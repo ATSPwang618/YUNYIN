@@ -1,0 +1,98 @@
+{
+  "_说明": "YUNYIN 主题文字配色配置文件。改这里就能改对应主题的界面文字颜色；改完重新打包 VPK 生效。顶部 _开头的是说明字段（不会影响程序），真正生效的是 bg 和 ui 两段。",
+  "_支持颜色": {
+    "_格式": "值为 Tailwind 文本颜色类，格式：text-<颜色>-<深浅>。深浅可取 50–950（约 20 档），另支持 text-white / text-black。",
+    "_可用颜色列表": "slate / gray / zinc / neutral / stone / red / orange / amber / yellow / lime / green / emerald / teal / cyan / sky / blue / indigo / violet / purple / fuchsia / pink / rose",
+    "_举例": {
+      "text-slate-900": "深灰（浅色主题的标题/正文）",
+      "text-slate-600": "中灰（正文）",
+      "text-slate-500": "灰（次要文字）",
+      "text-slate-400": "浅灰（弱提示）",
+      "text-slate-100": "近白（深色主题标题）",
+      "text-purple-900": "深紫（Pure 主题标题）",
+      "text-purple-700": "紫",
+      "text-purple-500": "亮紫",
+      "text-orange-600": "橙（强调/选中/进行中）",
+      "text-orange-300": "浅橙",
+      "text-pink-600": "粉红（Anime 强调）",
+      "text-pink-500": "粉",
+      "text-rose-800": "深玫红（Anime 标题）",
+      "text-rose-600": "玫红",
+      "text-rose-500": "浅玫红",
+      "text-fuchsia-700": "紫红（歌词当前行）",
+      "text-blue-600": "蓝（品牌字）",
+      "text-sky-400": "浅蓝",
+      "text-white": "白（深色面板标题）",
+      "text-black": "黑"
+    }
+  },
+  "_部件说明": {
+    "brand": "顶部品牌字「云音 for vita」",
+    "nav": "左侧导航【非选中】项文字",
+    "navActive": "左侧导航【选中/活动】项文字（强调色）",
+    "footer": "底部提示栏（MOVE/SELECT/OK/BACK/PAGE）+ 右上角 1/48 位置计数",
+    "lyricCur": "歌词【当前播放行】",
+    "lyricOther": "歌词【上下行】/歌曲标题/△ BACK 等弱提示",
+    "listTitle": "列表页/专辑页【大标题】（ALBUMS、列表名）",
+    "listSub": "列表页/专辑页【副标题与计数】（YOUR MUSIC COLLECTION、1/38、1-3/38）",
+    "listIndex": "列表/专辑【序号】（第几首）",
+    "status": "列表【歌曲名】/首页【LIST·ONE】状态字",
+    "detailArtist": "【歌手名】（列表/专辑详情）",
+    "setHeader": "设置页大标题 MUSIC SETTINGS",
+    "setSub": "设置页副标题（SYSTEM CONFIGURATION / 4 OPTIONS）",
+    "setTitle": "设置卡片标题（SFX / VIB / ABOUT / THEME）",
+    "setVal": "设置卡片值（ON / OFF / LIGHT / DARK / PURE / ANIME）",
+    "setInfo": "设置卡片次要信息（INFO）",
+    "aboutTitle": "About 页标题（ABOUT US / YUNYIN 云音 for vita）",
+    "aboutSub": "About 页正文（made by 阡陌 / GitHub / 标语 / △ BACK）",
+    "album": "首页【专辑名】（强调色）",
+    "title": "首页【歌曲标题】",
+    "artist": "首页【歌手名】",
+    "percent": "首页/歌词【进度百分比】",
+    "label": "首页标签（MODE / VIEW / LOVED）"
+  },
+  "bg": {
+    "light": { "title": "text-slate-900", "body": "text-slate-600", "mute": "text-slate-500", "faint": "text-slate-400", "accent": "text-orange-600", "focus": "text-red-600", "brand": "text-blue-600" },
+    "dark":  { "title": "text-slate-100", "body": "text-slate-300", "mute": "text-slate-400", "faint": "text-slate-500", "accent": "text-orange-300", "focus": "text-red-400", "brand": "text-blue-400" },
+    "pure":  { "title": "text-slate-100", "body": "text-slate-300", "mute": "text-slate-400", "faint": "text-slate-500", "accent": "text-orange-300", "focus": "text-red-400", "brand": "text-blue-400" },
+    "anime": { "title": "text-white",    "body": "text-slate-200", "mute": "text-slate-300", "faint": "text-slate-400", "accent": "text-pink-400", "focus": "text-rose-400", "brand": "text-sky-400" }
+  },
+  "ui": {
+    "light": {
+      "brand": "text-blue-600 font-bold", "nav": "text-slate-700 font-bold", "navActive": "text-orange-600 font-bold",
+      "footer": "text-slate-500 font-bold", "lyricCur": "text-purple-800 font-bold", "lyricOther": "text-slate-400",
+      "listTitle": "text-sm text-slate-900 font-bold", "listSub": "text-xs text-slate-500", "listIndex": "text-xs text-slate-400",
+      "detailTitle": "text-base text-slate-900 font-bold", "detailSub": "text-xs text-slate-500", "detailArtist": "text-xs text-slate-600",
+      "setTitle": "text-xs text-slate-700 font-bold", "setVal": "text-xs text-slate-500 font-bold", "setHeader": "text-sm text-slate-950 font-bold", "setSub": "text-xs text-slate-600", "setInfo": "text-xs text-slate-400 font-bold",
+      "aboutTitle": "text-sm text-slate-900 font-bold", "aboutSub": "text-xs text-slate-600",
+      "album": "text-xs text-orange-600", "title": "text-base text-slate-900 font-bold", "artist": "text-xs text-slate-600", "percent": "text-xs text-slate-500", "label": "text-xs text-slate-500", "status": "text-xs text-slate-900 font-bold"
+    },
+    "dark": {
+      "brand": "text-sky-400 font-bold", "nav": "text-slate-200 font-bold", "navActive": "text-orange-300 font-bold",
+      "footer": "text-slate-300 font-bold", "lyricCur": "text-slate-50 font-bold", "lyricOther": "text-slate-400",
+      "listTitle": "text-sm text-slate-100 font-bold", "listSub": "text-xs text-slate-400", "listIndex": "text-xs text-slate-500",
+      "detailTitle": "text-base text-slate-100 font-bold", "detailSub": "text-xs text-slate-400", "detailArtist": "text-xs text-slate-300",
+      "setTitle": "text-xs text-slate-200 font-bold", "setVal": "text-xs text-slate-400 font-bold", "setHeader": "text-sm text-slate-100 font-bold", "setSub": "text-xs text-slate-300", "setInfo": "text-xs text-slate-400 font-bold",
+      "aboutTitle": "text-sm text-slate-100 font-bold", "aboutSub": "text-xs text-slate-300",
+      "album": "text-xs text-orange-300", "title": "text-base text-slate-100 font-bold", "artist": "text-xs text-slate-300", "percent": "text-xs text-slate-400", "label": "text-xs text-slate-400", "status": "text-xs text-slate-100 font-bold"
+    },
+    "pure": {
+      "brand": "text-purple-600 font-bold", "nav": "text-purple-800 font-bold", "navActive": "text-purple-500 font-bold",
+      "footer": "text-purple-500 font-bold", "lyricCur": "text-fuchsia-700 font-bold", "lyricOther": "text-purple-500",
+      "listTitle": "text-sm text-purple-900 font-bold", "listSub": "text-xs text-purple-600", "listIndex": "text-xs text-purple-500",
+      "detailTitle": "text-base text-purple-900 font-bold", "detailSub": "text-xs text-purple-600", "detailArtist": "text-xs text-purple-700",
+      "setTitle": "text-xs text-purple-800 font-bold", "setVal": "text-xs text-purple-600 font-bold", "setHeader": "text-sm text-purple-900 font-bold", "setSub": "text-xs text-purple-700", "setInfo": "text-xs text-purple-500 font-bold",
+      "aboutTitle": "text-sm text-purple-900 font-bold", "aboutSub": "text-xs text-purple-700",
+      "album": "text-xs text-purple-500", "title": "text-base text-purple-900 font-bold", "artist": "text-xs text-purple-700", "percent": "text-xs text-purple-600", "label": "text-xs text-purple-600", "status": "text-xs text-purple-900 font-bold"
+    },
+    "anime": {
+      "brand": "text-pink-600 font-bold", "nav": "text-rose-800 font-bold", "navActive": "text-pink-600 font-bold",
+      "footer": "text-pink-500 font-bold", "lyricCur": "text-rose-700 font-bold", "lyricOther": "text-rose-600",
+      "listTitle": "text-sm text-rose-800 font-bold", "listSub": "text-xs text-rose-600", "listIndex": "text-xs text-rose-500",
+      "detailTitle": "text-base text-rose-800 font-bold", "detailSub": "text-xs text-rose-600", "detailArtist": "text-xs text-rose-600",
+      "setTitle": "text-xs text-rose-800 font-bold", "setVal": "text-xs text-rose-600 font-bold", "setHeader": "text-sm text-rose-800 font-bold", "setSub": "text-xs text-rose-600", "setInfo": "text-xs text-rose-400 font-bold",
+      "aboutTitle": "text-sm text-rose-800 font-bold", "aboutSub": "text-xs text-rose-600",
+      "album": "text-xs text-pink-600", "title": "text-base text-rose-800 font-bold", "artist": "text-xs text-rose-600", "percent": "text-xs text-rose-500", "label": "text-xs text-rose-500", "status": "text-xs text-rose-800 font-bold"
+    }
+  }
+}
