@@ -8,14 +8,6 @@
 UI 参考 PocketJS 官方
 `library` / `gallery` / `music` / `launcher` 模板风格。
 
-## 下载
-
-- **v0.1.0 VPK**：[YUNYIN-v0.1.0.vpk](release/YUNYIN-v0.1.0.vpk)（TITLE_ID: `PF2A47F97`，约 2.9 MB）
-
-> 把 VPK 拷到 Vita 的 `ux0:`，用 VitaShell 安装；模拟器直接拖入 Vita3K 即可。
-> LiveArea 图已按规范压成 8 位索引（colorType=3），启动图为透明抠图，未携带零售
-> `sce_sys/package` / `sce_sys/about` 签名文件，可正常安装。建议机内语言设为简体中文，
-> 以保证气泡「云音」正常显示。
 
 ## 功能特性
 
