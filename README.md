@@ -2,7 +2,8 @@
 
 一款运行在 **PS Vita** 上的本地音乐播放器，基于
 [PocketJS](https://pocketjs.dev)（Solid 前端 + Rust 原生宿主）开发。
-注意：音频文件最好通过MusicBrainz Picard进行补充歌曲元数据！！
+
+注意：强烈推荐音频文件最好通过MusicBrainz Picard进行补充歌曲元数据！！
 官网：https://picard.musicbrainz.org/
 
 UI 参考 PocketJS 官方
