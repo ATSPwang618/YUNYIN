@@ -8,6 +8,7 @@
 } from "@pocketjs/framework/components";
 
 import { animate, jump } from "@pocketjs/framework/animation";
+import { after } from "@pocketjs/framework/clock";
 import { registerTexture } from "@pocketjs/framework";
 import { onButtonPress, onFrame } from "@pocketjs/framework/lifecycle";
 import { BTN, focusNode } from "@pocketjs/framework/input";
@@ -17,6 +18,7 @@ import {
   createEffect,
   createMemo,
   onMount,
+  onCleanup,
   For,
 } from "solid-js";
 
@@ -301,22 +303,22 @@ const SKINS: Record<UiSkin, SkinMap> = {
     coverGlow: "asset/ui/dark/cover_glow.png",
     settingBg: "asset/ui/dark/setting_bg.png",
     aboutBg: "asset/ui/dark/about_bg.png",
-    playN: "asset/ui/light/icon_playN.png",
-    playF: "asset/ui/light/icon_playF.png",
-    pauseN: "asset/ui/light/icon_pauseN.png",
-    pauseP: "asset/ui/light/icon_pauseP.png",
-    prevN: "asset/ui/light/icon_prevN.png",
-    prevF: "asset/ui/light/icon_prevF.png",
-    nextN: "asset/ui/light/icon_nextN.png",
-    nextF: "asset/ui/light/icon_nextF.png",
-    rep1N: "asset/ui/light/icon_rep1N.png",
-    rep1F: "asset/ui/light/icon_rep1F.png",
-    shufN: "asset/ui/light/icon_shufN.png",
-    shufF: "asset/ui/light/icon_shufF.png",
-    honN: "asset/ui/light/icon_honN.png",
-    honF: "asset/ui/light/icon_honF.png",
-    hoffN: "asset/ui/light/icon_hoffN.png",
-    hoffF: "asset/ui/light/icon_hoffF.png",
+    playN: "asset/ui/dark/icon_playN.png",
+    playF: "asset/ui/dark/icon_playF.png",
+    pauseN: "asset/ui/dark/icon_pauseN.png",
+    pauseP: "asset/ui/dark/icon_pauseP.png",
+    prevN: "asset/ui/dark/icon_prevN.png",
+    prevF: "asset/ui/dark/icon_prevF.png",
+    nextN: "asset/ui/dark/icon_nextN.png",
+    nextF: "asset/ui/dark/icon_nextF.png",
+    rep1N: "asset/ui/dark/icon_rep1N.png",
+    rep1F: "asset/ui/dark/icon_rep1F.png",
+    shufN: "asset/ui/dark/icon_shufN.png",
+    shufF: "asset/ui/dark/icon_shufF.png",
+    honN: "asset/ui/dark/icon_honN.png",
+    honF: "asset/ui/dark/icon_honF.png",
+    hoffN: "asset/ui/dark/icon_hoffN.png",
+    hoffF: "asset/ui/dark/icon_hoffF.png",
   },
   pure: {
     screenBg: "asset/ui/pure/screen_bg.png",
@@ -1311,6 +1313,66 @@ function PageEnter(props: { dir?: number; children: any }) {
   );
 }
 
+/* 弹出式子界面（About / Lyrics）：打开时从右侧滑入并淡入，关闭时向右侧滑出并淡出。
+ * 关闭动画必须在卸载前播放，因此由 closing() 驱动离场，动画播完后经 onExitDone 通知宿主真正卸载。 */
+function PageInOut(props: {
+  dir?: number;
+  closing: () => boolean;
+  onExitDone: () => void;
+  children: any;
+}) {
+  let el: NodeMirror | undefined;
+  let disposed = false;
+  let disposeExitTimer: (() => void) | undefined;
+  const dir = props.dir ?? 1;
+
+  onMount(() => {
+    if (el) {
+      animate(el, "opacity", 1, { dur: 200, easing: "out" });
+      animate(el, "scale", 1, { dur: 260, easing: "out-back", delay: 10 });
+      animate(el, "translateX", 0, {
+        dur: 300,
+        easing: "out-back",
+        delay: 20,
+      });
+    }
+  });
+
+  createEffect(() => {
+    if (props.closing() && el) {
+      animate(el, "opacity", 0, { dur: 180, easing: "in" });
+      animate(el, "scale", 0.98, { dur: 240, easing: "in" });
+      animate(el, "translateX", dir * 44, {
+        dur: 240,
+        easing: "in",
+      });
+      /* PocketJS 的 setTimeout 会退化成微任务（不会等 300ms），这里改用确定性的虚拟时钟
+       * after()：0.3s 后（60Hz 下约 18 帧）真正卸载，保证离场动画播完再切回原界面。 */
+      disposeExitTimer?.();
+      disposeExitTimer = after(0.3, () => {
+        if (!disposed) props.onExitDone();
+      });
+    }
+  });
+
+  onCleanup(() => {
+    disposed = true;
+    disposeExitTimer?.();
+  });
+
+  return (
+    <View
+      ref={(node: NodeMirror) => {
+        el = node;
+      }}
+      style={{ opacity: 0, translateX: dir * 44, scale: 0.98 }}
+      class="w-96 h-48 items-center justify-center"
+    >
+      {props.children}
+    </View>
+  );
+}
+
 /* =========================================================
  * MAIN APP
  * ======================================================= */
@@ -1348,6 +1410,8 @@ export default function Music() {
   const [homeCursor, setHomeCursor] = createSignal(1);
   const [lyricsVisible, setLyricsVisible] = createSignal(false);
   const [aboutVisible, setAboutVisible] = createSignal(false);
+  const [lyricsClosing, setLyricsClosing] = createSignal(false);
+  const [aboutClosing, setAboutClosing] = createSignal(false);
 
   const [listCursor, setListCursor] = createSignal(0);
   const [listStart, setListStart] = createSignal(0);
@@ -1577,14 +1641,14 @@ export default function Music() {
   /* Root theme */
   const rootClass = createMemo(() => {
     if (uiTheme() === "pure") {
-      return "flex-col w-full h-full p-2 gap-2 bg-gradient-to-b from-purple-950 to-purple-900";
+      return "flex-col w-full h-full p-2 gap-2 bg-gradient-to-b from-orange-200 to-amber-50";
     }
     if (uiTheme() === "anime") {
       return "flex-col w-full h-full p-2 gap-2 bg-gradient-to-b from-fuchsia-950 to-rose-900";
     }
     return uiTheme() === "dark"
-      ? "flex-col w-full h-full p-2 gap-2 bg-gradient-to-b from-slate-900 to-slate-800"
-      : "flex-col w-full h-full p-2 gap-2 bg-gradient-to-b from-indigo-50 to-slate-100";
+      ? "flex-col w-full h-full p-2 gap-2 bg-gradient-to-b from-slate-950 to-indigo-950"
+      : "flex-col w-full h-full p-2 gap-2 bg-gradient-to-b from-emerald-50 to-teal-50";
   });
 
   /*
@@ -1636,6 +1700,7 @@ export default function Music() {
   const resetHome = () => {
     setHomeCursor(1);
     setLyricsVisible(false);
+    setLyricsClosing(false);
   };
 
   const resetList = () => {
@@ -1673,6 +1738,7 @@ export default function Music() {
   const openSelectedNav = () => {
     const index = navIndex();
     setAboutVisible(false);
+    setAboutClosing(false);
 
     if (index === 0) {
       setScreen("home");
@@ -2001,6 +2067,7 @@ export default function Music() {
     if (index === 2) {
       /* ABOUT：打开 About Us 静态文字界面，△ 返回设置页。 */
       setAboutVisible(true);
+      setAboutClosing(false);
       focusContent();
       return;
     }
@@ -2047,6 +2114,7 @@ export default function Music() {
 
       if (cursor === 5) {
         setLyricsVisible(true);
+        setLyricsClosing(false);
         return;
       }
 
@@ -2225,15 +2293,15 @@ export default function Music() {
     }
 
     if (screen() === "home" && lyricsVisible()) {
-      setLyricsVisible(false);
+      setLyricsClosing(true);
       setHomeCursor(5);
-      focusContent();
+      /* 焦点在离场动画播完后，由 PageInOut.onExitDone 归还到内容区。 */
       return;
     }
 
     if (screen() === "setting" && aboutVisible()) {
-      setAboutVisible(false);
-      focusContent();
+      setAboutClosing(true);
+      /* 焦点在离场动画播完后，由 PageInOut.onExitDone 归还到内容区。 */
       return;
     }
 
@@ -2393,7 +2461,7 @@ export default function Music() {
           >
             {/* HOME PLAYER */}
 
-            {screen() === "home" && !lyricsVisible() && (
+            {screen() === "home" && !lyricsVisible() && !lyricsClosing() && (
               <PageEnter dir={-1}>
                 <HomePage
                   track={track}
@@ -2410,8 +2478,16 @@ export default function Music() {
 
             {/* HOME LYRICS */}
 
-            {screen() === "home" && lyricsVisible() && (
-              <PageEnter dir={1}>
+            {screen() === "home" && (lyricsVisible() || lyricsClosing()) && (
+              <PageInOut
+                dir={1}
+                closing={() => lyricsClosing()}
+                onExitDone={() => {
+                  setLyricsVisible(false);
+                  setLyricsClosing(false);
+                  focusContent();
+                }}
+              >
                 <LyricsPage
                   track={track}
                   playing={playing}
@@ -2419,7 +2495,7 @@ export default function Music() {
                   position={position}
                   percent={percent}
                 />
-              </PageEnter>
+              </PageInOut>
             )}
 
             {/* ALL TRACKS */}
@@ -2484,8 +2560,18 @@ export default function Music() {
 
             {screen() === "setting" && (
               <PageEnter dir={1}>
-                {aboutVisible() ? (
-                  <AboutPage />
+                {aboutVisible() || aboutClosing() ? (
+                  <PageInOut
+                    dir={1}
+                    closing={() => aboutClosing()}
+                    onExitDone={() => {
+                      setAboutVisible(false);
+                      setAboutClosing(false);
+                      focusContent();
+                    }}
+                  >
+                    <AboutPage />
+                  </PageInOut>
                 ) : (
                   <SettingPage
                     cursor={settingCursor}
@@ -2531,7 +2617,11 @@ function NavItem(props: {
     <View
       ref={props.refNode}
       focusable
-      class="relative w-16 h-8 overflow-hidden flex-col items-center justify-center"
+      class={
+        isCursor()
+          ? "relative w-16 h-8 overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-110"
+          : "relative w-16 h-8 overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-100"
+      }
     >
       <Image
         src={isCursor() ? useSkin().navFocus : props.active ? useSkin().navActive : useSkin().nav}
@@ -2596,14 +2686,15 @@ function HomePage(props: {
 }) {
   const buttonClass = (index: number, round: boolean) => {
     void round;
-    void index;
-    return "relative w-[35] h-[35] overflow-hidden flex-col items-center justify-center";
+    return props.cursor() === index
+      ? "relative w-[35] h-[35] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-110"
+      : "relative w-[35] h-[35] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-100";
   };
 
   const lyricsButtonClass = () =>
     props.cursor() === 5
-      ? "w-16 h-6 rounded-xl shadow-md items-center justify-center bg-orange-100 border-2 border-orange-500"
-      : "w-16 h-6 rounded-xl shadow-md items-center justify-center bg-white border-slate-300";
+      ? "w-16 h-6 rounded-xl shadow-md items-center justify-center bg-orange-100 border-2 border-orange-500 transition duration-150 ease-out-back scale-110"
+      : "w-16 h-6 rounded-xl shadow-md items-center justify-center bg-white border-slate-300 transition duration-150 ease-out-back scale-100";
 
   const progressWidth = () => {
     const duration = getTrackDuration(props.track());
@@ -2653,7 +2744,17 @@ function HomePage(props: {
               <View class={buttonClass(0, true)}>
                 <Image src={props.cursor() === 0 ? useSkin().prevF : useSkin().prevN} class="absolute inset-0 w-full h-full" />
               </View>
-              <View class="relative w-[35] h-[35] overflow-hidden flex-col items-center justify-center">
+              <View
+                class={
+                  props.playing()
+                    ? (props.cursor() === 1
+                        ? "relative w-[35] h-[35] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-110 animate-pulse"
+                        : "relative w-[35] h-[35] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-100 animate-pulse")
+                    : (props.cursor() === 1
+                        ? "relative w-[35] h-[35] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-110"
+                        : "relative w-[35] h-[35] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-100")
+                }
+              >
                 <Image
                   src={
                     props.playing()
@@ -2850,7 +2951,11 @@ function MusicListPage(props: {
 
         return (
           <View
-            class="relative flex-row items-center justify-between w-full h-10 overflow-hidden rounded-xl px-2"
+            class={
+              current
+                ? "relative flex-row items-center justify-between w-full h-10 overflow-hidden rounded-xl px-2 transition-transform duration-150 ease-out-back scale-105"
+                : "relative flex-row items-center justify-between w-full h-10 overflow-hidden rounded-xl px-2 transition-transform duration-150 ease-out-back scale-100"
+            }
           >
             <Image
               src={current ? useSkin().rowFocus : useSkin().row}
@@ -3070,8 +3175,8 @@ function AlbumTile(props: {
               src={coverKey || useSkin().coverDefault}
               class={
                 current
-                  ? "w-[82] h-[82] rounded-xl shadow-md border-2 border-red-600"
-                  : "w-[82] h-[82] rounded-xl shadow-md border-slate-300"
+                  ? "w-[82] h-[82] rounded-xl shadow-md border-2 border-red-600 transition-transform duration-150 ease-out-back scale-110"
+                  : "w-[82] h-[82] rounded-xl shadow-md border-slate-300 transition-transform duration-150 ease-out-back scale-100"
               }
             />
 
@@ -3133,8 +3238,9 @@ function SettingPage(props: {
   theme: () => Theme;
 }) {
   const cardClass = (index: number) => {
-    void index;
-    return "relative w-[82] h-[82] overflow-hidden flex-col items-center justify-center";
+    return props.cursor() === index
+      ? "relative w-[82] h-[82] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-110"
+      : "relative w-[82] h-[82] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-100";
   };
 
   const cardImg = (index: number) =>
