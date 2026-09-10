@@ -12,7 +12,7 @@ SRC=/mnt/d/AI-PSVITA/yunyin
 PKJ=/root/pocketjs
 APP=yunyin
 OUT=yunyin-main
-FONT="$SRC/fonts/NotoSansSC-Medium.ttf"
+FONT="$SRC/fonts/chinese/NotoSansSC-Medium.ttf"
 
 echo "== 1/4 安装 wasm32 目标（如无） =="
 rustup target add wasm32-unknown-unknown >/dev/null 2>&1 || true

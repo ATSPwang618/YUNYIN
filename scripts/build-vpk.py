@@ -73,7 +73,8 @@ def theme_font():
     for pat in ("*.ttf", "*.ttc", "*.otf"):
         for cand in sorted(base.glob(pat)):
             return str(cand)
-    return str(PROJECT_ROOT / "fonts" / "NotoSansSC-Medium.ttf")
+    # 兜底：中文版字体（fonts/chinese/ 那份，项目里只有这一份 Noto）
+    return str(PROJECT_ROOT / "fonts" / "chinese" / "NotoSansSC-Medium.ttf")
 
 
 # --- helpers --------------------------------------------------------------
@@ -749,8 +750,8 @@ def repack():
 
 
 if __name__ == "__main__":
-    if not (PROJECT_ROOT / "fonts" / "NotoSansSC-Medium.ttf").exists():
-        raise SystemExit("fonts/NotoSansSC-Medium.ttf missing")
+    if not Path(theme_font()).exists():
+        raise SystemExit(f"字体文件缺失：{theme_font()}")
     stage()
     patch_host()
     patch_graphics_glyph()

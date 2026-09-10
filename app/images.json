@@ -1,481 +1,4 @@
 {
-  "asset/ui/light/screen_bg.png": {
-    "linear": true
-  },
-  "asset/ui/light/app_bg.png": {
-    "linear": true
-  },
-  "asset/ui/light/cover_glow.png": {
-    "linear": true
-  },
-  "asset/ui/light/panel.png": {
-    "linear": true
-  },
-  "asset/ui/light/lyrics_panel.png": {
-    "linear": true
-  },
-  "asset/ui/light/card.png": {
-    "linear": true
-  },
-  "asset/ui/light/card_focus.png": {
-    "linear": true
-  },
-  "asset/ui/light/nav.png": {
-    "linear": true
-  },
-  "asset/ui/light/nav_active.png": {
-    "linear": true
-  },
-  "asset/ui/light/nav_focus.png": {
-    "linear": true
-  },
-  "asset/ui/light/btn.png": {
-    "linear": true
-  },
-  "asset/ui/light/btn_focus.png": {
-    "linear": true
-  },
-  "asset/ui/light/btn_round.png": {
-    "linear": true
-  },
-  "asset/ui/light/btn_round_focus.png": {
-    "linear": true
-  },
-  "asset/ui/light/row.png": {
-    "linear": true
-  },
-  "asset/ui/light/row_focus.png": {
-    "linear": true
-  },
-  "asset/ui/light/cover_default.png": {
-    "linear": true
-  },
-  "asset/ui/dark/app_bg.png": {
-    "linear": true
-  },
-  "asset/ui/dark/screen_bg.png": {
-    "linear": true
-  },
-  "asset/ui/dark/panel.png": {
-    "linear": true
-  },
-  "asset/ui/dark/lyrics_panel.png": {
-    "linear": true
-  },
-  "asset/ui/dark/card.png": {
-    "linear": true
-  },
-  "asset/ui/dark/card_focus.png": {
-    "linear": true
-  },
-  "asset/ui/dark/nav.png": {
-    "linear": true
-  },
-  "asset/ui/dark/nav_active.png": {
-    "linear": true
-  },
-  "asset/ui/dark/nav_focus.png": {
-    "linear": true
-  },
-  "asset/ui/dark/btn.png": {
-    "linear": true
-  },
-  "asset/ui/dark/btn_focus.png": {
-    "linear": true
-  },
-  "asset/ui/dark/btn_round.png": {
-    "linear": true
-  },
-  "asset/ui/dark/btn_round_focus.png": {
-    "linear": true
-  },
-  "asset/ui/dark/row.png": {
-    "linear": true
-  },
-  "asset/ui/dark/row_focus.png": {
-    "linear": true
-  },
-  "asset/ui/dark/cover_default.png": {
-    "linear": true
-  },
-  "asset/ui/dark/cover_glow.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_prev.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_play.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_pause.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_next.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_repeat.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_shuffle.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_heart.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_heartOff.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_playN.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_playF.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_pauseN.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_pauseP.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_prevN.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_prevF.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_nextN.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_nextF.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_rep1N.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_rep1F.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_shufN.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_shufF.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_honN.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_honF.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_hoffN.png": {
-    "linear": true
-  },
-  "asset/ui/light/icon_hoffF.png": {
-    "linear": true
-  },
-  "asset/ui/dark/icon_prev.png": {
-    "linear": true
-  },
-  "asset/ui/dark/icon_play.png": {
-    "linear": true
-  },
-  "asset/ui/dark/icon_pause.png": {
-    "linear": true
-  },
-  "asset/ui/dark/icon_next.png": {
-    "linear": true
-  },
-  "asset/ui/dark/icon_repeat.png": {
-    "linear": true
-  },
-  "asset/ui/dark/icon_shuffle.png": {
-    "linear": true
-  },
-  "asset/ui/dark/icon_heart.png": {
-    "linear": true
-  },
-  "asset/ui/dark/icon_heartOff.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\app_bg.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\card.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\card_focus.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\cover_default.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\cover_glow.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_hoffF.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_hoffN.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_honF.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_honN.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_nextF.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_nextN.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_pauseN.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_pauseP.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_playF.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_playN.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_prevF.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_prevN.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_rep1F.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_rep1N.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_shufF.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\icon_shufN.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\lyrics_panel.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\nav.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\nav_active.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\nav_focus.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\panel.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\row.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\row_focus.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\screen_bg.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\app_bg.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\card.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\card_focus.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\cover_default.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\cover_glow.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_hoffF.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_hoffN.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_honF.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_honN.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_nextF.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_nextN.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_pauseN.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_pauseP.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_playF.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_playN.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_prevF.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_prevN.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_rep1F.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_rep1N.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_shufF.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\icon_shufN.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\lyrics_panel.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\nav.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\nav_active.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\nav_focus.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\panel.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\row.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\row_focus.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\screen_bg.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\app_bg.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\card.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\card_focus.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\cover_default.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\cover_glow.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_hoffF.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_hoffN.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_honF.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_honN.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_nextF.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_nextN.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_pauseN.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_pauseP.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_playF.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_playN.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_prevF.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_prevN.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_rep1F.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_rep1N.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_shufF.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\icon_shufN.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\lyrics_panel.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\nav.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\nav_active.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\nav_focus.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\panel.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\row.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\row_focus.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\screen_bg.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\setting_bg.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\setting_bg.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\setting_bg.png": {
-    "linear": true
-  },
-  "asset/ui\\dark\\about_bg.png": {
-    "linear": true
-  },
-  "asset/ui\\light\\about_bg.png": {
-    "linear": true
-  },
-  "asset/ui\\pur\\about_bg.png": {
-    "linear": true
-  },
   "asset/ui/anime/about_bg.png": {
     "linear": true
   },
@@ -504,6 +27,21 @@
     "linear": true
   },
   "asset/ui/anime/icon_honN.png": {
+    "linear": true
+  },
+  "asset/ui/anime/icon_nav_album.png": {
+    "linear": true
+  },
+  "asset/ui/anime/icon_nav_home.png": {
+    "linear": true
+  },
+  "asset/ui/anime/icon_nav_list.png": {
+    "linear": true
+  },
+  "asset/ui/anime/icon_nav_loved.png": {
+    "linear": true
+  },
+  "asset/ui/anime/icon_nav_set.png": {
     "linear": true
   },
   "asset/ui/anime/icon_nextF.png": {
@@ -572,6 +110,21 @@
   "asset/ui/dark/about_bg.png": {
     "linear": true
   },
+  "asset/ui/dark/app_bg.png": {
+    "linear": true
+  },
+  "asset/ui/dark/card.png": {
+    "linear": true
+  },
+  "asset/ui/dark/card_focus.png": {
+    "linear": true
+  },
+  "asset/ui/dark/cover_default.png": {
+    "linear": true
+  },
+  "asset/ui/dark/cover_glow.png": {
+    "linear": true
+  },
   "asset/ui/dark/icon_hoffF.png": {
     "linear": true
   },
@@ -582,6 +135,21 @@
     "linear": true
   },
   "asset/ui/dark/icon_honN.png": {
+    "linear": true
+  },
+  "asset/ui/dark/icon_nav_album.png": {
+    "linear": true
+  },
+  "asset/ui/dark/icon_nav_home.png": {
+    "linear": true
+  },
+  "asset/ui/dark/icon_nav_list.png": {
+    "linear": true
+  },
+  "asset/ui/dark/icon_nav_loved.png": {
+    "linear": true
+  },
+  "asset/ui/dark/icon_nav_set.png": {
     "linear": true
   },
   "asset/ui/dark/icon_nextF.png": {
@@ -620,13 +188,136 @@
   "asset/ui/dark/icon_shufN.png": {
     "linear": true
   },
-  "asset/ui/dark/setting_bg - 副本.png": {
+  "asset/ui/dark/lyrics_panel.png": {
+    "linear": true
+  },
+  "asset/ui/dark/nav.png": {
+    "linear": true
+  },
+  "asset/ui/dark/nav_active.png": {
+    "linear": true
+  },
+  "asset/ui/dark/nav_focus.png": {
+    "linear": true
+  },
+  "asset/ui/dark/panel.png": {
+    "linear": true
+  },
+  "asset/ui/dark/row.png": {
+    "linear": true
+  },
+  "asset/ui/dark/row_focus.png": {
+    "linear": true
+  },
+  "asset/ui/dark/screen_bg.png": {
     "linear": true
   },
   "asset/ui/dark/setting_bg.png": {
     "linear": true
   },
   "asset/ui/light/about_bg.png": {
+    "linear": true
+  },
+  "asset/ui/light/app_bg.png": {
+    "linear": true
+  },
+  "asset/ui/light/card.png": {
+    "linear": true
+  },
+  "asset/ui/light/card_focus.png": {
+    "linear": true
+  },
+  "asset/ui/light/cover_default.png": {
+    "linear": true
+  },
+  "asset/ui/light/cover_glow.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_hoffF.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_hoffN.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_honF.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_honN.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_nav_album.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_nav_home.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_nav_list.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_nav_loved.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_nav_set.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_nextF.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_nextN.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_pauseN.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_pauseP.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_playF.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_playN.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_prevF.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_prevN.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_rep1F.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_rep1N.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_shufF.png": {
+    "linear": true
+  },
+  "asset/ui/light/icon_shufN.png": {
+    "linear": true
+  },
+  "asset/ui/light/lyrics_panel.png": {
+    "linear": true
+  },
+  "asset/ui/light/nav.png": {
+    "linear": true
+  },
+  "asset/ui/light/nav_active.png": {
+    "linear": true
+  },
+  "asset/ui/light/nav_focus.png": {
+    "linear": true
+  },
+  "asset/ui/light/panel.png": {
+    "linear": true
+  },
+  "asset/ui/light/row.png": {
+    "linear": true
+  },
+  "asset/ui/light/row_focus.png": {
+    "linear": true
+  },
+  "asset/ui/light/screen_bg.png": {
     "linear": true
   },
   "asset/ui/light/setting_bg.png": {
@@ -660,6 +351,21 @@
     "linear": true
   },
   "asset/ui/pure/icon_honN.png": {
+    "linear": true
+  },
+  "asset/ui/pure/icon_nav_album.png": {
+    "linear": true
+  },
+  "asset/ui/pure/icon_nav_home.png": {
+    "linear": true
+  },
+  "asset/ui/pure/icon_nav_list.png": {
+    "linear": true
+  },
+  "asset/ui/pure/icon_nav_loved.png": {
+    "linear": true
+  },
+  "asset/ui/pure/icon_nav_set.png": {
     "linear": true
   },
   "asset/ui/pure/icon_nextF.png": {
@@ -720,9 +426,6 @@
     "linear": true
   },
   "asset/ui/pure/screen_bg.png": {
-    "linear": true
-  },
-  "asset/ui/pure/setting_bg - 副本.png": {
     "linear": true
   },
   "asset/ui/pure/setting_bg.png": {
