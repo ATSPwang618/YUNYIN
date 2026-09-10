@@ -65,6 +65,47 @@
 2. 音乐文件放进 `ux0:/data/yunyin/music`（可以分子文件夹）。
 3. 启动「云音」，首次进入会自动扫描曲库，扫描完在首页按 ○ 播放。。
 
+## 标签规范（重要）
+
+歌名、歌手、专辑、封面、歌词**全部来自音频的内嵌标签**。标签不规范时，界面上就会出现
+文件名、`Local` / `Unknown`、问号或者空白。最常见的三类问题：
+
+| 情况 | 在播放器上的表现 |
+| --- | --- |
+| MP3 标签编码字节写着 Latin-1，里面却塞 GBK / Big5 字节（国内工具常见） | 中文全变乱码 |
+| 只有文件尾那种老式 ID3v1，或者压根没有标签 | 只显示文件名，歌手 `Local`、专辑 `Unknown` |
+| 封面不是内嵌的 JPEG / PNG，或体积超过 1MB | 显示默认封面 |
+
+### 先体检：`scripts/check-tags.ps1`
+
+在 PC 上跑一遍，它按**和播放器完全相同的规则**读标签，逐首告诉你缺什么、哪些是乱码：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\check-tags.ps1 -Path "D:\Music" -Csv report.csv -Playlist music-to-fix.m3u8
+```
+
+也可以直接把音乐文件夹拖到 `scripts\check-tags.cmd` 上。它会给出：
+
+- 每首歌的状态：完整 / 可改善 / 建议整理 / 乱码，并列出缺哪几项
+- 乱码的歌会直接写出「正确内容应为『…』」，方便确认
+- `report.csv` 明细表；`music-to-fix.m3u8` 是全部待处理曲目，拖进 Picard 即可一次载入
+
+### 再修：MusicBrainz Picard
+
+1. 装 [MusicBrainz Picard](https://picard.musicbrainz.org/)（免费）
+2. 打开 `music-to-fix.m3u8`，或直接把音乐文件夹拖进去
+3. 全选 → **Lookup**（按声学指纹匹配，不认识中文也能自动认出来）
+4. **Save** —— 标签会被重写成规范的 UTF-8 / UTF-16，乱码一并解决
+5. 想要封面和歌词：Options → Metadata 里勾上 Cover Art、Lyrics
+
+### 自己写标签时的规范建议
+
+- MP3：ID3v2.3 / 2.4，文字用 **UTF-8**（或带 BOM 的 UTF-16）
+- FLAC / OGG / OPUS：Vorbis comment（UTF-8），键名用 TITLE / ARTIST / ALBUM / LYRICS
+- 封面：内嵌 JPEG 或 PNG，建议 500×500 以内、**不要超过 1MB**
+- 歌词：内嵌（ID3 的 USLT、Vorbis 的 LYRICS），带时间轴更佳（LRC 格式）
+- 文件名随意：播放器优先用标签，读不到标签才退回文件名
+
 ## 两个字体版本（中文 / 日文）
 
 同一份代码可以打包成两个字体版本，界面完全一致，只有字体文件与字形集不同：
