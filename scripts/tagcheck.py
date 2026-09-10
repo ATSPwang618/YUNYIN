@@ -644,6 +644,69 @@ def musicbrainz_search(artist, title, limit=5):
     return out
 
 
+def deezer_search(artist, title, limit=5):
+    """Deezer 公开搜索接口，无需 key；封面给到 1000px。"""
+    term = " ".join(x for x in (artist, title) if x).strip()
+    if not term:
+        return []
+    url = "https://api.deezer.com/search?" + urllib.parse.urlencode({"q": term, "limit": limit})
+    try:
+        data = _http_json(url)
+    except Exception:
+        return []
+    out = []
+    for item in (data.get("data") or [])[:limit]:
+        album = item.get("album") or {}
+        artist_obj = item.get("artist") or {}
+        out.append({
+            "source": "Deezer",
+            "title": item.get("title", ""),
+            "artist": artist_obj.get("name", ""),
+            "album": album.get("title", ""),
+            "year": "",
+            "track": None,
+            "duration": (item.get("duration") or 0) * 1000 or None,
+            "cover_url": album.get("cover_xl") or album.get("cover_big") or None,
+        })
+    return out
+
+
+def theaudiodb_search(artist, title, limit=5):
+    """TheAudioDB 公开接口（用它的公开测试 key=2），中文曲库也有收录。"""
+    if not title:
+        return []
+    url = "https://theaudiodb.com/api/v1/json/2/searchtrack.php?" + urllib.parse.urlencode(
+        {"s": artist or "", "t": title})
+    try:
+        data = _http_json(url)
+    except Exception:
+        return []
+    out = []
+    for item in (data.get("track") or [])[:limit]:
+        cover = item.get("strTrackThumb") or item.get("strAlbumThumb") or None
+        out.append({
+            "source": "TheAudioDB",
+            "title": item.get("strTrack", ""),
+            "artist": item.get("strArtist", ""),
+            "album": item.get("strAlbum", ""),
+            "year": "",
+            "track": None,
+            "duration": int(item["intDuration"]) if item.get("intDuration") else None,
+            "cover_url": cover,
+        })
+    return out
+
+
+# 可选的联网数据源（都是免费、不需要自己申请 key 的）
+SOURCES = {
+    "itunes": ("iTunes", itunes_search),
+    "musicbrainz": ("MusicBrainz", musicbrainz_search),
+    "deezer": ("Deezer", deezer_search),
+    "theaudiodb": ("TheAudioDB", theaudiodb_search),
+}
+DEFAULT_SOURCES = ("itunes", "deezer", "theaudiodb", "musicbrainz")
+
+
 def _norm(s):
     return re.sub(r"[\s\-_·、,.，。()[\]（）【】!！?？'\"’“”]+", "", (s or "").lower())
 
@@ -679,7 +742,7 @@ def score_candidate(cand, artist, title, duration_ms=None):
     return max(0.0, min(1.0, score))
 
 
-def find_matches(row, sources=("itunes", "musicbrainz"), limit=5, duration_ms=0):
+def find_matches(row, sources=DEFAULT_SOURCES, limit=5, duration_ms=0):
     """返回 (候选列表（按相似度降序）, 用到的查询词)。
 
     中文曲库的文件名常写成「歌名 - 歌手」，和标签顺序相反，所以两种顺序都试一遍。
@@ -698,10 +761,10 @@ def find_matches(row, sources=("itunes", "musicbrainz"), limit=5, duration_ms=0)
     seen = {}                       # key -> 候选，用来去重并在两种查询顺序间取高分
     for q_artist, q_title in queries:
         found = []
-        if "itunes" in sources:
-            found += itunes_search(q_artist, q_title, limit)
-        if "musicbrainz" in sources:
-            found += musicbrainz_search(q_artist, q_title, limit)
+        for key in sources:
+            entry = SOURCES.get(key)
+            if entry is not None:
+                found += entry[1](q_artist, q_title, limit)
         for c in found:
             key = (c["source"], _norm(c["title"]), _norm(c["artist"]), _norm(c["album"]))
             c["score"] = score_candidate(c, q_artist, q_title, duration_ms)
@@ -920,6 +983,9 @@ def run_cli(argv):
                 skipped += 1
                 continue
             best = cands[0]
+            _debug_log("match %s: %.2f %s | %s / %s / %s"
+                       % (r["name"], best["score"], best["source"],
+                          best["artist"], best["title"], best["album"]))
             _log("  [%.2f] %s" % (best["score"], r["name"]))
             _log("         查询「%s - %s」 → %s / %s / %s（%s）"
                  % (used[0], used[1], best["source"], best["artist"], best["title"], best["album"]))
@@ -1097,6 +1163,17 @@ def open_fix_dialog(root, rows, on_finished):
     progress = ttk.Progressbar(opts, mode="determinate", length=220)
     progress.pack(side="right")
 
+    src_row = ttk.Frame(win, padding=(10, 4, 10, 0))
+    src_row.pack(fill="x")
+    ttk.Label(src_row, text="数据源：").pack(side="left")
+    src_vars = {}
+    for key in ("itunes", "deezer", "theaudiodb", "musicbrainz"):
+        var = tk.BooleanVar(value=key in DEFAULT_SOURCES)
+        src_vars[key] = var
+        ttk.Checkbutton(src_row, text=SOURCES[key][0], variable=var).pack(side="left", padx=(0, 10))
+    ttk.Label(src_row, text="（都是免费接口；MusicBrainz 有 1 秒限速，勾多了会慢一些）",
+              foreground="#666").pack(side="left")
+
     cols = ("status", "name", "match", "score")
     heads = {"status": ("状态", 90), "name": ("文件", 300), "match": ("匹配结果（歌手 / 歌名 / 专辑）", 480),
              "score": ("相似度", 70)}
@@ -1139,10 +1216,12 @@ def open_fix_dialog(root, rows, on_finished):
         return tree.item(item, "tags")[1]
 
     def worker(items):
+        picked = tuple(k for k, v in src_vars.items() if v.get()) or DEFAULT_SOURCES
         for i, r in enumerate(items, 1):
             q.put(("progress", i, len(items), r["name"]))
             try:
-                cands, used = find_matches(r, duration_ms=file_duration_ms(r["file"]))
+                cands, used = find_matches(r, sources=picked,
+                                           duration_ms=file_duration_ms(r["file"]))
             except Exception as exc:
                 cands, used = [], ("", "")
                 q.put(("note", r["file"], "搜索失败：%s" % exc))
@@ -1418,9 +1497,13 @@ def run_gui():
     folder_btn.pack(side="left", padx=6)
     fix_btn = ttk.Button(buttons, text="联网匹配并修复…", state="disabled")
     fix_btn.pack(side="left")
+    remove_btn = ttk.Button(buttons, text="移除选中", state="disabled")
+    remove_btn.pack(side="left", padx=(12, 0))
+    clear_btn = ttk.Button(buttons, text="清空列表", state="disabled")
+    clear_btn.pack(side="left", padx=6)
     ttk.Button(buttons, text="打开 Picard 官网",
                command=lambda: open_url(PICARD_URL)).pack(side="right")
-    ttk.Label(buttons, text="Picard 不认播放列表：用「导出待修文件夹」把待修曲目挑出来再整包拖进去",
+    ttk.Label(buttons, text="先试「联网匹配并修复」；查不到的用「导出待修文件夹」交给 Picard",
               foreground="#666").pack(side="right", padx=8)
 
     # ---- 表格刷新 / 详情 --------------------------------------------------
@@ -1467,6 +1550,32 @@ def run_gui():
 
     tree.bind("<<TreeviewSelect>>", show_selected)
 
+    def remove_selected():
+        """拖错文件时，把选中的行从列表里去掉（不删文件）。"""
+        sel = tree.selection()
+        if not sel:
+            return
+        drop = {item_rows[i]["file"] for i in sel if i in item_rows}
+        if not drop:
+            return
+        state["rows"] = [r for r in state["rows"] if r["file"] not in drop]
+        refresh_table()
+        if not state["rows"]:
+            clear_list()
+        else:
+            stat_var.set(stat_var.get() + "        （已移除 %d 项）" % len(drop))
+
+    def clear_list():
+        state["rows"] = []
+        item_rows.clear()
+        tree.delete(*tree.get_children())
+        stat_var.set("列表已清空：重新拖入文件/文件夹，或点「选择文件夹…」。")
+        detail_var.set("选中上面任意一行，这里会显示它的完整说明。")
+        for btn in (csv_btn, folder_btn, fix_btn, remove_btn, clear_btn):
+            btn["state"] = "disabled"
+
+    tree.bind("<Delete>", lambda _e: remove_selected())
+
     # ---- 扫描（后台线程 + 队列，界面不卡） --------------------------------
     def scan_thread(paths):
         def progress_cb(i, total, name):
@@ -1495,6 +1604,8 @@ def run_gui():
                     csv_btn["state"] = "normal"
                     folder_btn["state"] = "normal"
                     fix_btn["state"] = "normal" if HAS_MUTAGEN else "disabled"
+                    remove_btn["state"] = "normal"
+                    clear_btn["state"] = "normal"
                     refresh_table()
                     s = summarize(rows)
                     if others:
@@ -1505,8 +1616,10 @@ def run_gui():
                         else:
                             messagebox.showinfo(
                                 "体检完成",
-                                "有 %d 首要处理%s。\n\n下一步：点「导出 Picard 待修清单」，"
-                                "把生成的 m3u8 拖进 Picard，全选 → Lookup → Save 即可。"
+                                "有 %d 首要处理%s。\n\n下一步：点「联网匹配并修复…」，工具会去 "
+                                "iTunes / Deezer / TheAudioDB / MusicBrainz 搜索，把歌名、歌手、专辑、"
+                                "封面直接写进文件（先给你看匹配结果，可逐个换候选）。\n\n"
+                                "免费库查不到的，再用「导出待修文件夹」交给 MusicBrainz Picard。"
                                 % (s["bad"], ("（其中 %d 首乱码）" % s["garbled"]) if s["garbled"] else ""))
                     if os.environ.get("TAGCHECK_DEBUG_AUTO") and rows:
                         open_fix_dialog(root, rows, on_finished=start_scan)
@@ -1534,6 +1647,8 @@ def run_gui():
         csv_btn["state"] = "disabled"
         folder_btn["state"] = "disabled"
         fix_btn["state"] = "disabled"
+        remove_btn["state"] = "disabled"
+        clear_btn["state"] = "disabled"
         stat_var.set("开始扫描 %d 项输入…" % len(inputs) if len(inputs) > 1 else "开始扫描…")
         threading.Thread(target=scan_thread, args=(inputs,), daemon=True).start()
 
@@ -1591,6 +1706,8 @@ def run_gui():
     csv_btn.configure(command=export_csv)
     folder_btn.configure(command=export_folder)
     fix_btn.configure(command=open_fix)
+    remove_btn.configure(command=remove_selected)
+    clear_btn.configure(command=clear_list)
 
     # 所有控件建好之后再挂拖放，否则表格、按钮区收不到拖进来的文件。
     # 传入的只是「把路径塞进队列」，真正的界面操作由 pump 在界面线程里做。
