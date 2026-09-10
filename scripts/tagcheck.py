@@ -47,6 +47,18 @@ def _log(msg):
             pass
 
 
+def _debug_log(msg):
+    """设了环境变量 TAGCHECK_DEBUG_LOG 时，把关键动作写进日志文件（排查/自调用）。"""
+    path = os.environ.get("TAGCHECK_DEBUG_LOG")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # 字节读取
 # ---------------------------------------------------------------------------
@@ -293,11 +305,12 @@ def check_file(path):
             for fid, field in ((b"TIT2", "title"), (b"TPE1", "artist"), (b"TALB", "album")):
                 if fid in frames:
                     app, fixed, bad, note = decode_id3_text(frames[fid])
-                    row[field] = app
+                    # 乱码时表格里显示「正确内容」并加个 ⚠，说明栏再写清楚播放器实际会显示什么
+                    row[field] = ("⚠ " + fixed) if (bad and fixed) else app
                     if bad:
                         broken = True
                         suffix = "（正确内容应为「%s」）" % fixed if fixed else ""
-                        notes.append("%s：%s%s" % (field, note, suffix))
+                        notes.append("%s：%s（播放器显示：%s）%s" % (field, note, app or "空", suffix))
             if b"APIC" in frames:
                 img = find_image(frames[b"APIC"])
                 if img is None:
@@ -383,20 +396,46 @@ def check_file(path):
     return row
 
 
-def scan_folder(root, max_files=2000, progress=None, should_stop=None):
-    """扫描一个文件夹，返回 (rows, 播放器不支持的格式数量)。"""
+def collect_paths(paths, max_files=2000):
+    """把「文件 + 文件夹」混合的输入展开成音频文件列表。
+
+    返回 (files, skipped_unsupported)。拖进来的单个音频文件会原样收下，
+    文件夹则递归展开；不支持的扩展名（m4a / wma …）只计入 skipped。
+    """
     files = []
     others = 0
-    for base, _dirs, names in os.walk(root):
-        for n in sorted(names):
-            ext = os.path.splitext(n)[1].lower()
-            if ext in AUDIO_EXT:
-                files.append(os.path.join(base, n))
-            elif ext in OTHER_EXT:
-                others += 1
+    seen = set()
+
+    def add(path):
+        nonlocal others
         if len(files) >= max_files:
-            break
-    files = files[:max_files]
+            return
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext in AUDIO_EXT:
+            seen.add(key)
+            files.append(path)
+        elif ext in OTHER_EXT:
+            others += 1
+
+    for item in paths:
+        if os.path.isdir(item):
+            for base, _dirs, names in os.walk(item):
+                for n in sorted(names):
+                    add(os.path.join(base, n))
+                if len(files) >= max_files:
+                    break
+        elif os.path.isfile(item):
+            add(item)
+    return files[:max_files], others
+
+
+def scan_paths(paths, max_files=2000, progress=None, should_stop=None):
+    """体检一批「文件 + 文件夹」，返回 (rows, 播放器不支持的格式数量)。"""
+    files, others = collect_paths(paths, max_files)
+    _debug_log("scan_paths: %d 个音频文件（不支持格式 %d）" % (len(files), others))
     rows = []
     total = max(1, len(files))
     for i, path in enumerate(files, 1):
@@ -411,6 +450,11 @@ def scan_folder(root, max_files=2000, progress=None, should_stop=None):
         if progress is not None:
             progress(i, total, os.path.basename(path))
     return rows, others
+
+
+def scan_folder(root, max_files=2000, progress=None, should_stop=None):
+    """兼容旧调用：只扫一个文件夹。"""
+    return scan_paths([root], max_files, progress, should_stop)
 
 
 def summarize(rows):
@@ -453,25 +497,27 @@ def write_m3u8(rows, path):
 def run_cli(argv):
     import argparse
     ap = argparse.ArgumentParser(description="YUNYIN 标签体检（命令行模式）")
-    ap.add_argument("--cli", metavar="目录", required=True, help="要检查的音乐文件夹")
+    ap.add_argument("--cli", metavar="路径", nargs="+", required=True,
+                    help="要检查的音乐文件夹或音频文件（可以给多个）")
     ap.add_argument("--csv", help="导出明细 CSV")
     ap.add_argument("--m3u8", help="导出 Picard 待修清单")
     ap.add_argument("--only-problems", action="store_true", help="只列需要处理的")
     ap.add_argument("--max-files", type=int, default=2000)
     args = ap.parse_args(argv)
 
-    if not os.path.isdir(args.cli):
-        _log("路径不存在：" + args.cli)
+    paths = [p for p in args.cli if os.path.exists(p)]
+    if not paths:
+        _log("路径不存在：" + " ".join(args.cli))
         return 1
 
     def progress(i, total, _name):
         if i % 25 == 0 or i == total:
             _log("  ...%d/%d" % (i, total))
 
-    rows, others = scan_folder(args.cli, args.max_files, progress)
+    rows, others = scan_paths(paths, args.max_files, progress)
     s = summarize(rows)
     _log("")
-    _log("YUNYIN 标签体检  " + args.cli)
+    _log("YUNYIN 标签体检  " + (paths[0] if len(paths) == 1 else "(%d 项输入) %s …" % (len(paths), paths[0])))
     _log("扫描 %d 首%s" % (s["total"], ("（另有 %d 个播放器不支持的格式已跳过）" % others) if others else ""))
     _log("")
     for r in rows:
@@ -512,16 +558,125 @@ def open_url(url):
         _log(url)
 
 
+def _all_widgets(widget):
+    yield widget
+    for child in widget.winfo_children():
+        yield from _all_widgets(child)
+
+
+def enable_windows_drag_drop(root, on_drop):
+    """把 Windows 资源管理器的文件拖放（WM_DROPFILES）接到窗口上。
+
+    只用 ctypes 调 shell32 / user32，不依赖第三方库，也不需要额外打包 DLL。
+    非 Windows 或失败时返回 False —— 界面上的「选择文件夹 / 选择文件」照旧可用。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+
+        WM_DROPFILES = 0x0233
+        GWLP_WNDPROC = -4
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, ctypes.c_uint,
+                                     wintypes.WPARAM, wintypes.LPARAM)
+
+        shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+        shell32.DragQueryFileW.restype = ctypes.c_uint
+        shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, ctypes.c_uint,
+                                           wintypes.LPWSTR, ctypes.c_uint]
+        shell32.DragFinish.argtypes = [wintypes.HANDLE]
+
+        set_long = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+        set_long.restype = ctypes.c_void_p
+        set_long.argtypes = [wintypes.HWND, ctypes.c_int, WNDPROC]
+        call_prev = user32.CallWindowProcW
+        call_prev.restype = LRESULT
+        call_prev.argtypes = [ctypes.c_void_p, wintypes.HWND, ctypes.c_uint,
+                              wintypes.WPARAM, wintypes.LPARAM]
+
+        def take_paths(hdrop):
+            paths = []
+            count = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
+            for i in range(count):
+                need = shell32.DragQueryFileW(hdrop, i, None, 0) + 1
+                buf = ctypes.create_unicode_buffer(need)
+                shell32.DragQueryFileW(hdrop, i, buf, need)
+                if buf.value:
+                    paths.append(buf.value)
+            shell32.DragFinish(hdrop)
+            return paths
+
+        keep_alive = []
+        old_procs = {}
+
+        def make_proc(hwnd):
+            def proc(h, msg, wparam, lparam):
+                if msg == WM_DROPFILES:
+                    try:
+                        paths = take_paths(wparam)
+                        _debug_log("drop: " + " | ".join(paths))
+                        # 注意：窗口过程里不要直接调 Tkinter（after/bind 都可能不出队），
+                        # 只把结果丢进队列，让界面线程自己取。
+                        on_drop(paths)
+                    except Exception as exc:            # 拖放失败不能拖垮界面
+                        _debug_log("drop failed: %r" % (exc,))
+                    return 0
+                return call_prev(old_procs[hwnd], h, msg, wparam, lparam)
+            return WNDPROC(proc)
+
+        for widget in _all_widgets(root):
+            try:
+                hwnd = user32.GetParent(widget.winfo_id()) or widget.winfo_id()
+            except Exception:
+                continue
+            if not hwnd or hwnd in old_procs:
+                continue
+            shell32.DragAcceptFiles(wintypes.HWND(hwnd), True)
+            proc = make_proc(hwnd)
+            old = set_long(wintypes.HWND(hwnd), GWLP_WNDPROC, proc)
+            old_procs[hwnd] = old
+            keep_alive.append(proc)
+        root._tagcheck_dnd = keep_alive             # 挂在 root 上，防止被 GC 回收
+        _debug_log("drag&drop 已启用（%d 个窗口: %s）"
+                   % (len(keep_alive), ",".join(str(h) for h in old_procs)))
+        return True
+    except Exception as exc:
+        _debug_log("drag&drop 不可用: %r" % (exc,))
+        return False
+
+
 def run_gui():
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
 
     root = tk.Tk()
     root.title("YUNYIN 标签体检 —— 一键检查曲库标签是否规范")
-    root.geometry("1100x660")
-    root.minsize(920, 520)
+    # 按屏幕大小开窗并居中（高分屏缩放时也不会把列挤出窗口）
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    win_w = max(900, min(1280, int(sw * 0.78)))
+    win_h = max(520, min(760, int(sh * 0.78)))
+    root.geometry("%dx%d+%d+%d" % (win_w, win_h,
+                                   max(0, (sw - win_w) // 2), max(0, (sh - win_h) // 3)))
+    root.minsize(880, 500)
 
-    state = {"rows": [], "root_dir": ""}
+    def fit_window():
+        """按控件实际需要的尺寸再定一次窗口大小（高分屏缩放时内容会更高）。"""
+        root.update_idletasks()
+        w = min(max(win_w, root.winfo_reqwidth() + 24), max(900, sw - 40))
+        h = min(max(win_h, root.winfo_reqheight() + 24), max(520, sh - 80))
+        root.geometry("%dx%d+%d+%d" % (w, h, max(0, (sw - w) // 2), max(0, (sh - h) // 3)))
+        root.update_idletasks()
+        _debug_log("layout: window=%dx%d req=%dx%d table=%dx%d bottom=%d (窗高 %d)"
+                   % (w, h, root.winfo_reqwidth(), root.winfo_reqheight(),
+                      tree.winfo_width(), tree.winfo_height(),
+                      buttons.winfo_y() + buttons.winfo_height(), h))
+
+    state = {"rows": [], "root_dir": "", "inputs": []}
     msg_queue = queue.Queue()
     item_rows = {}          # Treeview 行 → 体检结果，双击时按行取，避免同名文件串台
 
@@ -539,8 +694,38 @@ def run_gui():
             path_var.set(d)
 
     ttk.Button(top, text="选择文件夹…", command=choose_dir).pack(side="left")
+    ttk.Button(top, text="选择文件…", command=lambda: choose_files()).pack(side="left", padx=(6, 0))
     start_btn = ttk.Button(top, text="开始检查")
     start_btn.pack(side="left", padx=6)
+
+    def set_inputs(paths):
+        """记录本次要检查的输入（文件或文件夹，可多个）。"""
+        state["inputs"] = list(paths)
+        if not paths:
+            path_var.set("")
+        elif len(paths) == 1:
+            path_var.set(paths[0])
+        else:
+            path_var.set("%s  等 %d 项" % (paths[0], len(paths)))
+
+    def choose_files():
+        d = filedialog.askopenfilenames(
+            title="选择音频文件（可多选）",
+            filetypes=[("音频文件", "*.mp3 *.flac *.ogg *.oga *.opus *.wav"), ("所有文件", "*.*")])
+        if d:
+            set_inputs(list(d))
+
+    def on_drop(paths):
+        """拖进来：文件夹递归展开，单个音频文件原样收下，可一次拖多个。"""
+        try:
+            _debug_log("on_drop: %d 项" % len(paths))
+            set_inputs(paths)
+            stat_var.set("已接收 %d 项，正在开始检查…" % len(paths))
+            start_scan()
+        except Exception as exc:
+            _debug_log("on_drop failed: %r" % (exc,))
+
+    entry.bind("<Key>", lambda _e: state.__setitem__("inputs", []))   # 手打路径时以输入框为准
 
     opts = ttk.Frame(root, padding=(10, 0))
     opts.pack(fill="x")
@@ -551,17 +736,19 @@ def run_gui():
     progress.pack(side="right")
 
     # ---- 结果表 ----------------------------------------------------------
-    columns = ("status", "name", "title", "artist", "album", "cover", "lyrics", "notes")
-    heads = {"status": ("状态", 76), "name": ("文件", 240), "title": ("标题", 170),
-             "artist": ("歌手", 130), "album": ("专辑", 130), "cover": ("封面", 90),
-             "lyrics": ("歌词", 55), "notes": ("说明（双击看详情）", 420)}
+    # 说明单独放在表格下方（选中哪行显示哪行），表格只留短字段，
+    # 这样列宽固定也不会被系统缩放挤出窗口。
+    columns = ("status", "name", "title", "artist", "album", "cover", "lyrics")
+    heads = {"status": ("状态", 56), "name": ("文件", 175), "title": ("标题", 130),
+             "artist": ("歌手", 110), "album": ("专辑", 110), "cover": ("封面", 76),
+             "lyrics": ("歌词", 44)}
     frame = ttk.Frame(root, padding=(10, 6))
     frame.pack(fill="both", expand=True)
     tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
     for c in columns:
         text, width = heads[c]
         tree.heading(c, text=text)
-        tree.column(c, width=width, anchor="w", stretch=(c == "notes"))
+        tree.column(c, width=width, minwidth=40, anchor="w", stretch=False)
     vs = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=vs.set)
     tree.pack(side="left", fill="both", expand=True)
@@ -570,9 +757,16 @@ def run_gui():
         tree.tag_configure(status, foreground=color)
 
     # ---- 底部：统计 + 导出 ----------------------------------------------
+    detail_var = tk.StringVar(value="选中上面任意一行，这里会显示它的完整说明。")
+    detail = tk.Label(root, textvariable=detail_var, justify="left", anchor="w",
+                      wraplength=1100, height=3, bg="#f6f8fa", fg="#24292f",
+                      relief="solid", borderwidth=1, padx=8, pady=4)
+    detail.pack(fill="x", padx=10, pady=(0, 6))
+
     bottom = ttk.Frame(root, padding=(10, 0))
     bottom.pack(fill="x")
-    stat_var = tk.StringVar(value="选好文件夹后点「开始检查」。规则和 Vita 上的播放器完全一致。")
+    stat_var = tk.StringVar(
+        value="选文件夹 / 选文件 / 把文件或文件夹拖进窗口都可以（可多选）。规则和 Vita 上的播放器完全一致。")
     ttk.Label(bottom, textvariable=stat_var, justify="left", wraplength=1060).pack(anchor="w")
 
     buttons = ttk.Frame(root, padding=(10, 8, 10, 10))
@@ -594,8 +788,7 @@ def run_gui():
             if only_bad.get() and r["status"] == "完整":
                 continue
             item = tree.insert("", "end", values=(r["status"], r["name"], r["title"], r["artist"],
-                                                  r["album"], r["cover"], r["lyrics"],
-                                                  "；".join(r["notes"])),
+                                                  r["album"], r["cover"], r["lyrics"]),
                                tags=(r["status"],))
             item_rows[item] = r
         if rows:
@@ -619,25 +812,40 @@ def run_gui():
 
     tree.bind("<Double-1>", show_detail)
 
+    def show_selected(_event=None):
+        sel = tree.selection()
+        if not sel or sel[0] not in item_rows:
+            detail_var.set("选中上面任意一行，这里会显示它的完整说明。")
+            return
+        r = item_rows[sel[0]]
+        detail_var.set("[%s] %s\n%s\n%s"
+                       % (r["status"], r["name"], "；".join(r["notes"]) or "（没发现问题）", r["file"]))
+
+    tree.bind("<<TreeviewSelect>>", show_selected)
+
     # ---- 扫描（后台线程 + 队列，界面不卡） --------------------------------
-    def scan_thread(folder):
+    def scan_thread(paths):
         def progress_cb(i, total, name):
             msg_queue.put(("progress", i, total, name))
 
-        rows, others = scan_folder(folder, progress=progress_cb)
+        rows, others = scan_paths(paths, progress=progress_cb)
         msg_queue.put(("done", rows, others))
 
     def pump():
         try:
             while True:
                 msg = msg_queue.get_nowait()
-                if msg[0] == "progress":
+                if msg[0] == "drop":
+                    _debug_log("pump: 收到 %d 项拖放" % len(msg[1]))
+                    on_drop(msg[1])
+                elif msg[0] == "progress":
                     _, i, total, name = msg
                     progress["value"] = 100.0 * i / total
                     stat_var.set("正在读取 %d/%d：%s" % (i, total, name))
                 else:
                     _, rows, others = msg
                     state["rows"] = rows
+                    _debug_log("scan done: %d 行（不支持格式 %d）" % (len(rows), others))
                     progress["value"] = 0
                     start_btn["state"] = "normal"
                     csv_btn["state"] = "normal"
@@ -646,31 +854,40 @@ def run_gui():
                     s = summarize(rows)
                     if others:
                         stat_var.set(stat_var.get() + "        （另有 %d 个播放器不支持的格式已跳过）" % others)
-                    if s["bad"] == 0:
-                        messagebox.showinfo("体检完成", "太好了，所有歌曲的标签都能被播放器正常读取。")
-                    else:
-                        messagebox.showinfo(
-                            "体检完成",
-                            "有 %d 首要处理%s。\n\n下一步：点「导出 Picard 待修清单」，"
-                            "把生成的 m3u8 拖进 Picard，全选 → Lookup → Save 即可。"
-                            % (s["bad"], ("（其中 %d 首乱码）" % s["garbled"]) if s["garbled"] else ""))
+                    if not os.environ.get("TAGCHECK_DEBUG_LOG"):     # 自动测试时不弹窗
+                        if s["bad"] == 0:
+                            messagebox.showinfo("体检完成", "太好了，所有歌曲的标签都能被播放器正常读取。")
+                        else:
+                            messagebox.showinfo(
+                                "体检完成",
+                                "有 %d 首要处理%s。\n\n下一步：点「导出 Picard 待修清单」，"
+                                "把生成的 m3u8 拖进 Picard，全选 → Lookup → Save 即可。"
+                                % (s["bad"], ("（其中 %d 首乱码）" % s["garbled"]) if s["garbled"] else ""))
         except queue.Empty:
             pass
         root.after(120, pump)
 
     def start_scan():
-        folder = path_var.get().strip().strip('"')
-        if not folder or not os.path.isdir(folder):
-            messagebox.showwarning("路径不对", "请先选择音乐文件夹（点「选择文件夹…」）。")
+        _debug_log("start_scan: inputs=%d" % len(state["inputs"]))
+        inputs = [p for p in state["inputs"] if os.path.exists(p)]
+        if not inputs:
+            typed = path_var.get().strip().strip('"')
+            if typed and os.path.exists(typed):
+                inputs = [typed]
+        if not inputs:
+            messagebox.showwarning("还没有选择音乐",
+                                   "点「选择文件夹…」或「选择文件…」，也可以直接把文件/文件夹拖进窗口。")
             return
-        state["root_dir"] = folder
+        state["inputs"] = inputs
+        first = inputs[0]
+        state["root_dir"] = first if os.path.isdir(first) else os.path.dirname(first)
         state["rows"] = []
         tree.delete(*tree.get_children())
         start_btn["state"] = "disabled"
         csv_btn["state"] = "disabled"
         m3u_btn["state"] = "disabled"
-        stat_var.set("开始扫描…")
-        threading.Thread(target=scan_thread, args=(folder,), daemon=True).start()
+        stat_var.set("开始扫描 %d 项输入…" % len(inputs) if len(inputs) > 1 else "开始扫描…")
+        threading.Thread(target=scan_thread, args=(inputs,), daemon=True).start()
 
     start_btn.configure(command=start_scan)
     entry.bind("<Return>", lambda _e: start_scan())
@@ -704,6 +921,11 @@ def run_gui():
 
     csv_btn.configure(command=export_csv)
     m3u_btn.configure(command=export_m3u)
+
+    # 所有控件建好之后再挂拖放，否则表格、按钮区收不到拖进来的文件。
+    # 传入的只是「把路径塞进队列」，真正的界面操作由 pump 在界面线程里做。
+    fit_window()
+    enable_windows_drag_drop(root, lambda paths: msg_queue.put(("drop", paths)))
 
     root.after(120, pump)
     root.mainloop()
