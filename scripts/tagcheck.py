@@ -542,10 +542,18 @@ def export_fix_folder(rows, dest_dir):
 # ---------------------------------------------------------------------------
 # 联网匹配：iTunes Search / MusicBrainz（+ Cover Art Archive 封面）
 # ---------------------------------------------------------------------------
-def _http_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8", "replace"))
+def _http_json(url, retries=2):
+    """GET 一个 JSON 接口，失败/限流时退避重试几次。"""
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception as exc:                 # 网络抖动 / 429 都值得再试一次
+            last = exc
+            time.sleep(0.7 * (attempt + 1))
+    raise last
 
 
 def _http_bytes(url, cap=MAX_ART):
@@ -785,6 +793,96 @@ def find_matches(row, sources=DEFAULT_SOURCES, limit=5, duration_ms=0):
 # ---------------------------------------------------------------------------
 # 写标签（mutagen；没装就跳过联网修复功能）
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 歌词：LRCLIB（免费、不需要 key，中文歌也有，带时间轴）
+# ---------------------------------------------------------------------------
+def lrclib_search(artist, title, album=None, duration_ms=None, limit=6):
+    """返回候选歌词列表（按匹配度排序），每项含 synced / plain 文本。"""
+    if not title:
+        return []
+    params = {"artist_name": artist or "", "track_name": title}
+    if album:
+        params["album_name"] = album
+    url = "https://lrclib.net/api/search?" + urllib.parse.urlencode(params)
+    try:
+        data = _http_json(url)
+        if not data:                       # LRCLIB 偶尔限流返回空，稍等一下再试
+            time.sleep(1.2)
+            data = _http_json(url)
+    except Exception:
+        return []
+    out = []
+    for item in (data or [])[:limit]:
+        synced = (item.get("syncedLyrics") or "").strip()
+        plain = (item.get("plainLyrics") or "").strip()
+        if not synced and not plain:
+            continue
+        out.append({
+            "title": item.get("trackName", ""),
+            "artist": item.get("artistName", ""),
+            "album": item.get("albumName", ""),
+            "duration": int((item.get("duration") or 0) * 1000) or None,
+            "synced": synced,
+            "plain": plain,
+            "instrumental": bool(item.get("instrumental")),
+        })
+    for c in out:
+        # 同步歌词优先，其次看歌名/时长
+        score = score_candidate({"title": c["title"], "artist": c["artist"],
+                                 "duration": c["duration"]}, artist, title, duration_ms)
+        if c["synced"]:
+            score += 0.05
+        c["score"] = min(1.0, score)
+    out.sort(key=lambda c: -c["score"])
+    return out
+
+
+def pick_lyrics(artist, title, album=None, duration_ms=None):
+    """挑一条最合适的歌词，返回 (要写入的文本, 说明) 或 (None, 说明)。"""
+    cands = lrclib_search(artist, title, album, duration_ms)
+    if not cands:
+        return None, "LRCLIB 里没找到歌词"
+    best = cands[0]
+    if best["score"] < 0.5:
+        return None, "歌词候选相似度太低（%.2f），没写入" % best["score"]
+    text = best["synced"] or best["plain"]
+    how = "带时间轴" if best["synced"] else "纯文本"
+    return text, "歌词来自 LRCLIB（%s，%s / %s）" % (how, best["artist"], best["title"])
+
+
+def apply_lyrics(path, text):
+    """把歌词写进文件：MP3 → USLT，FLAC / OGG / OPUS → LYRICS 注释。"""
+    if not HAS_MUTAGEN or not text:
+        return False, "没装 mutagen 或歌词为空"
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".mp3":
+            from mutagen.id3 import ID3, USLT, ID3NoHeaderError
+            try:
+                tags = ID3(path)
+            except ID3NoHeaderError:
+                tags = ID3()
+            tags.delall("USLT")
+            tags.add(USLT(encoding=3, lang="eng", desc="", text=text))
+            tags.save(path)
+        elif ext == ".flac":
+            from mutagen.flac import FLAC
+            f = FLAC(path)
+            f["LYRICS"] = text
+            f.save()
+        elif ext in (".ogg", ".oga", ".opus"):
+            from mutagen.oggvorbis import OggVorbis
+            from mutagen.oggopus import OggOpus
+            audio = OggOpus(path) if ext == ".opus" else OggVorbis(path)
+            audio["LYRICS"] = text
+            audio.save()
+        else:
+            return False, "这个格式不支持写歌词"
+    except Exception as exc:
+        return False, "写歌词失败：%s" % exc
+    return True, ""
+
+
 try:
     import mutagen                                   # noqa: F401
     HAS_MUTAGEN = True
@@ -930,6 +1028,7 @@ def run_cli(argv):
                     help="相似度阈值，低于它不写入（默认 %.2f）" % MATCH_THRESHOLD)
     ap.add_argument("--overwrite", action="store_true", help="覆盖已有标签（默认只补缺失/乱码的字段）")
     ap.add_argument("--no-cover", action="store_true", help="不下载内嵌封面")
+    ap.add_argument("--lyrics", action="store_true", help="同时匹配并嵌入歌词（LRCLIB，带时间轴优先）")
     args = ap.parse_args(argv)
 
     paths = [p for p in args.cli if os.path.exists(p)]
@@ -991,19 +1090,34 @@ def run_cli(argv):
                  % (used[0], used[1], best["source"], best["artist"], best["title"], best["album"]))
             if not args.apply:
                 continue
-            if best["score"] < args.threshold:
-                _log("         相似度低于 %.2f，跳过（不写）" % args.threshold)
-                skipped += 1
-                continue
-            broken = set()
-            for field, key in (("title", "Title"), ("artist", "Artist"), ("album", "Album")):
-                if any(n.startswith(key.lower() + "：") or n.startswith(field + "：") for n in r["notes"]):
-                    broken.add(field)
-            written, note = apply_tags(r["file"], best, overwrite=args.overwrite,
+            good = best["score"] >= args.threshold
+            did, note = [], ""
+            if good:
+                broken = set()
+                for field in ("title", "artist", "album"):
+                    if any(n.startswith(field + "：") for n in r["notes"]):
+                        broken.add(field)
+                did, note = apply_tags(r["file"], best, overwrite=args.overwrite,
                                        broken_fields=broken, want_cover=not args.no_cover)
-            if written:
+            if args.lyrics:
+                if good:
+                    q_artist, q_title, q_album = best["artist"], best["title"], best["album"]
+                else:
+                    q_artist, q_title = query_from_row(r)
+                    q_album = None
+                text, why = pick_lyrics(q_artist, q_title, q_album, file_duration_ms(r["file"]))
+                if text and apply_lyrics(r["file"], text)[0]:
+                    did.append("lyrics")
+                    _debug_log("lyrics %s: %s" % (r["name"], why))
+                elif not note:
+                    note = why
+                time.sleep(0.4)          # LRCLIB 别请求太密
+            if did:
                 fixed += 1
-                _log("         已写入：%s%s" % (", ".join(written), ("（%s）" % note) if note else ""))
+                _log("         已写入：%s%s" % (", ".join(did), ("（%s）" % note) if note else ""))
+            elif not good:
+                skipped += 1
+                _log("         相似度低于 %.2f，跳过（不写）" % args.threshold)
             else:
                 failed += 1
                 _log("         没写入任何字段%s" % (("：" + note) if note else ""))
@@ -1155,8 +1269,10 @@ def open_fix_dialog(root, rows, on_finished):
     opts.pack(fill="x")
     overwrite = tk.BooleanVar(value=False)
     want_cover = tk.BooleanVar(value=True)
+    want_lyrics = tk.BooleanVar(value=True)
     ttk.Checkbutton(opts, text="覆盖已有标签（慎用）", variable=overwrite).pack(side="left")
     ttk.Checkbutton(opts, text="下载并内嵌封面", variable=want_cover).pack(side="left", padx=(12, 0))
+    ttk.Checkbutton(opts, text="匹配并内嵌歌词（LRCLIB）", variable=want_lyrics).pack(side="left", padx=(12, 0))
     ttk.Label(opts, text="相似度阈值：").pack(side="left", padx=(12, 0))
     thr = tk.StringVar(value="%.2f" % MATCH_THRESHOLD)
     ttk.Entry(opts, textvariable=thr, width=6).pack(side="left")
@@ -1317,26 +1433,39 @@ def open_fix_dialog(root, rows, on_finished):
         ok = skip = fail = 0
         for i, r in enumerate(items, 1):
             info = state["matches"].get(r["file"])
-            if not info or not info["cands"]:
-                skip += 1
-                continue
-            best = info["cands"][info["pick"]]
-            if best["score"] < threshold():
-                skip += 1
-                q.put(("written", i, len(items), r["name"], "相似度低，跳过"))
-                continue
-            broken = set()
-            for field in ("title", "artist", "album"):
-                if any(n.startswith(field + "：") for n in r["notes"]):
-                    broken.add(field)
-            written, note = apply_tags(r["file"], best, overwrite=overwrite.get(),
+            best = info["cands"][info["pick"]] if (info and info["cands"]) else None
+            good = bool(best) and best["score"] >= threshold()
+            did = []
+            note = ""
+            if good:
+                broken = set()
+                for field in ("title", "artist", "album"):
+                    if any(n.startswith(field + "：") for n in r["notes"]):
+                        broken.add(field)
+                did, note = apply_tags(r["file"], best, overwrite=overwrite.get(),
                                        broken_fields=broken, want_cover=want_cover.get())
-            if written:
+            # 歌词：即使标签没匹配上，也按现有标签/文件名单独找一次
+            if want_lyrics.get():
+                if good:
+                    q_artist, q_title, q_album = best["artist"], best["title"], best["album"]
+                else:
+                    q_artist, q_title = query_from_row(r)
+                    q_album = None
+                text, why = pick_lyrics(q_artist, q_title, q_album, file_duration_ms(r["file"]))
+                if text and apply_lyrics(r["file"], text)[0]:
+                    did.append("歌词")
+                elif not note:
+                    note = why
+                time.sleep(0.4)          # LRCLIB 别请求太密
+            if did:
                 ok += 1
-                q.put(("written", i, len(items), r["name"], "写入 " + ",".join(written)))
-            else:
+                q.put(("written", i, len(items), r["name"], "写入 " + "、".join(did)))
+            elif good or note:
                 fail += 1
                 q.put(("written", i, len(items), r["name"], note or "没写入"))
+            else:
+                skip += 1
+                q.put(("written", i, len(items), r["name"], "相似度低，跳过"))
         q.put(("finished", ok, skip, fail))
 
     def apply(only_selected):
