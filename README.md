@@ -3,7 +3,7 @@
 <img src="screenshots/icon0.png" width="112" align="right" alt="YUNYIN">
 
 一款用 [PocketJS](https://pocketjs.dev) 开发
-（Solid 前端 + Rust 原生宿主，跑在 Vita 原生进程里），专为psvita开发的一款本地音乐播放器。受不了现有音乐播放器的古法UI，想要一个现代化、可自定义主题、支持中文歌词的本地音乐播放器，于是就自己写了。
+（Solid 前端 + Rust ，跑在 Vita 原生进程里），专为psvita开发的一款本地音乐播放器。受不了现有音乐播放器的古法UI，想要一个现代化、可自定义主题、支持中文歌词的本地音乐播放器，于是就自己写了。
 
 |  |  |
 | --- | --- |
