@@ -246,6 +246,7 @@ type UiSkin = (typeof UI_THEMES)[number];
 type UiSkinKey =
   | "screenBg" | "appBg" | "panel" | "lyricsPanel" | "card" | "cardFocus"
   | "nav" | "navActive" | "navFocus"
+  | "navHome" | "navList" | "navAlbum" | "navLoved" | "navSet"
   | "row" | "rowFocus" | "coverDefault" | "coverGlow" | "settingBg" | "aboutBg"
   | "playN" | "playF" | "pauseN" | "pauseP"
   | "prevN" | "prevF" | "nextN" | "nextF"
@@ -264,6 +265,11 @@ const SKINS: Record<UiSkin, SkinMap> = {
     nav: "asset/ui/light/nav.png",
     navActive: "asset/ui/light/nav_active.png",
     navFocus: "asset/ui/light/nav_focus.png",
+    navHome: "asset/ui/light/icon_nav_home.png",
+    navList: "asset/ui/light/icon_nav_list.png",
+    navAlbum: "asset/ui/light/icon_nav_album.png",
+    navLoved: "asset/ui/light/icon_nav_loved.png",
+    navSet: "asset/ui/light/icon_nav_set.png",
     row: "asset/ui/light/row.png",
     rowFocus: "asset/ui/light/row_focus.png",
     coverDefault: "asset/ui/light/cover_default.png",
@@ -297,6 +303,11 @@ const SKINS: Record<UiSkin, SkinMap> = {
     nav: "asset/ui/dark/nav.png",
     navActive: "asset/ui/dark/nav_active.png",
     navFocus: "asset/ui/dark/nav_focus.png",
+    navHome: "asset/ui/dark/icon_nav_home.png",
+    navList: "asset/ui/dark/icon_nav_list.png",
+    navAlbum: "asset/ui/dark/icon_nav_album.png",
+    navLoved: "asset/ui/dark/icon_nav_loved.png",
+    navSet: "asset/ui/dark/icon_nav_set.png",
     row: "asset/ui/dark/row.png",
     rowFocus: "asset/ui/dark/row_focus.png",
     coverDefault: "asset/ui/dark/cover_default.png",
@@ -330,6 +341,11 @@ const SKINS: Record<UiSkin, SkinMap> = {
     nav: "asset/ui/pure/nav.png",
     navActive: "asset/ui/pure/nav_active.png",
     navFocus: "asset/ui/pure/nav_focus.png",
+    navHome: "asset/ui/pure/icon_nav_home.png",
+    navList: "asset/ui/pure/icon_nav_list.png",
+    navAlbum: "asset/ui/pure/icon_nav_album.png",
+    navLoved: "asset/ui/pure/icon_nav_loved.png",
+    navSet: "asset/ui/pure/icon_nav_set.png",
     row: "asset/ui/pure/row.png",
     rowFocus: "asset/ui/pure/row_focus.png",
     coverDefault: "asset/ui/pure/cover_default.png",
@@ -363,6 +379,11 @@ const SKINS: Record<UiSkin, SkinMap> = {
     nav: "asset/ui/anime/nav.png",
     navActive: "asset/ui/anime/nav_active.png",
     navFocus: "asset/ui/anime/nav_focus.png",
+    navHome: "asset/ui/anime/icon_nav_home.png",
+    navList: "asset/ui/anime/icon_nav_list.png",
+    navAlbum: "asset/ui/anime/icon_nav_album.png",
+    navLoved: "asset/ui/anime/icon_nav_loved.png",
+    navSet: "asset/ui/anime/icon_nav_set.png",
     row: "asset/ui/anime/row.png",
     rowFocus: "asset/ui/anime/row_focus.png",
     coverDefault: "asset/ui/anime/cover_default.png",
@@ -388,7 +409,8 @@ const SKINS: Record<UiSkin, SkinMap> = {
   },
 };
 
-const [uiTheme, setUiTheme] = createSignal<UiSkin>("light");
+/* 启动默认皮肤（设置页里仍可切换，切换顺序 light → pure → anime → dark）。 */
+const [uiTheme, setUiTheme] = createSignal<UiSkin>("dark");
 const useSkin = (): SkinMap => SKINS[uiTheme()];
 
 /* 主题化文字色：dark 皮肤上文字要浅色，light 上深色。 */
@@ -1383,6 +1405,13 @@ function clip(s: string | undefined, n: number): string {
   return t.length <= n ? t : t.slice(0, Math.max(1, n - 1)) + "…";
 }
 
+function formatMs(ms: number): string {
+  const t = Math.max(0, Math.floor((ms || 0) / 1000));
+  const m = Math.floor(t / 60);
+  const s = t % 60;
+  return m + ":" + (s < 10 ? "0" : "") + s;
+}
+
 export default function Music() {
   /* =======================================================
    * DATA SOURCE — 未来接入真实曲库的唯一入口
@@ -2371,7 +2400,7 @@ export default function Music() {
       <View class="flex-row items-center justify-between h-6">
         <View class="flex-row items-center gap-1">
           <Text class={pTxt("brand")}>
-            云音 for vita
+            YUNYIN
           </Text>
         </View>
 
@@ -2590,11 +2619,10 @@ export default function Music() {
       {/* FOOTER */}
 
       <View class="flex-row items-center justify-between">
-      <Text class={pTxt("footer")}>↑↓ MOVE</Text>
-      <Text class={pTxt("footer")}>←→ SELECT</Text>
-      <Text class={pTxt("footer")}>● OK</Text>
-      <Text class={pTxt("footer")}>▲ BACK</Text>
-      <Text class={pTxt("footer")}>L/R PAGE</Text>
+      <Text class={pTxt("footer")}>○ SELECT</Text>
+      <Text class={pTxt("footer")}>△ BACK</Text>
+      <Text class={pTxt("footer")}>L PREV | R NEXT</Text>
+      <Text class={pTxt("footer")}>◎ MENU</Text>
       </View>
     </View>
   );
@@ -2604,6 +2632,17 @@ export default function Music() {
  * NAV ITEM
  * ======================================================= */
 
+/* label → 皮肤键。图标路径必须来自 SKINS 里的完整字面量：打包器只烘焙源码
+ * 中出现的字面量路径，`asset/ui/${theme}/icon_nav_${label}.png` 这种运行时
+ * 拼出来的路径不会被烘焙，于是图标全都空着（上一版的问题）。 */
+const NAV_ICON_KEY: Record<string, UiSkinKey> = {
+  HOME: "navHome",
+  LIST: "navList",
+  ALBUM: "navAlbum",
+  LOVED: "navLoved",
+  SET: "navSet",
+};
+
 function NavItem(props: {
   label: string;
   index: number;
@@ -2612,6 +2651,7 @@ function NavItem(props: {
   refNode: (node: NodeMirror) => void;
 }) {
   const isCursor = () => props.cursor() === props.index;
+  const icon = () => useSkin()[NAV_ICON_KEY[props.label] ?? "navHome"];
 
   return (
     <View
@@ -2627,15 +2667,10 @@ function NavItem(props: {
         src={isCursor() ? useSkin().navFocus : props.active ? useSkin().navActive : useSkin().nav}
         class="absolute inset-0 w-full h-full"
       />
-      <Text
-        class={
-          isCursor() || props.active
-            ? pTxt("navActive")
-            : pTxt("nav")
-        }
-      >
-        {props.label}
-      </Text>
+      <Image
+        src={icon()}
+        class="relative w-5 h-5"
+      />
     </View>
   );
 }
@@ -2653,20 +2688,21 @@ function Bars(props: {
    * 避免 5 个独立响应式节点各自重算。 */
   const heights = createMemo(() => {
     const f = props.frame();
+    /* 柱子尺寸：高 4–20px、宽 5px（原来 5–30px / 8px，整体细一圈小一圈）。 */
     if (!props.playing()) {
-      return Array.from({ length: props.count }, () => 5);
+      return Array.from({ length: props.count }, () => 4);
     }
     return Array.from({ length: props.count }, (_, i) => {
       const value = Math.abs(Math.sin(f * 0.9 + i * 1.7));
-      return 5 + Math.round(value * 25);
+      return 4 + Math.round(value * 16);
     });
   });
 
   return (
-    <View class="absolute inset-0 flex-row items-end justify-center gap-2 pb-4">
+    <View class="absolute inset-0 flex-row items-end justify-center gap-[6] pb-4">
       {Array.from({ length: props.count }, (_, i) => (
         <View
-          class="w-2 rounded-md bg-white"
+          class="w-[5] rounded-md bg-white"
           style={{ height: heights()[i] }}
         />
       ))}
@@ -2684,11 +2720,20 @@ function HomePage(props: {
   playbackMode: () => PlaybackMode;
   favorite: () => boolean;
 }) {
-  const buttonClass = (index: number, round: boolean) => {
-    void round;
-    return props.cursor() === index
-      ? "relative w-[35] h-[35] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-110"
-      : "relative w-[35] h-[35] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-100";
+  const buttonClass = (index: number, big: boolean) => {
+    /* 注意：这里必须返回**完整**的类字面量。PocketJS 的样式表是按源码里
+     * 出现的字面量烘焙的，`box + " scale-110"` 这种拼接在运行时拼出来的
+     * 字符串匹配不到任何样式，View 就没有宽高（配合 overflow-hidden 直接
+     * 把图标裁没了）——上一版就是这么把前一首/后一首/循环/爱心弄丢的。 */
+    const focused = props.cursor() === index;
+    if (big) {
+      return focused
+        ? "relative w-[44] h-[44] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-110"
+        : "relative w-[44] h-[44] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-100";
+    }
+    return focused
+      ? "relative w-[32] h-[32] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-110"
+      : "relative w-[32] h-[32] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-100";
   };
 
   const lyricsButtonClass = () =>
@@ -2728,31 +2773,34 @@ function HomePage(props: {
           <Image src={useSkin().panel} class="absolute inset-0 w-full h-full" />
           <View class="relative flex-col justify-center gap-1 w-[184] h-48 p-1">
             <Text class={pTxt("album")}>{clip(props.track().album, 24)}</Text>
-            <Text class={pTxt("title")}>{clip(props.track().title, 18)}</Text>
-            <Text class={pTxt("artist")}>{clip(props.track().artist, 30)}</Text>
+            <Text class={pTxt("title")}>{clip(props.track().title, 16)}</Text>
+            <Text class={pTxt("artist")}>{clip(props.track().artist, 28)}</Text>
 
             {/* PROGRESS */}
-            <View class="flex-row items-center gap-1">
-              <View class="w-45 h-2 rounded-md bg-slate-200 overflow-hidden">
-                <View class="w-0 h-2 rounded-md bg-orange-500" style={{ width: progressWidth() }} />
+            <View class="flex-col gap-0">
+              <View class="w-45 h-1 rounded-md bg-slate-200 overflow-hidden">
+                <View class="w-0 h-1 rounded-md bg-orange-500" style={{ width: progressWidth() }} />
               </View>
-              <Text class={pTxt("percent")}>{props.percent()}%</Text>
+              <View class="flex-row items-center justify-between w-45">
+                <Text class={pTxt("percent")}>{formatMs(props.position())}</Text>
+                <Text class={pTxt("percent")}>{formatMs(getTrackDuration(props.track()))}</Text>
+              </View>
             </View>
 
-            {/* PLAYER BUTTONS */}
-            <View class="flex-row items-center gap-1">
-              <View class={buttonClass(0, true)}>
+            {/* PLAYER BUTTONS — 车机风格：暂停键更大 */}
+            <View class="flex-row items-center justify-center gap-1">
+              <View class={buttonClass(0, false)}>
                 <Image src={props.cursor() === 0 ? useSkin().prevF : useSkin().prevN} class="absolute inset-0 w-full h-full" />
               </View>
               <View
                 class={
                   props.playing()
                     ? (props.cursor() === 1
-                        ? "relative w-[35] h-[35] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-110 animate-pulse"
-                        : "relative w-[35] h-[35] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-100 animate-pulse")
+                        ? "relative w-[44] h-[44] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-110 animate-pulse"
+                        : "relative w-[44] h-[44] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-100 animate-pulse")
                     : (props.cursor() === 1
-                        ? "relative w-[35] h-[35] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-110"
-                        : "relative w-[35] h-[35] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-100")
+                        ? "relative w-[44] h-[44] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-110"
+                        : "relative w-[44] h-[44] overflow-hidden flex-col items-center justify-center transition-transform duration-150 ease-out-back scale-100")
                 }
               >
                 <Image
@@ -2764,7 +2812,7 @@ function HomePage(props: {
                   class="absolute inset-0 w-full h-full"
                 />
               </View>
-              <View class={buttonClass(2, true)}>
+              <View class={buttonClass(2, false)}>
                 <Image src={props.cursor() === 2 ? useSkin().nextF : useSkin().nextN} class="absolute inset-0 w-full h-full" />
               </View>
               <View class={buttonClass(3, false)}>
@@ -2789,18 +2837,13 @@ function HomePage(props: {
               </View>
             </View>
 
-            {/* STATUS */}
+            {/* STATUS + LYRICS — 合并成一行，给封面/进度留空 */}
             <View class="flex-row items-center gap-2">
               <Text class={pTxt("label")}>MODE</Text>
               <Text class={pTxt("status")}>
                 {props.playbackMode() === "sequence" ? "LIST" : "ONE"}
               </Text>
               <Text class={pTxt("label")}>{props.favorite() ? "LOVED" : ""}</Text>
-            </View>
-
-            {/* LYRICS BUTTON */}
-            <View class="flex-row items-center gap-2">
-              <Text class={pTxt("label")}>VIEW</Text>
               <View class={lyricsButtonClass()}>
                 <Text
                   class={
@@ -2934,10 +2977,13 @@ function MusicListPage(props: {
   );
 
   return (
+    /* 这张卡片和设计稿一样是浅色的，所以标题/副标题要用「浅底版」文字色：
+     * listTitle / listSub 是给专辑页那种深色背景配的（dark / anime 下是浅色
+     * 字），直接拿来用在这个浅色卡片上，标题就整行看不见了。 */
     <View class="flex-col w-96 h-48 p-2 gap-1 rounded-xl bg-slate-100 border-slate-300">
       <View class="flex-row items-center justify-between h-7">
-        <Text class={pTxt("listTitle")}>{clip(props.title, 30)}</Text>
-        <Text class={pTxt("listSub")}>{props.subtitle}</Text>
+        <Text class={pTxt("listPanelTitle")}>{clip(props.title, 30)}</Text>
+        <Text class={pTxt("listPanelSub")}>{props.subtitle}</Text>
       </View>
 
       {visible().map((trackId, localIndex) => {
@@ -2990,7 +3036,7 @@ function MusicListPage(props: {
       })}
 
       <View class="flex-row items-center justify-end">
-        <Text class={pTxt("listSub")}>
+        <Text class={pTxt("listPanelSub")}>
           {props.trackIds.length > 0
             ? `${props.cursor() + 1} / ${props.trackIds.length}`
             : "0 / 0"}
