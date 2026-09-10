@@ -8,7 +8,7 @@
 |  |  |
 | --- | --- |
 | 曲库目录 | `ux0:/data/yunyin/music` |
-| 音频格式 | MP3 / OGG / WAV / FLAC / OPUS |
+| 音频格式 | MP3（最推荐格式！！） / OGG / WAV / FLAC / OPUS |
 | 界面 | 首页播放器 · 全部曲目 · 专辑 · 收藏 · 设置 |
 | 主题 | LIGHT / DARK / PURE / ANIME 四套，**默认 DARK** |
 
