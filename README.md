@@ -76,19 +76,29 @@
 | 只有文件尾那种老式 ID3v1，或者压根没有标签 | 只显示文件名，歌手 `Local`、专辑 `Unknown` |
 | 封面不是内嵌的 JPEG / PNG，或体积超过 1MB | 显示默认封面 |
 
-### 先体检：`scripts/check-tags.ps1`
+### 先体检：YUNYIN 标签体检（图形界面）
 
-在 PC 上跑一遍，它按**和播放器完全相同的规则**读标签，逐首告诉你缺什么、哪些是乱码：
+下载 Release 附件里的 **`YUNYIN-TagCheck.exe`**，双击打开 → 选音乐文件夹 → 点「开始检查」。
+它用的是**和播放器完全相同的标签读取规则**，所以报告出来的就是播放器真实会看到的结果：
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\check-tags.ps1 -Path "D:\Music" -Csv report.csv -Playlist music-to-fix.m3u8
+- 每首歌的状态（完整 / 可改善 / 建议整理 / 乱码）+ 缺哪几项，红色标出有问题的
+- 乱码的歌直接写出「正确内容应该是『…』」，方便确认检测准不准
+- 双击某一行看这首歌的完整详情
+
+界面上两个导出按钮：
+
+- **导出明细 CSV** —— 全量报告，Excel 直接打开
+- **导出 Picard 待修清单** —— 生成 m3u8，拖进 Picard 即可一次载入所有需要修的曲目
+
+源码就是 `scripts/tagcheck.py`（纯 Python 标准库 + tkinter，不依赖任何第三方库），也能当命令行用：
+
+```
+python scripts/tagcheck.py                     # 图形界面
+python scripts/tagcheck.py --cli "D:\Music" --csv report.csv --m3u8 music-to-fix.m3u8
 ```
 
-也可以直接把音乐文件夹拖到 `scripts\check-tags.cmd` 上。它会给出：
-
-- 每首歌的状态：完整 / 可改善 / 建议整理 / 乱码，并列出缺哪几项
-- 乱码的歌会直接写出「正确内容应为『…』」，方便确认
-- `report.csv` 明细表；`music-to-fix.m3u8` 是全部待处理曲目，拖进 Picard 即可一次载入
+要自己重新打包 exe：`powershell -ExecutionPolicy Bypass -File scripts\build-tagcheck-exe.ps1`
+（需要 Python 3.10+ 且勾选了 tcl/tk；脚本会自动装 pyinstaller）
 
 ### 再修：MusicBrainz Picard
 
