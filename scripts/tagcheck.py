@@ -20,8 +20,13 @@
 import os
 import re
 import sys
+import json
+import time
+import difflib
 import queue
 import threading
+import urllib.parse
+import urllib.request
 
 # --- 与播放器一致的常量 ---------------------------------------------------
 PREFIX_CAP = 1024 * 1024 + 65536     # media.rs: PREFIX_CAP
@@ -29,6 +34,9 @@ MAX_ART = 1024 * 1024                # media.rs: MAX_ART（封面超过就忽略
 AUDIO_EXT = (".mp3", ".flac", ".ogg", ".oga", ".opus", ".wav")
 OTHER_EXT = (".m4a", ".aac", ".wma", ".aiff", ".aif", ".mp4", ".ape", ".wv")
 PICARD_URL = "https://picard.musicbrainz.org/"
+UA = "YUNYIN-TagCheck/1.0 (+https://github.com/ATSPwang618/YUNYIN)"
+HTTP_TIMEOUT = 20
+MATCH_THRESHOLD = 0.72          # 相似度低于这个值就不建议自动写入
 
 CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uff01-\uff5e]")
 # 常用汉字（简繁各取一些），用来判断 GBK / Big5 哪种解码更合理
@@ -116,7 +124,11 @@ def decode_id3_text(data):
         # 播放器两种情况都按小端解
         app = _strip_nul(body.decode("utf-16-le", "replace"))
         be = _strip_nul(body.decode("utf-16-be", "replace"))
-        if body[:2] == b"\xfe\xff" or (not CJK_RE.search(app) and CJK_RE.search(be)):
+        # 大端判定：有 FEFF BOM 一定是大端；没有 BOM 时，若小端解出来是干净的
+        # ASCII（说明就是正常的小端），就不要误判——纯英文标签字节交换后也会
+        # 落进汉字区，只看"有没有汉字"会误报。
+        app_is_ascii = bool(app) and all(ord(c) < 128 for c in app)
+        if body[:2] == b"\xfe\xff" or (not app_is_ascii and not CJK_RE.search(app) and CJK_RE.search(be)):
             return app, be, True, "UTF-16 大端标签：播放器按小端解，会乱码"
         return app, app, False, ""
 
@@ -491,6 +503,350 @@ def write_m3u8(rows, path):
                 f.write(r["file"] + "\n")
 
 
+def export_fix_folder(rows, dest_dir):
+    """把待修文件「硬链接」到一个文件夹里，方便整包拖进 Picard。
+
+    Picard 不认播放列表（.m3u8），只认音频文件和文件夹；硬链接不占额外空间，
+    Picard 改写标签时改的就是原文件。跨盘等硬链接失败的情况退回复制。
+    返回 (链接数, 复制数, 失败清单)。
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    linked = copied = 0
+    failed = []
+    used = set()
+    for r in rows:
+        if r["status"] == "完整":
+            continue
+        src = r["file"]
+        name = os.path.basename(src)
+        target = os.path.join(dest_dir, name)
+        n = 1
+        while os.path.normcase(target) in used or os.path.exists(target):
+            stem, ext = os.path.splitext(name)
+            target = os.path.join(dest_dir, "%s (%d)%s" % (stem, n, ext))
+            n += 1
+        used.add(os.path.normcase(target))
+        try:
+            os.link(src, target)
+            linked += 1
+        except OSError:
+            try:
+                import shutil
+                shutil.copy2(src, target)
+                copied += 1
+            except OSError as exc:
+                failed.append("%s（%s）" % (name, exc))
+    return linked, copied, failed
+
+
+# ---------------------------------------------------------------------------
+# 联网匹配：iTunes Search / MusicBrainz（+ Cover Art Archive 封面）
+# ---------------------------------------------------------------------------
+def _http_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _http_bytes(url, cap=MAX_ART):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        data = resp.read(cap + 1)
+    if len(data) > cap:
+        return None
+    return data
+
+
+def name_hint(path):
+    """没有可用标签时，从文件名猜（歌手 - 歌名 / 01 歌名 之类）。"""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    stem = re.sub(r"^\s*\d{1,3}[.\-_、 ]+", "", stem).strip()     # 去掉开头序号
+    stem = re.sub(r"[\[(（【][^\]）)】]*(?:320k|128k|flac|hi-?res|hq|无损|官方|高音质)[^\]）)】]*[\]）)】]",
+                  "", stem, flags=re.I).strip()
+    if " - " in stem:
+        artist, title = stem.split(" - ", 1)
+        return artist.strip(), title.strip()
+    return "", stem.strip()
+
+
+def query_from_row(row, force_name=False):
+    """决定用什么关键词去搜：优先用现有标签，乱码或缺失时退回文件名。"""
+    title, artist = row.get("title", ""), row.get("artist", "")
+    broken = any(("编码" in n or "UTF-16" in n) for n in row.get("notes", []))
+    if force_name or broken or not title or title.startswith("（缺") or artist.startswith("（缺"):
+        hint_artist, hint_title = name_hint(row["file"])
+        title = hint_title or title
+        artist = hint_artist or (artist if not artist.startswith("（缺") else "")
+    return artist.strip(), title.strip()
+
+
+def itunes_search(artist, title, limit=5):
+    term = " ".join(x for x in (artist, title) if x).strip()
+    if not term:
+        return []
+    url = "https://itunes.apple.com/search?" + urllib.parse.urlencode(
+        {"term": term, "entity": "song", "limit": limit})
+    try:
+        data = _http_json(url)
+    except Exception:
+        return []
+    out = []
+    for item in data.get("results", [])[:limit]:
+        art = item.get("artworkUrl100", "")
+        out.append({
+            "source": "iTunes",
+            "title": item.get("trackName", ""),
+            "artist": item.get("artistName", ""),
+            "album": item.get("collectionName", ""),
+            "year": (item.get("releaseDate", "") or "")[:4],
+            "track": item.get("trackNumber"),
+            "duration": item.get("trackTimeMillis"),
+            "cover_url": art.replace("100x100bb", "600x600bb") if art else None,
+        })
+    return out
+
+
+def musicbrainz_search(artist, title, limit=5):
+    parts = []
+    if title:
+        parts.append('recording:"%s"' % title.replace('"', " "))
+    if artist:
+        parts.append('artist:"%s"' % artist.replace('"', " "))
+    if not parts:
+        return []
+    url = "https://musicbrainz.org/ws/2/recording/?" + urllib.parse.urlencode(
+        {"query": " AND ".join(parts), "fmt": "json", "limit": limit})
+    time.sleep(1.0)                     # MusicBrainz 要求每秒最多 1 个请求
+    try:
+        data = _http_json(url)
+    except Exception:
+        return []
+    out = []
+    for rec in data.get("recordings", [])[:limit]:
+        credits = rec.get("artist-credit") or []
+        names = []
+        for c in credits:
+            if isinstance(c, dict) and c.get("name"):
+                names.append(c["name"])
+        releases = rec.get("releases") or []
+        rel = releases[0] if releases else {}
+        cover = ("https://coverartarchive.org/release/%s/front-500" % rel["id"]) if rel.get("id") else None
+        out.append({
+            "source": "MusicBrainz",
+            "title": rec.get("title", ""),
+            "artist": " / ".join(names),
+            "album": rel.get("title", ""),
+            "year": (rel.get("date", "") or "")[:4],
+            "track": None,
+            "duration": rec.get("length"),
+            "cover_url": cover,
+        })
+    return out
+
+
+def _norm(s):
+    return re.sub(r"[\s\-_·、,.，。()[\]（）【】!！?？'\"’“”]+", "", (s or "").lower())
+
+
+def _has_cjk(s):
+    return bool(CJK_RE.search(s or ""))
+
+
+def score_candidate(cand, artist, title, duration_ms=None):
+    qt, ct = _norm(title), _norm(cand.get("title"))
+    qa, ca = _norm(artist), _norm(cand.get("artist"))
+    t = difflib.SequenceMatcher(None, qt, ct).ratio()
+    a = difflib.SequenceMatcher(None, qa, ca).ratio()
+    # 文件名里常带多余信息（「小森林 Little Forest」「Title (Remix) [320k]」），
+    # 只要一方完整包含另一方，就按高度匹配算。
+    if qt and ct and (qt in ct or ct in qt):
+        t = max(t, 0.95)
+    if qa and ca and (qa in ca or ca in qa):
+        a = max(a, 0.95)
+    # 数据库里常把中文/日文歌手写成罗马音（赵雷 vs Lei Zhao），跨文字系统时
+    # 别拿歌手名去扣分，否则明明对上的歌也会被压到阈值以下。
+    if artist and _has_cjk(artist) == _has_cjk(cand.get("artist", "")):
+        score = 0.7 * t + 0.3 * a
+    else:
+        score = t
+    # 时长只当软信号：标题已经高度一致时不扣分（不同版本差几十秒很常见）
+    if duration_ms and cand.get("duration"):
+        diff = abs(duration_ms - cand["duration"]) / 1000.0
+        if diff <= 8:
+            score += 0.05
+        elif t < 0.95:
+            score -= min(0.25, (diff - 8) / 120.0)
+    return max(0.0, min(1.0, score))
+
+
+def find_matches(row, sources=("itunes", "musicbrainz"), limit=5, duration_ms=0):
+    """返回 (候选列表（按相似度降序）, 用到的查询词)。
+
+    中文曲库的文件名常写成「歌名 - 歌手」，和标签顺序相反，所以两种顺序都试一遍。
+    """
+    artist, title = query_from_row(row)
+    queries = []
+    if artist or title:
+        queries.append((artist, title))
+    hint_artist, hint_title = name_hint(row["file"])
+    for q in ((hint_artist, hint_title), (hint_title, hint_artist)):
+        if (q[0] or q[1]) and q not in queries:
+            queries.append(q)
+    queries = queries[:2]
+
+    cands = []
+    seen = {}                       # key -> 候选，用来去重并在两种查询顺序间取高分
+    for q_artist, q_title in queries:
+        found = []
+        if "itunes" in sources:
+            found += itunes_search(q_artist, q_title, limit)
+        if "musicbrainz" in sources:
+            found += musicbrainz_search(q_artist, q_title, limit)
+        for c in found:
+            key = (c["source"], _norm(c["title"]), _norm(c["artist"]), _norm(c["album"]))
+            c["score"] = score_candidate(c, q_artist, q_title, duration_ms)
+            c["query"] = "%s - %s" % (q_artist, q_title)
+            if key in seen:
+                # 同一首可能被两种查询都搜到，取分高的那次（否则会被错误顺序的低分覆盖）
+                old = seen[key]
+                if c["score"] > old["score"]:
+                    old["score"] = c["score"]
+                    old["query"] = c["query"]
+                continue
+            seen[key] = c
+            cands.append(c)
+    cands.sort(key=lambda c: -c["score"])
+    return cands, (artist, title)
+
+
+# ---------------------------------------------------------------------------
+# 写标签（mutagen；没装就跳过联网修复功能）
+# ---------------------------------------------------------------------------
+try:
+    import mutagen                                   # noqa: F401
+    HAS_MUTAGEN = True
+    MUTAGEN_ERROR = ""
+except Exception as _exc:                            # pragma: no cover
+    HAS_MUTAGEN = False
+    MUTAGEN_ERROR = "%s: %s" % (type(_exc).__name__, _exc)
+
+
+def file_duration_ms(path):
+    """取音频时长（毫秒），拿不到就 0。用来给匹配结果加一道时长校验。"""
+    if not HAS_MUTAGEN:
+        return 0
+    try:
+        import mutagen
+        info = mutagen.File(path)
+        return int((info.info.length or 0) * 1000) if info and info.info else 0
+    except Exception:
+        return 0
+
+
+def _embed_cover(path, data):
+    """把封面写进文件（MP3 / FLAC / OGG / OPUS；WAV 跳过）。"""
+    ext = os.path.splitext(path)[1].lower()
+    mime = "image/png" if data[:4] == b"\x89PNG" else "image/jpeg"
+    if ext == ".mp3":
+        from mutagen.id3 import ID3, APIC, ID3NoHeaderError
+        try:
+            tags = ID3(path)
+        except ID3NoHeaderError:
+            tags = ID3()
+        tags.delall("APIC")
+        tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=data))
+        tags.save(path)
+    elif ext == ".flac":
+        from mutagen.flac import FLAC, Picture
+        f = FLAC(path)
+        f.clear_pictures()
+        pic = Picture()
+        pic.type, pic.mime, pic.desc = 3, mime, "Cover"
+        pic.data = data
+        f.add_picture(pic)
+        f.save()
+    elif ext in (".ogg", ".oga", ".opus"):
+        import base64
+        from mutagen.flac import Picture
+        from mutagen.oggvorbis import OggVorbis
+        from mutagen.oggopus import OggOpus
+        pic = Picture()
+        pic.type, pic.mime, pic.desc = 3, mime, "Cover"
+        pic.data = data
+        audio = OggOpus(path) if ext == ".opus" else OggVorbis(path)
+        audio["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
+        audio.save()
+    else:
+        return False
+    return True
+
+
+def apply_tags(path, cand, overwrite=False, broken_fields=(), want_cover=True):
+    """把匹配结果写进文件。默认只补「缺失或乱码」的字段，不覆盖已有好标签。
+
+    返回 (写入了哪些字段, 说明)。
+    """
+    if not HAS_MUTAGEN:
+        return [], "没装 mutagen，无法写标签"
+    import mutagen
+    from mutagen.easyid3 import EasyID3
+    from mutagen.id3 import ID3NoHeaderError
+
+    audio = mutagen.File(path, easy=True)
+    if audio is None:
+        return [], "这个格式暂时不支持写标签"
+    if audio.tags is None:
+        try:
+            audio.add_tags()
+        except Exception as exc:
+            return [], "无法创建标签：%s" % exc
+
+    def current(key):
+        v = audio.tags.get(key)
+        return v[0] if v else ""
+
+    mapping = [("title", cand.get("title")), ("artist", cand.get("artist")),
+               ("album", cand.get("album")), ("albumartist", cand.get("artist")),
+               ("date", cand.get("year"))]
+    written = []
+    for key, value in mapping:
+        if not value:
+            continue
+        existing = current(key)
+        if existing and not overwrite and key not in broken_fields:
+            continue
+        try:
+            audio.tags[key] = [str(value)]
+            written.append(key)
+        except Exception:
+            pass
+    if cand.get("track"):
+        try:
+            if overwrite or not current("tracknumber"):
+                audio.tags["tracknumber"] = [str(cand["track"])]
+                written.append("tracknumber")
+        except Exception:
+            pass
+    try:
+        audio.save()
+    except Exception as exc:
+        return [], "保存失败：%s" % exc
+
+    note = ""
+    if want_cover and cand.get("cover_url"):
+        try:
+            data = _http_bytes(cand["cover_url"])
+            if data is None:
+                note = "封面超过 1MB，已跳过（播放器本来也会忽略）"
+            elif _embed_cover(path, data):
+                written.append("cover")
+            else:
+                note = "这个格式没写入封面"
+        except Exception as exc:
+            note = "封面下载失败：%s" % exc
+    return written, note
+
+
 # ---------------------------------------------------------------------------
 # 命令行模式
 # ---------------------------------------------------------------------------
@@ -503,6 +859,14 @@ def run_cli(argv):
     ap.add_argument("--m3u8", help="导出 Picard 待修清单")
     ap.add_argument("--only-problems", action="store_true", help="只列需要处理的")
     ap.add_argument("--max-files", type=int, default=2000)
+    ap.add_argument("--match", action="store_true", help="联网匹配标签（iTunes / MusicBrainz），只打印结果")
+    ap.add_argument("--apply", action="store_true", help="配合 --match：把匹配结果写进文件")
+    ap.add_argument("--all", action="store_true", help="连标签完整的歌也一起匹配")
+    ap.add_argument("--limit", type=int, default=5, help="每首歌取几个候选（默认 5）")
+    ap.add_argument("--threshold", type=float, default=MATCH_THRESHOLD,
+                    help="相似度阈值，低于它不写入（默认 %.2f）" % MATCH_THRESHOLD)
+    ap.add_argument("--overwrite", action="store_true", help="覆盖已有标签（默认只补缺失/乱码的字段）")
+    ap.add_argument("--no-cover", action="store_true", help="不下载内嵌封面")
     args = ap.parse_args(argv)
 
     paths = [p for p in args.cli if os.path.exists(p)]
@@ -537,6 +901,47 @@ def run_cli(argv):
     if args.m3u8:
         write_m3u8(rows, args.m3u8)
         _log("待修清单已导出：" + os.path.abspath(args.m3u8))
+
+    if args.match:
+        if args.apply and not HAS_MUTAGEN:
+            _log("要写入标签需要 mutagen（python -m pip install mutagen）")
+            if MUTAGEN_ERROR:
+                _log("  mutagen 导入失败：" + MUTAGEN_ERROR)
+            return 2
+        targets = [r for r in rows if args.all or r["status"] != "完整"]
+        _log("")
+        _log("联网匹配 %d 首%s" % (len(targets), "（写入模式）" if args.apply else "（只看结果）"))
+        fixed = skipped = failed = 0
+        for r in targets:
+            cands, used = find_matches(r, limit=args.limit,
+                                       duration_ms=file_duration_ms(r["file"]))
+            if not cands:
+                _log("  [无匹配] %s   （查询：%s / %s）" % (r["name"], used[0], used[1]))
+                skipped += 1
+                continue
+            best = cands[0]
+            _log("  [%.2f] %s" % (best["score"], r["name"]))
+            _log("         查询「%s - %s」 → %s / %s / %s（%s）"
+                 % (used[0], used[1], best["source"], best["artist"], best["title"], best["album"]))
+            if not args.apply:
+                continue
+            if best["score"] < args.threshold:
+                _log("         相似度低于 %.2f，跳过（不写）" % args.threshold)
+                skipped += 1
+                continue
+            broken = set()
+            for field, key in (("title", "Title"), ("artist", "Artist"), ("album", "Album")):
+                if any(n.startswith(key.lower() + "：") or n.startswith(field + "：") for n in r["notes"]):
+                    broken.add(field)
+            written, note = apply_tags(r["file"], best, overwrite=args.overwrite,
+                                       broken_fields=broken, want_cover=not args.no_cover)
+            if written:
+                fixed += 1
+                _log("         已写入：%s%s" % (", ".join(written), ("（%s）" % note) if note else ""))
+            else:
+                failed += 1
+                _log("         没写入任何字段%s" % (("：" + note) if note else ""))
+        _log("匹配完成：写入 %d 首 / 跳过 %d 首 / 失败 %d 首" % (fixed, skipped, failed))
     return 0
 
 
@@ -648,6 +1053,242 @@ def enable_windows_drag_drop(root, on_drop):
     except Exception as exc:
         _debug_log("drag&drop 不可用: %r" % (exc,))
         return False
+
+
+def open_fix_dialog(root, rows, on_finished):
+    """联网匹配并写标签的窗口：iTunes + MusicBrainz 搜索，mutagen 写回文件。"""
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+
+    targets = [r for r in rows if r["status"] != "完整"]
+    if not targets:
+        messagebox.showinfo("联网匹配", "当前没有需要处理的曲目。")
+        return
+    if not HAS_MUTAGEN:
+        messagebox.showwarning("联网匹配",
+                               "写入标签需要 mutagen 库：\n\npython -m pip install mutagen")
+        return
+
+    win = tk.Toplevel(root)
+    win.title("联网匹配并修复 —— iTunes / MusicBrainz")
+    win.transient(root)
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    w, h = min(1040, max(820, sw - 200)), min(620, max(480, sh - 240))
+    win.geometry("%dx%d+%d+%d" % (w, h, max(0, (sw - w) // 2), max(0, (sh - h) // 3)))
+
+    state = {"matches": {}, "busy": False}
+    q = queue.Queue()
+
+    head = ttk.Frame(win, padding=10)
+    head.pack(fill="x")
+    ttk.Label(head, justify="left",
+              text="用现有标签（乱码/缺失时用文件名）去数据库搜索，只写入匹配上的结果。\n"
+                   "默认只补「缺失或乱码」的字段，不动你已经写好的标签。").pack(anchor="w")
+
+    opts = ttk.Frame(win, padding=(10, 0))
+    opts.pack(fill="x")
+    overwrite = tk.BooleanVar(value=False)
+    want_cover = tk.BooleanVar(value=True)
+    ttk.Checkbutton(opts, text="覆盖已有标签（慎用）", variable=overwrite).pack(side="left")
+    ttk.Checkbutton(opts, text="下载并内嵌封面", variable=want_cover).pack(side="left", padx=(12, 0))
+    ttk.Label(opts, text="相似度阈值：").pack(side="left", padx=(12, 0))
+    thr = tk.StringVar(value="%.2f" % MATCH_THRESHOLD)
+    ttk.Entry(opts, textvariable=thr, width=6).pack(side="left")
+    progress = ttk.Progressbar(opts, mode="determinate", length=220)
+    progress.pack(side="right")
+
+    cols = ("status", "name", "match", "score")
+    heads = {"status": ("状态", 90), "name": ("文件", 300), "match": ("匹配结果（歌手 / 歌名 / 专辑）", 480),
+             "score": ("相似度", 70)}
+    frame = ttk.Frame(win, padding=(10, 8))
+    frame.pack(fill="both", expand=True)
+    tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
+    for c in cols:
+        text, width = heads[c]
+        tree.heading(c, text=text)
+        tree.column(c, width=width, anchor="w", stretch=(c == "match"))
+    vs = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=vs.set)
+    tree.pack(side="left", fill="both", expand=True)
+    vs.pack(side="right", fill="y")
+
+    status_var = tk.StringVar(value="点「开始匹配」联网搜索（每首约 1 秒）。")
+    ttk.Label(win, textvariable=status_var, padding=(10, 0)).pack(anchor="w")
+
+    btns = ttk.Frame(win, padding=10)
+    btns.pack(fill="x")
+    match_btn = ttk.Button(btns, text="开始匹配")
+    match_btn.pack(side="left")
+    apply_all_btn = ttk.Button(btns, text="写入全部匹配", state="disabled")
+    apply_all_btn.pack(side="left", padx=6)
+    apply_sel_btn = ttk.Button(btns, text="只写入选中项", state="disabled")
+    apply_sel_btn.pack(side="left")
+    ttk.Button(btns, text="关闭", command=win.destroy).pack(side="right")
+    ttk.Label(btns, text="（写标签会修改音频文件本身）", foreground="#666").pack(side="right", padx=8)
+
+    def add_row(r):
+        return tree.insert("", "end", values=("待匹配", r["name"], "…", ""),
+                           tags=("p", r["file"]))
+
+    for r in targets:
+        add_row(r)
+    for tag, color in (("p", "#9a6700"), ("ok", "#1a7f37"), ("bad", "#cf222e")):
+        tree.tag_configure(tag, foreground=color)
+
+    def row_file(item):
+        return tree.item(item, "tags")[1]
+
+    def worker(items):
+        for i, r in enumerate(items, 1):
+            q.put(("progress", i, len(items), r["name"]))
+            try:
+                cands, used = find_matches(r, duration_ms=file_duration_ms(r["file"]))
+            except Exception as exc:
+                cands, used = [], ("", "")
+                q.put(("note", r["file"], "搜索失败：%s" % exc))
+            q.put(("match", r["file"], cands, used))
+            time.sleep(0.2)
+        q.put(("matched",))
+
+    def start_match():
+        if state["busy"]:
+            return
+        state["busy"] = True
+        match_btn["state"] = "disabled"
+        status_var.set("正在联网搜索…")
+        threading.Thread(target=worker, args=(targets,), daemon=True).start()
+
+    def refresh_row_for(file):
+        r = state["matches"].get(file)
+        for item in tree.get_children():
+            if row_file(item) == file:
+                if not r or not r["cands"]:
+                    tree.item(item, values=("无匹配", tree.item(item, "values")[1], "数据库里没找到", ""),
+                              tags=("bad", file))
+                else:
+                    c = r["cands"][r["pick"]]
+                    tree.item(item, values=("可写入" if c["score"] >= threshold() else "相似度低",
+                                            tree.item(item, "values")[1],
+                                            "%s / %s / %s（%s）" % (c["artist"], c["title"], c["album"], c["source"]),
+                                            "%.2f" % c["score"]),
+                              tags=("ok" if c["score"] >= threshold() else "p", file))
+                break
+
+    def threshold():
+        try:
+            return max(0.0, min(1.0, float(thr.get())))
+        except ValueError:
+            return MATCH_THRESHOLD
+
+    def cycle_candidate(_event=None):
+        """点在匹配结果那一列上=换下一个候选（简单好用）。"""
+        sel = tree.selection()
+        if not sel:
+            return
+        file = row_file(sel[0])
+        r = state["matches"].get(file)
+        if not r or len(r["cands"]) < 2:
+            return
+        r["pick"] = (r["pick"] + 1) % len(r["cands"])
+        refresh_row_for(file)
+
+    tree.bind("<Double-1>", cycle_candidate)
+
+    def pump():
+        try:
+            while True:
+                msg = q.get_nowait()
+                if msg[0] == "progress":
+                    _, i, total, name = msg
+                    progress["value"] = 100.0 * i / max(1, total)
+                    status_var.set("正在搜索 %d/%d：%s" % (i, total, name))
+                elif msg[0] == "match":
+                    _, file, cands, used = msg
+                    state["matches"][file] = {"cands": cands, "pick": 0, "used": used}
+                    refresh_row_for(file)
+                elif msg[0] == "note":
+                    _, file, text = msg
+                    status_var.set(text)
+                elif msg[0] == "matched":
+                    state["busy"] = False
+                    progress["value"] = 0
+                    match_btn["state"] = "normal"
+                    apply_all_btn["state"] = "normal"
+                    apply_sel_btn["state"] = "normal"
+                    good = sum(1 for r in state["matches"].values()
+                               if r["cands"] and r["cands"][r["pick"]]["score"] >= threshold())
+                    status_var.set("匹配结束：%d 首达到阈值可以写入（双击某行可换一个候选）" % good)
+                elif msg[0] == "written":
+                    _, done, total, name, result = msg
+                    progress["value"] = 100.0 * done / max(1, total)
+                    status_var.set("正在写入 %d/%d：%s  →  %s" % (done, total, name, result))
+                elif msg[0] == "finished":
+                    _, ok, skip, fail = msg
+                    state["busy"] = False
+                    progress["value"] = 0
+                    apply_all_btn["state"] = "normal"
+                    apply_sel_btn["state"] = "normal"
+                    messagebox.showinfo("完成", "写入 %d 首 / 跳过 %d 首 / 失败 %d 首。" % (ok, skip, fail))
+                    on_finished()
+        except queue.Empty:
+            pass
+        win.after(120, pump)
+
+    def writer(items):
+        ok = skip = fail = 0
+        for i, r in enumerate(items, 1):
+            info = state["matches"].get(r["file"])
+            if not info or not info["cands"]:
+                skip += 1
+                continue
+            best = info["cands"][info["pick"]]
+            if best["score"] < threshold():
+                skip += 1
+                q.put(("written", i, len(items), r["name"], "相似度低，跳过"))
+                continue
+            broken = set()
+            for field in ("title", "artist", "album"):
+                if any(n.startswith(field + "：") for n in r["notes"]):
+                    broken.add(field)
+            written, note = apply_tags(r["file"], best, overwrite=overwrite.get(),
+                                       broken_fields=broken, want_cover=want_cover.get())
+            if written:
+                ok += 1
+                q.put(("written", i, len(items), r["name"], "写入 " + ",".join(written)))
+            else:
+                fail += 1
+                q.put(("written", i, len(items), r["name"], note or "没写入"))
+        q.put(("finished", ok, skip, fail))
+
+    def apply(only_selected):
+        if state["busy"]:
+            return
+        if not state["matches"]:
+            messagebox.showinfo("联网匹配", "请先点「开始匹配」。")
+            return
+        items = targets
+        if only_selected:
+            files = {row_file(i) for i in tree.selection()}
+            items = [r for r in targets if r["file"] in files]
+            if not items:
+                messagebox.showinfo("联网匹配", "先在上面的列表里选中要写入的行。")
+                return
+        if not messagebox.askyesno("确认写入",
+                                   "会修改这 %d 个音频文件的内嵌标签（改动直接写进文件）。\n\n继续吗？"
+                                   % len(items)):
+            return
+        state["busy"] = True
+        apply_all_btn["state"] = "disabled"
+        apply_sel_btn["state"] = "disabled"
+        status_var.set("开始写入…")
+        threading.Thread(target=writer, args=(items,), daemon=True).start()
+
+    match_btn.configure(command=start_match)
+    apply_all_btn.configure(command=lambda: apply(False))
+    apply_sel_btn.configure(command=lambda: apply(True))
+    win.after(120, pump)
+    if os.environ.get("TAGCHECK_DEBUG_AUTO"):       # 自动测试用：打开就开搜
+        win.after(300, start_match)
 
 
 def run_gui():
@@ -773,11 +1414,14 @@ def run_gui():
     buttons.pack(fill="x")
     csv_btn = ttk.Button(buttons, text="导出明细 CSV", state="disabled")
     csv_btn.pack(side="left")
-    m3u_btn = ttk.Button(buttons, text="导出 Picard 待修清单", state="disabled")
-    m3u_btn.pack(side="left", padx=6)
-    ttk.Button(buttons, text="打开 Picard 官网", command=lambda: open_url(PICARD_URL)).pack(side="left")
-    ttk.Label(buttons, text="流程：导出待修清单 → 拖进 Picard → 全选 Lookup → Save",
-              foreground="#666").pack(side="right")
+    folder_btn = ttk.Button(buttons, text="导出待修文件夹（拖进 Picard）", state="disabled")
+    folder_btn.pack(side="left", padx=6)
+    fix_btn = ttk.Button(buttons, text="联网匹配并修复…", state="disabled")
+    fix_btn.pack(side="left")
+    ttk.Button(buttons, text="打开 Picard 官网",
+               command=lambda: open_url(PICARD_URL)).pack(side="right")
+    ttk.Label(buttons, text="Picard 不认播放列表：用「导出待修文件夹」把待修曲目挑出来再整包拖进去",
+              foreground="#666").pack(side="right", padx=8)
 
     # ---- 表格刷新 / 详情 --------------------------------------------------
     def refresh_table():
@@ -849,7 +1493,8 @@ def run_gui():
                     progress["value"] = 0
                     start_btn["state"] = "normal"
                     csv_btn["state"] = "normal"
-                    m3u_btn["state"] = "normal"
+                    folder_btn["state"] = "normal"
+                    fix_btn["state"] = "normal" if HAS_MUTAGEN else "disabled"
                     refresh_table()
                     s = summarize(rows)
                     if others:
@@ -863,6 +1508,8 @@ def run_gui():
                                 "有 %d 首要处理%s。\n\n下一步：点「导出 Picard 待修清单」，"
                                 "把生成的 m3u8 拖进 Picard，全选 → Lookup → Save 即可。"
                                 % (s["bad"], ("（其中 %d 首乱码）" % s["garbled"]) if s["garbled"] else ""))
+                    if os.environ.get("TAGCHECK_DEBUG_AUTO") and rows:
+                        open_fix_dialog(root, rows, on_finished=start_scan)
         except queue.Empty:
             pass
         root.after(120, pump)
@@ -885,7 +1532,8 @@ def run_gui():
         tree.delete(*tree.get_children())
         start_btn["state"] = "disabled"
         csv_btn["state"] = "disabled"
-        m3u_btn["state"] = "disabled"
+        folder_btn["state"] = "disabled"
+        fix_btn["state"] = "disabled"
         stat_var.set("开始扫描 %d 项输入…" % len(inputs) if len(inputs) > 1 else "开始扫描…")
         threading.Thread(target=scan_thread, args=(inputs,), daemon=True).start()
 
@@ -905,22 +1553,44 @@ def run_gui():
         write_csv(state["rows"], path)
         messagebox.showinfo("已导出", "明细已导出到：\n" + path)
 
-    def export_m3u():
+    def export_folder():
+        """Picard 不认播放列表，所以把待修文件硬链接到一个文件夹里，整包拖进去。"""
         if not state["rows"]:
             return
-        path = filedialog.asksaveasfilename(title="导出 Picard 待修清单", defaultextension=".m3u8",
-                                           initialfile="music-to-fix.m3u8",
-                                           initialdir=state["root_dir"] or os.getcwd(),
-                                           filetypes=[("播放列表", "*.m3u8")])
-        if not path:
+        if not [r for r in state["rows"] if r["status"] != "完整"]:
+            messagebox.showinfo("导出待修文件夹", "没有需要处理的曲目。")
             return
-        write_m3u8(state["rows"], path)
-        messagebox.showinfo(
-            "已导出",
-            "待修清单已导出：\n%s\n\n把它拖进 MusicBrainz Picard，全选 → Lookup → Save。" % path)
+        base = state["root_dir"] or os.getcwd()
+        picked = filedialog.askdirectory(title="选一个位置（会在里面建 music-to-fix 文件夹）",
+                                        initialdir=base, mustexist=False)
+        if not picked:
+            return
+        same = os.path.normcase(os.path.abspath(picked)) == os.path.normcase(os.path.abspath(base))
+        dest = os.path.join(picked, "music-to-fix") if same else picked
+        try:
+            linked, copied, failed = export_fix_folder(state["rows"], dest)
+        except OSError as exc:
+            messagebox.showerror("导出失败", str(exc))
+            return
+        text = ("待修文件已放到：\n%s\n\n硬链接 %d 首（不占额外空间，Picard 改的就是原文件）、复制 %d 首。\n\n"
+                "把整个文件夹拖进 MusicBrainz Picard → 全选 → Lookup → Save。" % (dest, linked, copied))
+        if failed:
+            text += "\n\n有 %d 个没能放进去：\n%s" % (len(failed), "\n".join(failed[:5]))
+        messagebox.showinfo("导出待修文件夹", text)
+        try:
+            if os.name == "nt":
+                os.startfile(dest)          # noqa: S606 顺手把文件夹打开
+        except Exception:
+            pass
+
+    def open_fix():
+        if not state["rows"]:
+            return
+        open_fix_dialog(root, state["rows"], on_finished=start_scan)
 
     csv_btn.configure(command=export_csv)
-    m3u_btn.configure(command=export_m3u)
+    folder_btn.configure(command=export_folder)
+    fix_btn.configure(command=open_fix)
 
     # 所有控件建好之后再挂拖放，否则表格、按钮区收不到拖进来的文件。
     # 传入的只是「把路径塞进队列」，真正的界面操作由 pump 在界面线程里做。
@@ -933,6 +1603,7 @@ def run_gui():
 
 
 def main():
+    _debug_log("tagcheck 启动: mutagen=%s %s" % (HAS_MUTAGEN, MUTAGEN_ERROR))
     if len(sys.argv) > 1 and sys.argv[1] == "--cli":
         return run_cli(sys.argv[1:])
     try:
