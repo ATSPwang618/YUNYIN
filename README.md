@@ -96,12 +96,6 @@ wsl -d pocket-ubuntu -u root bash -lc 'cd /mnt/d/AI-PSVITA/yunyin && python3 scr
 wsl -d pocket-ubuntu -u root bash /mnt/d/AI-PSVITA/yunyin/scripts/build-variants.sh
 ```
 
-重新打标签工具：`powershell -ExecutionPolicy Bypass -File scripts\build-tagcheck-exe.ps1`
-（需要 Python 3.10+，脚本会自己装 pyinstaller 和 mutagen）
-
-目录：`app/` 前端源码（`app.tsx` 界面、`colors.json` 文字配色）· `asset/ui/<主题>/` 皮肤图 ·
-`native/` 音频解码与标签读取 · `fonts/` 字体 · `scripts/` 打包脚本。
-
 ## 最后
 
 - 特别感谢pocketjs团队的努力付出！！
