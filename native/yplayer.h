@@ -21,6 +21,7 @@ int  yp_open(const char *path);
 int  yp_rate(void);
 int  yp_channels(void);
 int  yp_decode(short *buf, int max_frames);
+int  yp_seek(long long frame);
 long long yp_position(void);
 long long yp_length(void);
 void yp_close(void);

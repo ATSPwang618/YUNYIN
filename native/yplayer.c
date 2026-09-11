@@ -225,6 +225,35 @@ int yp_decode(short *buf, int max_frames) {
   }
 }
 
+/* Jump to an absolute source frame.  Used to rewind the few frames that were
+ * already decoded into the output ring when the user hits pause, so resuming
+ * picks up exactly where the sound actually stopped. */
+int yp_seek(long long frame) {
+  if (frame < 0) frame = 0;
+  switch (g.fmt) {
+    case 1:
+      if (!g.mp3) return -1;
+      return mpg123_seek(g.mp3, (off_t)frame, SEEK_SET) < 0 ? -1 : 0;
+    case 2:
+      if (!g.vf_ok) return -1;
+      return ov_pcm_seek(&g.vf, (ogg_int64_t)frame) == 0 ? 0 : -1;
+    case 3:
+      if (!g.wav_ok) return -1;
+      if (!drwav_seek_to_pcm_frame(&g.wav, (drwav_uint64)frame)) return -1;
+      g.wav_frames = (unsigned long long)frame;
+      return 0;
+    case 4:
+      if (!g.flac) return -1;
+      if (!drflac_seek_to_pcm_frame(g.flac, (drflac_uint64)frame)) return -1;
+      g.flac_frames = (unsigned long long)frame;
+      return 0;
+    case 5:
+      if (!g.of) return -1;
+      return op_pcm_seek(g.of, (ogg_int64_t)frame) == 0 ? 0 : -1;
+  }
+  return -1;
+}
+
 long long yp_position(void) {
   if (g.fmt == 1 && g.mp3) return (long long)mpg123_tell(g.mp3);
   if (g.fmt == 2 && g.vf_ok) return (long long)ov_pcm_tell(&g.vf);

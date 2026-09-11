@@ -27,6 +27,7 @@ extern "C" {
     fn yp_open(path: *const i8) -> i32;
     fn yp_rate() -> i32;
     fn yp_decode(buf: *mut i16, max_frames: i32) -> i32;
+    fn yp_seek(frame: i64) -> i32;
     fn yp_length() -> i64;
     fn yp_close();
     fn yunyin_image_decode(
@@ -192,6 +193,11 @@ fn pump_stream(path: &str) {
         let _ = audio::start(TARGET_RATE);
         audio::flush();
     }
+    /* 环形缓冲总容量：缓冲空着时 free_frames() 就是容量（44.1kHz 下约
+     * 743ms）。解码线程总是抢在播放前面把音频灌满这个缓冲，所以“解码到哪
+     * 一帧”比“听众听到哪一帧”要早一大截 —— 两者之差就是还没播出去的部分。 */
+    let ring_cap = audio::free_frames() as u64;
+
     RATE_HZ.store(TARGET_RATE, Ordering::Release);
     DUR_MS.store(duration_ms, Ordering::Release);
     POS_MS.store(0, Ordering::Release);
@@ -202,20 +208,38 @@ fn pump_stream(path: &str) {
     let mut buf = vec![0i16; 1024 * 2];
     let mut at: u64 = 0;
     let mut eof = false;
+    let mut held = false; /* 暂停已经落地：声音已停、解码器已退回 */
+    let queued = || ring_cap.saturating_sub(audio::free_frames() as u64);
+    let to_ms = |f: u64| -> u32 { ((f * 1000) / (rate.max(1) as u64)) as u32 };
     loop {
         if STOP.load(Ordering::Acquire) {
             break;
         }
         if PAUSED.load(Ordering::Acquire) {
+            if !held {
+                /* 暂停要同时做到两件事：
+                 *   1) 马上安静 —— 只置标志的话，缓冲里最多 743ms 的音频还会
+                 *      继续放完，听起来就是“按了暂停还要等一会”；
+                 *   2) 能原地续播 —— 丢掉的那段要在恢复时补回来，所以把解码器
+                 *      退回听众真正听到的位置，而不是接在被丢掉的那段后面。 */
+                let heard = at.saturating_sub(queued());
+                audio::flush();
+                if heard < at && unsafe { yp_seek(heard as i64) } == 0 {
+                    at = heard;
+                }
+                POS_MS.store(to_ms(at), Ordering::Release);
+                held = true;
+            }
             unsafe { vitasdk_sys::sceKernelDelayThread(8_000) };
             continue;
         }
-        let free = unsafe { audio::free_frames() };
+        held = false;
+        let free = audio::free_frames();
         if free < 1024 {
             unsafe { vitasdk_sys::sceKernelDelayThread(4_000) };
             continue;
         }
-        let want = (free as usize).min(1024);
+        let want = free.min(1024);
         let got = unsafe { yp_decode(buf.as_mut_ptr(), want as i32) };
         if got <= 0 {
             eof = true;
@@ -225,16 +249,33 @@ fn pump_stream(path: &str) {
         let stereo = resample_stereo(&buf[..frames * 2], rate, 2);
         unsafe { audio::push(&stereo, 2) };
         at += frames as u64;
-        POS_MS.store(((at * 1000) / (rate.max(1) as u64)) as u32, Ordering::Release);
+        /* 上报“正在响”的位置（进度条 / 歌词才对得上声音）。 */
+        POS_MS.store(to_ms(at.saturating_sub(queued())), Ordering::Release);
     }
 
-    // On a natural end-of-stream the position lands a hair short of the total
-    // (and the 10Hz JS state poll can sample just before the final frames,
-    // freezing pos below dur).  Pin pos to the full duration so the JS frame
-    // loop reliably hits pos >= dur and advances / loops.  A manual STOP does
-    // not pin, so the stopped position stays put.
+    // On a natural end-of-stream, let the queued tail finish playing out, then
+    // pin pos to the full duration so the JS frame loop reliably hits
+    // pos >= dur and advances / loops (without cutting the last fraction of a
+    // second off the song).  A manual STOP does not pin, so the stopped
+    // position stays put.
     if eof {
-        POS_MS.store(duration_ms, Ordering::Release);
+        let mut waited = 0u32;
+        while queued() > 256 && waited < 400 {
+            if STOP.load(Ordering::Acquire) {
+                break;
+            }
+            if PAUSED.load(Ordering::Acquire) {
+                /* 尾巴还没放完就暂停：停在听众听到的位置，恢复后再放完
+                 * （暂停的时间不计入等待上限）。 */
+                unsafe { vitasdk_sys::sceKernelDelayThread(8_000) };
+                continue;
+            }
+            unsafe { vitasdk_sys::sceKernelDelayThread(5_000) };
+            waited += 1;
+        }
+        if !STOP.load(Ordering::Acquire) && !PAUSED.load(Ordering::Acquire) {
+            POS_MS.store(duration_ms, Ordering::Release);
+        }
     }
     PLAYING.store(false, Ordering::Release);
     unsafe { yp_close() };
@@ -1016,13 +1057,23 @@ unsafe extern "C" fn js_pause(
 }
 
 unsafe extern "C" fn js_resume(
-    _ctx: *mut JSContext,
+    ctx: *mut JSContext,
     _this: JSValue,
-    _argc: i32,
-    _argv: *mut JSValue,
+    argc: i32,
+    argv: *mut JSValue,
 ) -> JSValue {
-    PAUSED.store(false, Ordering::Release);
-    PLAYING.store(true, Ordering::Release);
+    /* 解码线程还活着且确实处于暂停：只清标志位，让它从原地继续。
+     * 关键是绝不能在这里重新 open 文件 —— 那就是“暂停后从头开始播”。 */
+    if WORKER.load(Ordering::Acquire) && PAUSED.load(Ordering::Acquire) {
+        PAUSED.store(false, Ordering::Release);
+        PLAYING.store(true, Ordering::Release);
+        return JS_UNDEFINED;
+    }
+    /* 没有可以续播的位置（播完了 / 已经被 stop）：给了路径就重新开一首。 */
+    let path = arg_string(ctx, argc, argv, 0);
+    if !path.is_empty() {
+        spawn_play(path);
+    }
     JS_UNDEFINED
 }
 

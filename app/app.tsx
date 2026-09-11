@@ -39,7 +39,7 @@ type VitaMedia = {
   roots?: () => string;
   play?: (path: string) => void;
   pause?: () => void;
-  resume?: () => void;
+  resume?: (path?: string) => void;
   stop?: () => void;
   state?: () => string;
   cover?: (path: string) => number;
@@ -1205,7 +1205,15 @@ const audioEngine = {
 
     if (this.mode === "vita" && vm && vm.play) {
       try {
-        vm.play(this.loadedPath);
+        /* 暂停后恢复播放：必须走原生 resume。
+         * vm.play() 会重新打开文件、另起一个解码线程，等于从 0 重播 —— 
+         * 这正是“点暂停再点播放会从头开始”的原因。带上路径是为了极端情况下
+         * （暂停时正好放到结尾、解码线程已经退出）还能退化成重新开一首。 */
+        if (this.nativePaused && vm.resume) {
+          vm.resume(this.loadedPath);
+        } else {
+          vm.play(this.loadedPath);
+        }
         this.nativeSampleValid = false;
       } catch {
         this.mode = "clock";
