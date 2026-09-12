@@ -9,7 +9,7 @@
 
 |  |  |
 | --- | --- |
-| 当前版本 | **0.5**（[历史版本 / 下载](https://github.com/ATSPwang618/YUNYIN/releases)） |
+| 当前版本 | **0.5** |
 | 曲库目录 | `ux0:/data/yunyin/music` |
 | 音频格式 | MP3（最推荐格式！！） / OGG / WAV / FLAC / OPUS |
 | 界面 | 首页播放器 · 全部曲目 · 专辑 · 收藏 · 设置 |
@@ -18,17 +18,7 @@
 > 建议先用 [MusicBrainz Picard](https://picard.musicbrainz.org/) 给音乐补全标签再放进去。
 > 歌名、歌手、专辑、封面、歌词全都来自音频内嵌标签，标签越全，界面越好看。
 
-## 0.5 版做了什么
 
-- **按 PS 回桌面，歌继续响**：MP3 / M4A / AAC / WAV 交给系统解码器播，所以退到 LiveArea 也在放。
-  （FLAC / OGG / OPUS 是本应用自己解码的，这几种按 PS 回桌面会停——系统只让自家解码器在后台跑。）
-- **黑屏播放**：播放页按 **START** 关掉画面，声音继续。黑屏下 **L / R** 直接切上一首 / 下一首，
-  屏幕保持黑着不亮；按其他任意键（或再按一次 START）才回到画面。
-- **撕页彻底退出应用 → 音乐立刻停**，不会再出现"应用都关了还在后台唱"。
-- 暂停 / 继续修好了：按暂停立刻静音，再按播放**从原地接着放**（以前会从头开始）。
-- 进入应用默认是**暂停**状态，按 **○** 才开始播。
-- 播放期间会替你压住系统的自动待机 / 自动关屏，不会听一半被系统掐掉。
-- 正式版**不再写调试日志**（抓日志的方法见文末）。
 
 ## PSIVTA实机安装
 
@@ -111,17 +101,10 @@ wsl -d pocket-ubuntu -u root bash -lc 'cd /mnt/d/AI-PSVITA/yunyin && python3 scr
 wsl -d pocket-ubuntu -u root bash /mnt/d/AI-PSVITA/yunyin/scripts/build-variants.sh
 ```
 
-## 抓日志（出问题时用）
-
-正式版默认不写日志。要抓日志：
-
-1. 在卡里 `ux0:/data/yunyin/` 下建一个**空文件**，名字就叫 `debug`（不要扩展名）。
-2. 重新打开云音，日志会写进 `ux0:data/yunyin.log`。
-3. 抓完把 `debug` 文件删掉，下次启动就又不写了。
-
 ## 最后
 
 - 特别感谢pocketjs团队的努力付出！！
+- 感谢G大开源的libShellAudio库
 - 主题文字颜色在 `app/colors.json` 里改，改完重新打包即可。
 - 日文版用的 MS Mincho 来自 Windows 自带字体，对外分发前请确认授权；
   `fonts/chinese/NotoSansSC-Medium.ttf` 是 Noto Sans SC（SIL OFL）。
