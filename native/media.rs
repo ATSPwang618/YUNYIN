@@ -72,6 +72,683 @@ static PATH_LEN: AtomicUsize = AtomicUsize::new(0);
 static PATH_BUF: Mutex<String> = Mutex::new(String::new());
 static COVER_HANDLES: Mutex<Option<HashMap<String, i32>>> = Mutex::new(None);
 
+/// 日志开关。默认关：正式版不写 ux0:data/yunyin.log，也不建这个文件。
+/// 要抓日志就在卡里建一个空文件 `ux0:/data/yunyin/debug`，再打开云音，
+/// 原生侧和 JS 侧（logMsg）的所有日志都会写进 ux0:data/yunyin.log。
+static LOG_ON: AtomicBool = AtomicBool::new(false);
+const LOG_FLAG: &str = "ux0:data/yunyin/debug";
+
+/// 追加一行到 ux0:data/yunyin.log（与 JS 侧 logMsg 共用同一个文件）。
+/// 没开日志就直接丢掉，不碰文件系统。
+fn append_log(s: &str) {
+    if !LOG_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("ux0:data/yunyin.log")
+    {
+        let _ = writeln!(f, "{}", s);
+    }
+}
+
+/* =========================================================
+ * 后台播放：把系统解码器支持的格式交给 SceShell 播
+ *
+ * 解码和播放都在 shell 侧进行，所以应用按 PS 回到 LiveArea（被系统挂起）
+ * 之后音乐照常响，也不占用本应用自己的线程和内存。系统解码器只认
+ * MP3 / AAC(m4a/.aac) / ATRAC9(.at9) / WAV；其余格式（FLAC / OGG / OPUS）
+ * 继续走本文件下面的软件解码路径。
+ *
+ * 接口来自对 Sony 系统静态库的逆向（GrapheneCt/libShellAudio，MIT 许可，
+ * 用法参考 GrapheneCt/ElevenMPV-A）。shell 服务对象等入口 vitasdk 没有
+ * 导出，由 native/yunyin_shellsvc_stub.S 手写 NID 导入提供。
+ * ========================================================= */
+
+/// shell 音频会话：服务对象指针、AudioControl 函数指针、跟踪 id。
+/// 存成 usize 是因为裸指针不是 Send，放不进 static。
+static SHELL_CTX: Mutex<Option<(usize, usize, i32, i32)>> = Mutex::new(None);
+/// 当前是不是由 shell 在播。
+static SHELL_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// shell 报回来的位置（毫秒）与状态（1 = 播放中，2 = 停/暂停）。
+static SHELL_POS_MS: AtomicU32 = AtomicU32::new(0);
+static SHELL_STATE: AtomicU32 = AtomicU32::new(0);
+/// 这一首是否已经放完（shell 停住且位置归零）。
+static SHELL_ENDED: AtomicBool = AtomicBool::new(false);
+/// 用户是不是希望它在放（按播放后为真，暂停/停止后为假）。
+static SHELL_WANT_PLAY: AtomicBool = AtomicBool::new(false);
+/// 是否已经握着 BGM 端口（0x80 档 = 系统认可的 BGM provider）。
+static HOLDING_BGM: AtomicBool = AtomicBool::new(false);
+
+const SCE_MUSIC_EVENT_PLAY: i32 = 1;
+const SCE_MUSIC_EVENT_STOP: i32 = 2;
+/// 音乐播放器服务的事件号（逆向得来，见 libShellAudio 的 ShellAudio.c）。
+const EV_MUSIC_INIT: i32 = 0x30000;
+const EV_MUSIC_TRACK_INFO: i32 = 0x30003;
+const EV_MUSIC_OPEN: i32 = 0x30004;
+const EV_MUSIC_COMMAND: i32 = 0x30006;
+const EV_MUSIC_STATUS: i32 = 0x30007;
+const EV_MUSIC_TERMINATE: i32 = 0x30001;
+
+/* appmgr 的应用事件（数值取自 ElevenMPV-A 的 include/utils.h）。 */
+const SCE_APP_EVENT_ON_ACTIVATE: i32 = 0x10000001;
+const SCE_APP_EVENT_ON_DEACTIVATE: i32 = 0x10000002;
+const SCE_APP_EVENT_REQUEST_QUIT: i32 = 0x20000001;
+
+extern "C" {
+    /// 取 shell 音频服务对象（NID 导入见 yunyin_shellsvc_stub.S）。
+    fn sceShellSvcGetSvcObj() -> *mut c_void;
+    /// 取 appmgr 事件队列里的数量 / 下一条事件。
+    fn sceAppMgrReceiveEventNum(event_num: *mut i32) -> i32;
+    fn sceAppMgrReceiveEvent(event: *mut SceAppMgrEvent) -> i32;
+    /// 按 TITLE_ID 查运行中的进程（用于确认插件注入目标是否存在）。
+    fn sceAppMgrGetIdByName(pid: *mut vitasdk_sys::SceUID, name: *const i8) -> i32;
+    /// 带优先级申请 BGM 端口（0x80 = "通过 shell 播放"档，参考项目用它）。
+    fn sceAppMgrAcquireBgmPortWithPriority(priority: i32) -> i32;
+    fn sceAppMgrReleaseBgmPort() -> i32;
+    /// 压住系统自动待机（SceKernel 的用户接口）。
+    fn sceKernelPowerTick(tick_type: i32) -> i32;
+    /// 初始化 shell/shell 事件系统。参考项目在用它之前都会先调这个；
+    /// 少了这一步，SceShellUtil / appmgr 事件一类接口会直接报错。
+    fn sceShellUtilInitEvents(unk: i32) -> i32;
+    /// 0 = disable / 1 = enable BackGround Music：让 shell 把这段播放当成
+    /// 系统级 BGM 来管理（这样应用退出时系统会把播放收走）。
+    fn sceShellUtilSetBGMMode(mode: i32) -> i32;
+    /// 电源回调：参考项目用它在息屏/待机前把播放"续上"。
+    /// 参考项目的调用是 4 个参数：(名字, attr=0, 回调, 用户数据)。
+    /// 之前我按 3 个参数声明，导致创建失败、回调从未注册。
+    fn sceKernelCreateCallback(
+        name: *const i8,
+        attr: i32,
+        func: extern "C" fn(i32, i32, i32, *mut c_void) -> i32,
+        arg: *mut c_void,
+    ) -> i32;
+    fn scePowerRegisterCallback(cbid: i32) -> i32;
+}
+
+/// 电源回调里只置这个标志（回调上下文里不能做文件 I/O 之类的重活，
+/// 参考项目也是丢给工作线程处理）。
+static POWER_EVENT: AtomicU32 = AtomicU32::new(0);
+
+/// 系统要息屏/待机时，趁我们还没被挂起，给 shell 补发一次 PLAY ——
+/// 这样应用被挂起后音乐仍在响（参考项目 ElevenMPV-A 的做法）。
+extern "C" fn power_callback(_id: i32, _count: i32, power_info: i32, _common: *mut c_void) -> i32 {
+    POWER_EVENT.store(power_info as u32, Ordering::Release);
+    0
+}
+
+/// 处理电源事件的工作线程：息屏/待机前把播放续上。
+fn spawn_power_watch() {
+    let _ = std::thread::Builder::new()
+        .name("yunyin-power".into())
+        .stack_size(16 * 1024)
+        .spawn(|| loop {
+            let info = POWER_EVENT.swap(0, Ordering::AcqRel);
+            if info != 0 {
+                append_log(&format!("power: callback 0x{:08X}", info));
+                /* 息屏/待机/唤醒都补发一次 PLAY：应用被挂起期间由 shell 继续放。
+                 * 位定义在各固件上不一致，所以不挑位，反正只有在"用户要它在放"
+                 * 的时候才会补发。 */
+                if SHELL_WANT_PLAY.load(Ordering::Acquire) {
+                    shell_audio_command(SCE_MUSIC_EVENT_PLAY);
+                    append_log("power: re-send PLAY");
+                }
+            }
+            unsafe { vitasdk_sys::sceKernelDelayThread(200_000) };
+        });
+}
+
+fn register_power_callback() {
+    let cbid = unsafe {
+        sceKernelCreateCallback(
+            b"yunyin_power\0".as_ptr() as *const i8,
+            0,
+            power_callback,
+            core::ptr::null_mut(),
+        )
+    };
+    if cbid >= 0 {
+        unsafe { scePowerRegisterCallback(cbid) };
+        append_log("power callback registered");
+    } else {
+        append_log(&format!("power callback failed -> 0x{:08X}", cbid as u32));
+    }
+}
+
+/// SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND
+const POWER_TICK_DISABLE_AUTO_SUSPEND: i32 = 1;
+/// SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF —— 压住"自动关屏"。
+/// 播放期间必须连这个一起压：自动关屏之后系统会进待机，音乐就断了。
+/// 用户想关屏时按 Start 走应用主动关屏（音频继续）。
+const POWER_TICK_DISABLE_OLED_OFF: i32 = 4;
+
+/// appmgr 事件结构（大小 0x64）。
+#[repr(C)]
+struct SceAppMgrEvent {
+    event: i32,
+    app_id: i32,
+    param: [u8; 56],
+}
+
+/// sceShellSvcAudioControl 的参数块。
+#[repr(C)]
+struct ShellAudioParams {
+    params1: *mut c_void,
+    params1_size: u32,
+    params2: *mut c_void,
+    params2_size: u32,
+    params3: *mut c_void,
+    params3_size: u32,
+    params4: *mut c_void,
+    params4_size: u32,
+}
+
+impl ShellAudioParams {
+    fn new() -> Self {
+        Self {
+            params1: core::ptr::null_mut(),
+            params1_size: 0,
+            params2: core::ptr::null_mut(),
+            params2_size: 0,
+            params3: core::ptr::null_mut(),
+            params3_size: 0,
+            params4: core::ptr::null_mut(),
+            params4_size: 0,
+        }
+    }
+}
+
+/// 服务用来认这段会话的两个 id（初始化时由服务回填）。
+#[repr(C)]
+struct ShellAudioTracking {
+    unk00: i32,
+    tracking1: i32,
+    tracking2: i32,
+}
+
+#[repr(C)]
+struct ShellAudioCommand {
+    command: i32,
+    param: i32,
+}
+
+#[repr(C)]
+struct ShellAudioOpt {
+    flag: i32,
+    param1: i32,
+    param2: i32,
+    param3: i32,
+}
+
+type ShellAudioControlFn = unsafe extern "C" fn(
+    *mut c_void,
+    i32,
+    *mut ShellAudioParams,
+    i32,
+    *mut i32,
+    *mut ShellAudioParams,
+    i32,
+) -> i32;
+
+/// 系统解码器认识这些格式（其余留给软件解码）。
+fn shell_audio_supported(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    [".mp3", ".m4a", ".aac", ".at9", ".wav"]
+        .iter()
+        .any(|ext| p.ends_with(ext))
+}
+
+/// 已建立的会话（服务对象、AudioControl、跟踪 id）。
+fn shell_ctx() -> Option<(*mut c_void, ShellAudioControlFn, i32, i32)> {
+    let (obj, func, t1, t2) = SHELL_CTX.lock().ok().and_then(|g| *g)?;
+    let control: ShellAudioControlFn = unsafe { core::mem::transmute(func) };
+    Some((obj as *mut c_void, control, t1, t2))
+}
+
+/// 拿服务对象和 AudioControl 入口（第 6 个槽位）。
+fn shell_audio_svc() -> Option<(*mut c_void, ShellAudioControlFn)> {
+    let obj = unsafe { sceShellSvcGetSvcObj() };
+    if (obj as usize) < 0x1000 {
+        return None;
+    }
+    let table = unsafe { *(obj as *mut *const usize) };
+    if (table as usize) < 0x1000 {
+        return None;
+    }
+    let entry = unsafe { *table.add(5) };
+    if (entry as usize) < 0x1000 {
+        return None;
+    }
+    let control: ShellAudioControlFn = unsafe { core::mem::transmute(entry) };
+    Some((obj, control))
+}
+
+/// 调一次 sceShellSvcAudioControl。
+unsafe fn shell_audio_call(
+    obj: *mut c_void,
+    control: ShellAudioControlFn,
+    event: i32,
+    params: *mut ShellAudioParams,
+    num_in: i32,
+    out_params: *mut ShellAudioParams,
+) -> i32 {
+    let mut res: i32 = 0;
+    control(
+        obj,
+        event,
+        params,
+        num_in,
+        &mut res,
+        out_params,
+        if out_params.is_null() { 0 } else { 1 },
+    )
+}
+
+/// 给 shell 发一条播放命令（1 = 播放，2 = 停/暂停）。没有会话就什么都不做。
+fn shell_audio_command(cmd: i32) {
+    let Some((obj, control, t1, t2)) = shell_ctx() else {
+        return;
+    };
+    let mut command = ShellAudioCommand {
+        command: cmd,
+        param: 0,
+    };
+    let mut track = ShellAudioTracking {
+        unk00: 0,
+        tracking1: t1,
+        tracking2: t2,
+    };
+    let mut params = ShellAudioParams::new();
+    params.params1 = &mut command as *mut _ as *mut c_void;
+    params.params1_size = 0x8;
+    params.params2 = &mut track as *mut _ as *mut c_void;
+    params.params2_size = 0xC;
+    unsafe {
+        shell_audio_call(
+            obj,
+            control,
+            EV_MUSIC_COMMAND,
+            &mut params,
+            2,
+            core::ptr::null_mut(),
+        )
+    };
+}
+
+/// 建立会话（只做一次）：初始化音乐播放器服务，并把播放绑到应用的生命周期上。
+fn shell_audio_session() -> bool {
+    if SHELL_CTX.lock().map(|g| g.is_some()).unwrap_or(false) {
+        return true;
+    }
+    let Some((obj, control)) = shell_audio_svc() else {
+        return false;
+    };
+    let mut track = ShellAudioTracking {
+        unk00: 0,
+        tracking1: 1,
+        tracking2: 0x8,
+    };
+    let mut params = ShellAudioParams::new();
+    params.params1 = &mut track as *mut _ as *mut c_void;
+    params.params1_size = 0xC;
+    let ret = unsafe {
+        shell_audio_call(
+            obj,
+            control,
+            EV_MUSIC_INIT,
+            &mut params,
+            1,
+            core::ptr::null_mut(),
+        )
+    };
+    if ret != 0 {
+        append_log(&format!("shell audio: init -> 0x{:08X}", ret as u32));
+        return false;
+    }
+    let (t1, t2) = (track.tracking1, track.tracking2);
+
+    if let Ok(mut g) = SHELL_CTX.lock() {
+        *g = Some((obj as usize, control as usize, t1, t2));
+    }
+    append_log(&format!(
+        "shell audio: session ready (t1={} t2={})",
+        t1, t2
+    ));
+    true
+}
+
+/// 结束会话（把 shell 的音乐播放服务还给系统）。退出应用、从 shell 解码
+/// 切回软件解码时调用。
+fn shell_audio_terminate() {
+    let Some((obj, control, t1, t2)) = shell_ctx() else {
+        return;
+    };
+    let mut track = ShellAudioTracking {
+        unk00: 0,
+        tracking1: t1,
+        tracking2: t2,
+    };
+    let mut params = ShellAudioParams::new();
+    params.params1 = &mut track as *mut _ as *mut c_void;
+    params.params1_size = 0xC;
+    let ret = unsafe {
+        shell_audio_call(
+            obj,
+            control,
+            EV_MUSIC_TERMINATE,
+            &mut params,
+            1,
+            core::ptr::null_mut(),
+        )
+    };
+    append_log(&format!("shell audio: terminate -> 0x{:08X}", ret as u32));
+    if let Ok(mut g) = SHELL_CTX.lock() {
+        *g = None;
+    }
+}
+
+/// 播放期间压住系统自动待机（对应 ElevenMPV-A 的 PowerTickTask）：
+/// 放着不管太久时系统会进待机，把声音一起掐掉；这个 tick 就是挡住它。
+fn spawn_power_tick_watch() {
+    let _ = std::thread::Builder::new()
+        .name("yunyin-powertick".into())
+        .stack_size(16 * 1024)
+        .spawn(|| loop {
+            /* 只要在放（壳播或自家解码）就压住自动待机 / 自动关屏。
+             * 屏幕真被系统关掉之后按键就不再报给应用了，黑屏下的肩键
+             * 换曲会跟着一起失效，所以息屏这件事只交给 Start 键做。 */
+            let shell_playing =
+                SHELL_ACTIVE.load(Ordering::Acquire) && SHELL_WANT_PLAY.load(Ordering::Acquire);
+            let local_playing = PLAYING.load(Ordering::Acquire) && !PAUSED.load(Ordering::Acquire);
+            if shell_playing || local_playing {
+                unsafe { sceKernelPowerTick(POWER_TICK_DISABLE_AUTO_SUSPEND) };
+                unsafe { sceKernelPowerTick(POWER_TICK_DISABLE_OLED_OFF) };
+            }
+            unsafe { vitasdk_sys::sceKernelDelayThread(10_000_000) };
+        });
+}
+
+/// 应用事件监听线程：收到 `REQUEST_QUIT`（用户从 LiveArea 关掉应用）时把 shell
+/// 那条播放停掉并结束会话 —— "彻底退出应用，音乐就停"靠的就是这里。
+/// 做法与 ElevenMPV-A 的 AppWatchdogTask 一致。
+fn spawn_app_event_watch() {
+    let _ = std::thread::Builder::new()
+        .name("yunyin-appev".into())
+        .stack_size(32 * 1024)
+        .spawn(|| {
+            append_log("app event: watchdog started");
+            let mut num_err_logged = false;
+            let mut unknown_logged = 0u32;
+            loop {
+                let mut count: i32 = 0;
+                let rc = unsafe { sceAppMgrReceiveEventNum(&mut count) };
+                if rc < 0 {
+                    /* 接口报错只记一次，免得刷屏 */
+                    if !num_err_logged {
+                        num_err_logged = true;
+                        append_log(&format!("app event: ReceiveEventNum -> 0x{:08X}", rc as u32));
+                    }
+                    unsafe { vitasdk_sys::sceKernelDelayThread(100_000) };
+                    continue;
+                }
+                for _ in 0..count.max(0) {
+                    let mut event = SceAppMgrEvent {
+                        event: 0,
+                        app_id: 0,
+                        param: [0u8; 56],
+                    };
+                    if unsafe { sceAppMgrReceiveEvent(&mut event) } < 0 {
+                        break;
+                    }
+                    match event.event {
+                        SCE_APP_EVENT_REQUEST_QUIT => {
+                            append_log("app event: request quit -> 停止 shell 播放");
+                            shell_audio_stop();
+                            shell_audio_terminate();
+                        }
+                        SCE_APP_EVENT_ON_DEACTIVATE => append_log("app event: deactivate"),
+                        SCE_APP_EVENT_ON_ACTIVATE => append_log("app event: activate"),
+                        other => {
+                            if unknown_logged < 10 {
+                                unknown_logged += 1;
+                                append_log(&format!("app event: 0x{:08X}", other as u32));
+                            }
+                        }
+                    }
+                }
+                unsafe { vitasdk_sys::sceKernelDelayThread(100_000) };
+            }
+        });
+}
+
+/// 问 shell 这首歌的时长（毫秒）；失败返回 0，JS 会退回曲库里的时长。
+fn shell_audio_duration() -> u32 {
+    let Some((obj, control, t1, t2)) = shell_ctx() else {
+        return 0;
+    };
+    let mut track = ShellAudioTracking {
+        unk00: 0,
+        tracking1: t1,
+        tracking2: t2,
+    };
+    let mut params = ShellAudioParams::new();
+    params.params1 = &mut track as *mut _ as *mut c_void;
+    params.params1_size = 0xC;
+    let mut buf = [0u8; 0x828];
+    let mut out_params = ShellAudioParams::new();
+    out_params.params1 = buf.as_mut_ptr() as *mut c_void;
+    out_params.params1_size = buf.len() as u32;
+    let ret = unsafe {
+        shell_audio_call(
+            obj,
+            control,
+            EV_MUSIC_TRACK_INFO,
+            &mut params,
+            1,
+            &mut out_params,
+        )
+    };
+    if ret != 0 {
+        return 0;
+    }
+    u32::from_ne_bytes([buf[8], buf[9], buf[10], buf[11]])
+}
+
+/// 时长：优先问 shell；拿不到就用自家解码器读一下文件头（不播放，只是解析）。
+/// 时长报 0 会让上层把它当成"1 毫秒"，于是每首歌一播就被判定为放完。
+fn shell_audio_duration_or_probe(path: &str) -> u32 {
+    let from_shell = shell_audio_duration();
+    if from_shell > 0 {
+        return from_shell;
+    }
+    let Ok(c_path) = std::ffi::CString::new(path) else {
+        return 0;
+    };
+    if unsafe { yp_open(c_path.as_ptr()) } != 0 {
+        return 0;
+    }
+    let rate = (unsafe { yp_rate() }).max(1) as u64;
+    let frames = (unsafe { yp_length() }).max(0) as u64;
+    unsafe { yp_close() };
+    ((frames * 1000) / rate) as u32
+}
+
+/// 用 shell 播这首（仅支持的格式）。成功之后位置/状态都从 shell 读。
+fn shell_audio_start(path: &str) -> bool {
+    if !shell_audio_session() {
+        return false;
+    }
+    let Some((obj, control, t1, t2)) = shell_ctx() else {
+        return false;
+    };
+    /* 以 0x80 档申请 BGM 端口（参考项目 ElevenMPV-A 就是这么做的）：
+     * 那是"应用通过 shell 播放"的档位，shell 会把我们当成正式的 BGM
+     * 提供者 —— LiveArea 上那套系统音乐控件才会出现（shell 插件要往里
+     * 写歌名/歌手的正是那几个控件）。
+     * 之前被系统拒绝（0x8080201F）是因为还没有 SceShell 权限，现在重试。 */
+    /* 只在还没握住端口时申请一次；换歌（同一会话内）不重复申请，
+     * 否则黑屏时会话重建会丢掉"后台出声"的特权。 */
+    if !HOLDING_BGM.swap(true, Ordering::AcqRel) {
+        unsafe { sceAppMgrReleaseBgmPort() };
+        let port_ret = unsafe { sceAppMgrAcquireBgmPortWithPriority(0x80) };
+        append_log(&format!(
+            "shell audio: AcquireBgmPortWithPriority(0x80) -> 0x{:08X}",
+            port_ret as u32
+        ));
+    }
+    let mut path_buf = path.as_bytes().to_vec();
+    let mut track = ShellAudioTracking {
+        unk00: 0,
+        tracking1: t1,
+        tracking2: t2,
+    };
+    let mut opt = ShellAudioOpt {
+        flag: 0,
+        param1: 0,
+        param2: 0,
+        param3: 0,
+    };
+    let mut params = ShellAudioParams::new();
+    params.params1 = &mut track as *mut _ as *mut c_void;
+    params.params1_size = 0xC;
+    params.params2 = path_buf.as_mut_ptr() as *mut c_void;
+    params.params2_size = path_buf.len() as u32;
+    params.params3 = &mut opt as *mut _ as *mut c_void;
+    params.params3_size = 0x10;
+    let ret = unsafe {
+        shell_audio_call(
+            obj,
+            control,
+            EV_MUSIC_OPEN,
+            &mut params,
+            3,
+            core::ptr::null_mut(),
+        )
+    };
+    if ret != 0 {
+        append_log(&format!("shell audio: open -> 0x{:08X}", ret as u32));
+        return false;
+    }
+    SHELL_POS_MS.store(0, Ordering::Release);
+    SHELL_STATE.store(SCE_MUSIC_EVENT_PLAY as u32, Ordering::Release);
+    SHELL_ENDED.store(false, Ordering::Release);
+    SHELL_ACTIVE.store(true, Ordering::Release);
+    DUR_MS.store(shell_audio_duration_or_probe(path), Ordering::Release);
+    SHELL_WANT_PLAY.store(true, Ordering::Release);
+    shell_audio_command(SCE_MUSIC_EVENT_PLAY);
+    /* 起播要等 shell 一拍，确认它真的在放再交给它；否则退回自家解码器，
+     * 免得出现"看上去成功了但没声音"。 */
+    if !shell_audio_wait_playing(20) {
+        append_log("shell audio: shell 没有开始播放，退回软件解码");
+        /* 没播起来就别占着 BGM 端口（否则系统音乐/别的应用会被挡住） */
+        HOLDING_BGM.store(false, Ordering::Release);
+        unsafe { sceAppMgrReleaseBgmPort() };
+        SHELL_ACTIVE.store(false, Ordering::Release);
+        return false;
+    }
+    append_log(&format!(
+        "shell audio: playing {} (dur={}ms)",
+        path,
+        DUR_MS.load(Ordering::Acquire)
+    ));
+    /* 交给 shell 托管这段播放（enable BackGround Music）。 */
+    let bgm_ret = unsafe { sceShellUtilSetBGMMode(1) };
+    append_log(&format!("shell audio: SetBGMMode(1) -> 0x{:08X}", bgm_ret as u32));
+    true
+}
+
+/// 等 shell 进入"播放中"状态，最多 tries × 50ms。
+fn shell_audio_wait_playing(tries: u32) -> bool {
+    for _ in 0..tries {
+        unsafe { vitasdk_sys::sceKernelDelayThread(50_000) };
+        shell_audio_poll();
+        if SHELL_STATE.load(Ordering::Acquire) == SCE_MUSIC_EVENT_PLAY as u32 {
+            return true;
+        }
+    }
+    false
+}
+
+/// 停止 shell 那条播放（换歌、按停止、退回软件解码时调用）。
+fn shell_audio_stop() {
+    if !SHELL_ACTIVE.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    SHELL_WANT_PLAY.store(false, Ordering::Release);
+    shell_audio_command(SCE_MUSIC_EVENT_STOP);
+    /* 注意：这里不释放 BGM 端口、也不关 BGM 模式。
+     * 换歌走的就是这条路（stop -> load -> play），如果把会话拆了重建，
+     * 黑屏时重建出来的会话拿不回"后台出声"的特权，就会出现
+     * "关屏换歌没声音、亮屏才恢复"。真正暂停时（js_pause）才让出端口。 */
+}
+
+/// 用户真正暂停时让出 BGM 端口与 BGM 模式（背景：让系统音乐/别的应用
+/// 能重新使用 BGM；参考项目也是在"暂停 + 切到后台"时释放）。
+fn shell_audio_yield_bgm() {
+    HOLDING_BGM.store(false, Ordering::Release);
+    unsafe { sceShellUtilSetBGMMode(0) };
+    unsafe { sceAppMgrReleaseBgmPort() };
+}
+
+/// 读一次 shell 的播放状态，刷新位置 / 状态 / 是否放完。
+fn shell_audio_poll() {
+    let Some((obj, control, t1, t2)) = shell_ctx() else {
+        return;
+    };
+    let mut track = ShellAudioTracking {
+        unk00: 0,
+        tracking1: t1,
+        tracking2: t2,
+    };
+    let mut params = ShellAudioParams::new();
+    params.params1 = &mut track as *mut _ as *mut c_void;
+    params.params1_size = 0xC;
+    let mut buf = [0u8; 0x70];
+    let mut out_params = ShellAudioParams::new();
+    out_params.params1 = buf.as_mut_ptr() as *mut c_void;
+    out_params.params1_size = buf.len() as u32;
+    let ret = unsafe {
+        shell_audio_call(
+            obj,
+            control,
+            EV_MUSIC_STATUS,
+            &mut params,
+            1,
+            &mut out_params,
+        )
+    };
+    if ret != 0 {
+        return;
+    }
+    let state = i32::from_ne_bytes([buf[0x10], buf[0x11], buf[0x12], buf[0x13]]);
+    let time = u32::from_ne_bytes([buf[0x2C], buf[0x2D], buf[0x2E], buf[0x2F]]);
+    SHELL_STATE.store(state as u32, Ordering::Release);
+    if state == SCE_MUSIC_EVENT_PLAY {
+        SHELL_POS_MS.store(time, Ordering::Release);
+        SHELL_ENDED.store(false, Ordering::Release);
+    } else if time > 0 {
+        /* 停住但位置还在：这不是放完，是被外部打断（息屏 / 电源键 / 系统
+         * 切走音频焦点）。参考 ElevenMPV-A 的做法：用户还想听就补发一次
+         * PLAY 让它接着放，否则界面会出现"按钮是播放状态但进度不动"。 */
+        SHELL_POS_MS.store(time, Ordering::Release);
+        if SHELL_WANT_PLAY.load(Ordering::Acquire) {
+            shell_audio_command(SCE_MUSIC_EVENT_PLAY);
+        }
+    } else {
+        /* 位置被清零：可能是放完了，也可能是被外力打断（息屏时系统会把
+         * 位置一起清掉）。只有"刚才已经放到接近总时长"才算真的放完，
+         * 其余情况一律续播 —— 否则息屏就会永久停在那里。 */
+        let last = SHELL_POS_MS.load(Ordering::Acquire);
+        let dur = DUR_MS.load(Ordering::Acquire);
+        if dur > 0 && last + 1000 >= dur {
+            SHELL_ENDED.store(true, Ordering::Release);
+        } else if SHELL_WANT_PLAY.load(Ordering::Acquire) {
+            shell_audio_command(SCE_MUSIC_EVENT_PLAY);
+        }
+    }
+}
+
 fn set_path(p: &str) {
     if let Ok(mut g) = PATH_BUF.lock() {
         g.clear();
@@ -1040,9 +1717,17 @@ unsafe extern "C" fn js_play(
     argv: *mut JSValue,
 ) -> JSValue {
     let path = arg_string(ctx, argc, argv, 0);
-    if !path.is_empty() {
-        spawn_play(path);
+    if path.is_empty() {
+        return JS_UNDEFINED;
     }
+    /* 系统解码器认识的格式交给 shell 播：这样回到桌面音乐还在响。 */
+    if shell_audio_supported(&path) && shell_audio_start(&path) {
+        set_path(&path);
+        return JS_UNDEFINED;
+    }
+    /* 其余格式（FLAC / OGG / OPUS…）走自家的软件解码器。 */
+    shell_audio_stop();
+    spawn_play(path);
     JS_UNDEFINED
 }
 
@@ -1052,6 +1737,12 @@ unsafe extern "C" fn js_pause(
     _argc: i32,
     _argv: *mut JSValue,
 ) -> JSValue {
+    if SHELL_ACTIVE.load(Ordering::Acquire) {
+        SHELL_WANT_PLAY.store(false, Ordering::Release);
+        shell_audio_command(SCE_MUSIC_EVENT_STOP);
+        shell_audio_yield_bgm();
+        return JS_UNDEFINED;
+    }
     PAUSED.store(true, Ordering::Release);
     JS_UNDEFINED
 }
@@ -1062,6 +1753,11 @@ unsafe extern "C" fn js_resume(
     argc: i32,
     argv: *mut JSValue,
 ) -> JSValue {
+    if SHELL_ACTIVE.load(Ordering::Acquire) {
+        SHELL_WANT_PLAY.store(true, Ordering::Release);
+        shell_audio_command(SCE_MUSIC_EVENT_PLAY);
+        return JS_UNDEFINED;
+    }
     /* 解码线程还活着且确实处于暂停：只清标志位，让它从原地继续。
      * 关键是绝不能在这里重新 open 文件 —— 那就是“暂停后从头开始播”。 */
     if WORKER.load(Ordering::Acquire) && PAUSED.load(Ordering::Acquire) {
@@ -1083,6 +1779,7 @@ unsafe extern "C" fn js_stop(
     _argc: i32,
     _argv: *mut JSValue,
 ) -> JSValue {
+    shell_audio_stop();
     STOP.store(true, Ordering::Release);
     PAUSED.store(false, Ordering::Release);
     PLAYING.store(false, Ordering::Release);
@@ -1106,6 +1803,37 @@ unsafe extern "C" fn js_state(
     _argv: *mut JSValue,
 ) -> JSValue {
     let path = get_path();
+    if SHELL_ACTIVE.load(Ordering::Acquire) {
+        shell_audio_poll();
+        let state = SHELL_STATE.load(Ordering::Acquire);
+        let ended = SHELL_ENDED.load(Ordering::Acquire);
+        let dur = DUR_MS.load(Ordering::Acquire);
+        /* 放完时把位置钉在时长上，JS 那边才会走到"下一首"。 */
+        let pos = if ended {
+            dur
+        } else {
+            SHELL_POS_MS.load(Ordering::Acquire)
+        };
+        let json = format!(
+            "{{\"playing\":{},\"paused\":{},\"path\":\"{}\",\"pos\":{},\"dur\":{},\"rate\":{},\"dec\":\"{}\"}}",
+            if state == SCE_MUSIC_EVENT_PLAY as u32 && !ended {
+                "true"
+            } else {
+                "false"
+            },
+            if state != SCE_MUSIC_EVENT_PLAY as u32 && !ended {
+                "true"
+            } else {
+                "false"
+            },
+            json_escape(&path),
+            pos,
+            dur,
+            TARGET_RATE,
+            "shell"
+        );
+        return js_str(ctx, &json);
+    }
     let json = format!(
         "{{\"playing\":{},\"paused\":{},\"path\":\"{}\",\"pos\":{},\"dur\":{},\"rate\":{},\"dec\":\"{}\"}}",
         if PLAYING.load(Ordering::Acquire) && !PAUSED.load(Ordering::Acquire) {
@@ -1154,14 +1882,7 @@ unsafe extern "C" fn js_log(
     argv: *mut JSValue,
 ) -> JSValue {
     let s = arg_string(ctx, argc, argv, 0);
-    let line = format!("{}\n", s);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("ux0:data/yunyin.log")
-    {
-        let _ = f.write_all(line.as_bytes());
-    }
+    append_log(&s);
     JS_NewInt32(ctx, 0)
 }
 
@@ -1226,6 +1947,36 @@ unsafe fn add_fn(
 /// # Safety
 /// Same realm, render thread, once per guest.
 pub unsafe fn register(ctx: *mut JSContext, global: JSValue) {
+    /* 日志默认关：卡里没有 ux0:/data/yunyin/debug 这个文件就什么都不写。
+     * 抓日志时建这个空文件、重开应用即可（正式版不留日志文件）。 */
+    if std::fs::File::open(LOG_FLAG).is_ok() {
+        LOG_ON.store(true, Ordering::Relaxed);
+    }
+    append_log("yunyin: start");
+    /* 插件方案的前置检查：系统音乐播放器进程（NPXS19999）在不在。
+     * 插件要靠它做宿主 —— 它不在的话，注入就无从谈起。 */
+    for name in [b"NPXS19999\0".as_slice(), b"NPXS10008\0".as_slice()] {
+        let mut pid: vitasdk_sys::SceUID = -1;
+        let ret = unsafe { sceAppMgrGetIdByName(&mut pid, name.as_ptr() as *const i8) };
+        let label = std::str::from_utf8(&name[..name.len() - 1]).unwrap_or("?");
+        append_log(&format!(
+            "probe: GetIdByName({}) -> ret=0x{:08X} pid=0x{:08X}",
+            label, ret as u32, pid as u32
+        ));
+    }
+    /* 先初始化 shell 事件系统：appmgr 的应用事件（激活/退出）要靠它。 */
+    let init_ret = unsafe { sceShellUtilInitEvents(0) };
+    append_log(&format!(
+        "shell events init -> 0x{:08X}",
+        init_ret as u32
+    ));
+    /* 监听 appmgr 应用事件：用户从 LiveArea 关掉应用时把 shell 播放收掉。 */
+    spawn_app_event_watch();
+    /* 播放期间挡住系统自动待机。 */
+    spawn_power_tick_watch();
+    /* 息屏/待机前把播放续上。 */
+    register_power_callback();
+    spawn_power_watch();
     let obj = JS_NewObject(ctx);
     add_fn(ctx, obj, b"list\0", js_list, 1);
     add_fn(ctx, obj, b"roots\0", js_roots, 0);

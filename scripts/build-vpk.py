@@ -45,6 +45,8 @@ APP_ID = "yunyin-main"                         # pocket.json -> app.output（框
 # （YUNYIN_OUT=yunyin-cn / yunyin-jp -> dist/<名字>.vpk）。
 OUT = os.environ.get("YUNYIN_OUT", APP_ID)
 APP_TITLE = "云音"                             # param.sfo TITLE（LiveArea 气泡下方显示名）
+# param.sfo 里的 APP_VER（VitaShell 里看到的版本号），发布新版本时改这里
+APP_VER = os.environ.get("YUNYIN_APP_VER", "00.50")
 TITLE_ID = os.environ.get("YUNYIN_TITLE_ID", "")  # 留空 = 用 app/catalog.ts 的 TITLE_ID / PF2A47F97
 THEME = os.environ.get("YUNYIN_THEME", "light")  # 皮肤主题：light / dark / pure / anime
 # 字体主题：每套皮肤默认用一套字体（chinese / japanese），可单独用 YUNYIN_FONT 覆盖。
@@ -360,6 +362,17 @@ def patch_host():
     if "SceAudiodec_stub" not in c:
         c = c.replace('features = ["SceAudio_stub"',
                       'features = ["SceAudiodec_stub", "SceAudio_stub"', 1)
+    # 后台播放要用 sceShellUtilInitEvents()（先初始化 shell 事件系统，
+    # 否则 appmgr 的应用事件接口会直接报错），它在这个 feature 后面。
+    if "SceShellSvc_stub" not in c:
+        c = c.replace('features = [', 'features = ["SceShellSvc_stub", ', 1)
+    # 电源回调（息屏续播）要 scePowerRegisterCallback
+    if "ScePower_stub" not in c:
+        c = c.replace('features = [', 'features = ["ScePower_stub", ', 1)
+    # 早期实验用过的 AppMgr feature 已经不需要（符号由默认链接提供），
+    # 老环境里可能残留，顺手摘掉。
+    for stale in ('"SceAppMgr_stub", ',):
+        c = c.replace(stale, '')
     cargo.write_text(c)
 
     build = PKJ / "hosts/vita/build.rs"
@@ -367,7 +380,9 @@ def patch_host():
     if "use std::path::{Path, PathBuf};" not in b:
         b = "use std::path::{Path, PathBuf};\n" + b
     marker = '    println!("cargo:rerun-if-env-changed=POCKETJS_CAPTURE_DIR");'
-    if "yunyin_listdir.c" not in b or "yplayer.c" not in b:
+    if ("yunyin_listdir.c" not in b or "yplayer.c" not in b
+            or "yunyin_shellsvc_stub.S" not in b
+            or "empva_bridge" in b or "taihen_loader" in b):
         # Strip any previously injected yunyin_* cc blocks (they referenced
         # files we no longer ship; each cc block is guarded by .exists()).
         b = re.sub(
@@ -390,6 +405,8 @@ def patch_host():
             '.define("STBI_NO_STDIO", None).compile("yunyin_image");'
             '\n      cc::Build::new().file(native.join("yunyin_listdir.c")).include(native)'
             '.compile("yunyin_listdir");'
+            '\n      cc::Build::new().file(native.join("yunyin_shellsvc_stub.S")).include(native)'
+            '.compile("yunyin_shellsvc_stub");'
             '\n      println!("cargo:rustc-link-lib=mpg123");'
             '\n      println!("cargo:rustc-link-lib=vorbisfile");'
             '\n      println!("cargo:rustc-link-lib=vorbis");'
@@ -400,6 +417,7 @@ def patch_host():
             '\n      println!("cargo:rerun-if-changed=native/yplayer.c");'
             '\n      println!("cargo:rerun-if-changed=native/yunyin_image.c");'
             '\n      println!("cargo:rerun-if-changed=native/yunyin_listdir.c");'
+            '\n      println!("cargo:rerun-if-changed=native/yunyin_shellsvc_stub.S");'
             '\n      println!("cargo:rerun-if-changed=native/vendor");'
             '\n    }'
         )
@@ -739,8 +757,29 @@ def repack():
             ignore=shutil.ignore_patterns("package", "about"))
     (staging / "sce_sys").mkdir(parents=True, exist_ok=True)
     title_id = TITLE_ID or app_const("TITLE_ID") or "PF2A47F97"
+    # CATEGORY=gdc：把应用登记成"系统应用"分类。参考项目（ElevenMPV-A）就是这么
+    # 做的 —— appmgr 的生命周期事件（激活/退出）只对这类应用发放，普通 homebrew
+    # 分类（gd）调 sceAppMgrReceiveEventNum 会直接返回 0x8080201F。
     run([f"{VITASDK}/bin/vita-mksfoex", "-d", "ATTRIBUTE2=12",
-         "-s", f"TITLE_ID={title_id}", APP_TITLE, str(staging / "sce_sys/param.sfo")])
+         "-s", f"TITLE_ID={title_id}", "-s", "CATEGORY=gdc",
+         "-s", f"APP_VER={APP_VER}",
+         APP_TITLE, str(staging / "sce_sys/param.sfo")])
+    # 用带权限的 authid 重新生成 eboot.bin。
+    #
+    # 框架默认用 vita-make-fself -s 生成"safe"eboot —— 那种 self 拿不到
+    # appmgr 的系统级接口（实测全是 0x8080201F：应用生命周期事件、按 TITLE_ID
+    # 查进程、带优先级的 BGM 端口申请都被拒）。官方 SDK 构建的应用（例如
+    # ElevenMPV-A）带的是更高权限的 authid，所以它们能收到 REQUEST_QUIT，
+    # 从而"用户关掉应用时停止播放"。vitasdk 的 vita-make-fself 支持同样的开关：
+    #   -a : Authid for more permissions (SceShell: 0x2800000000000001)
+    velf = (PKJ / "hosts/vita/target/armv7-sony-vita-newlibeabihf"
+            / "release/pocketjs-vita.velf")
+    if velf.exists():
+        run([f"{VITASDK}/bin/vita-make-fself", "-a", "0x2800000000000001",
+             str(velf), str(staging / "eboot.bin")])
+        print("[build-vpk] eboot regenerated with authid 0x2800000000000001")
+    else:
+        print(f"[build-vpk] WARN: velf not found ({velf}), kept default eboot")
     out = PROJECT_ROOT / "dist" / f"{OUT}.vpk"
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for p in sorted(staging.rglob("*")):

@@ -1178,6 +1178,7 @@ const audioEngine = {
   nativePaused: false,
   nativeSampleAtMs: 0,
   nativeSampleValid: false,
+  nativePath: "",
 
   load(song: Track) {
     const realPath = song.audioPath || "";
@@ -1271,6 +1272,7 @@ const audioEngine = {
       this.nativeDurMs = Math.max(0, Number(st.dur) || 0);
       this.nativePlaying = !!st.playing && !st.paused;
       this.nativePaused = !!st.paused;
+      this.nativePath = String((st as { path?: string }).path || "");
       this.nativeSampleAtMs = Date.now();
       this.nativeSampleValid = true;
       return true;
@@ -1279,7 +1281,7 @@ const audioEngine = {
     }
   },
 
-  snapshot(force = false): { posMs: number; durMs: number; playing: boolean } {
+  snapshot(force = false): { posMs: number; durMs: number; playing: boolean; path: string } {
     if (this.mode === "vita") {
       this.statePollFrames += 1;
       if (force || !this.nativeSampleValid || this.statePollFrames >= this.statePollIntervalFrames) {
@@ -1290,7 +1292,12 @@ const audioEngine = {
       if (this.nativeSampleValid) {
         let pos = this.nativePosMs;
         if (this.nativePlaying) pos += Math.max(0, Date.now() - this.nativeSampleAtMs);
-        return { posMs: Math.max(0, pos), durMs: this.nativeDurMs, playing: this.nativePlaying };
+        return {
+          posMs: Math.max(0, pos),
+          durMs: this.nativeDurMs,
+          playing: this.nativePlaying,
+          path: this.nativePath,
+        };
       }
     }
 
@@ -1298,6 +1305,7 @@ const audioEngine = {
       posMs: this.clockFallback(),
       durMs: 0,
       playing: this.running,
+      path: this.loadedPath,
     };
   },
 
@@ -1480,7 +1488,12 @@ export default function Music() {
     MOCK_TRACKS[0]?.id ?? "",
   );
 
-  const [playing, setPlaying] = createSignal(true);
+  /* 进应用默认是暂停状态：等用户按播放键才出声（按 PS 回桌面后的后台
+   * 播放由原生侧接管，和这里的状态无关）。 */
+  const [playing, setPlaying] = createSignal(false);
+  /* 息屏中（Start）：画面盖一层纯黑遮罩、帧循环歇着，少占 CPU/GPU；
+   * 屏幕没真的关，按键还在，所以黑屏下 L/R 一样能换曲。 */
+  const [displayOff, setDisplayOff] = createSignal(false);
 
   /* 当前 mock 播放位置(ms)。Native Audio 接入后直接接 native position */
   const [position, setPosition] = createSignal(0);
@@ -1724,10 +1737,6 @@ export default function Music() {
 
     focusNav();
     audioEngine.load(track());
-
-    if (playing()) {
-      audioEngine.play();
-    }
   });
 
   /* =======================================================
@@ -2190,19 +2199,23 @@ export default function Music() {
    * BUTTON: UP
    * ======================================================= */
 
+  /* 息屏（黑屏遮罩）期间：方向键 / ○ / △ 不做事，只由下面的通配处理器
+   * 负责亮屏；这样"按一下键亮屏"不会顺手在界面上点出一个动作。 */
+  const screenOn = () => !displayOff();
+
   onButtonPress(BTN.UP, () => {
     if (focusZone() !== "nav") {
       return;
     }
 
-    const current = navIndex();
-    const next = Math.max(0, current - 1);
+   const current = navIndex();
+   const next = Math.max(0, current - 1);
 
-    if (next !== current) {
-      setNavIndex(next);
-      focusNav();
-    }
-  });
+   if (next !== current) {
+     setNavIndex(next);
+     focusNav();
+   }
+  }, { active: screenOn });
 
   /* =======================================================
    * BUTTON: DOWN
@@ -2213,14 +2226,14 @@ export default function Music() {
       return;
     }
 
-    const current = navIndex();
-    const next = Math.min(4, current + 1);
+   const current = navIndex();
+   const next = Math.min(4, current + 1);
 
-    if (next !== current) {
-      setNavIndex(next);
-      focusNav();
-    }
-  });
+   if (next !== current) {
+     setNavIndex(next);
+     focusNav();
+   }
+  }, { active: screenOn });
 
   /* =======================================================
    * BUTTON: LEFT
@@ -2270,6 +2283,43 @@ export default function Music() {
     }
 
     leaveContent();
+  }, { active: screenOn });
+
+  /* =======================================================
+   * BUTTON: L / R —— 上一首 / 下一首
+   *
+   * 故意不做焦点判断：关屏（应用仍在后台播放）时也要能直接切歌，
+   * 这是 PSP 上那套"合盖换曲"的习惯用法。
+   * ======================================================= */
+
+  onButtonPress(BTN.LTRIGGER, () => {
+    prevTrack();
+  });
+
+  onButtonPress(BTN.RTRIGGER, () => {
+    nextTrack();
+  });
+
+  /* =======================================================
+   * BUTTON: START —— 息屏（只盖黑屏遮罩，不真的关屏）
+   *
+   * 真的调 scePowerRequestDisplayOff 关屏之后，系统不再把按键报给应用
+   * （实机日志里关屏后一条按键记录都没有），黑屏换曲就没法做。
+   * 所以这里只是盖一层纯黑遮罩 + 停止画面更新：看起来一样是黑的，
+   * 但应用还在前台跑，按键照常进来（黑屏 L/R 换曲、任意键亮屏）。
+   * ======================================================= */
+
+  onButtonPress(BTN.START, () => {
+    const next = !displayOff();
+    setDisplayOff(next);
+    logMsg(next ? "screen: soft off" : "screen: on");
+  });
+
+  /* 息屏中按任意键亮屏；L / R 只换曲，不亮屏（合盖换曲就得屏幕一直黑着）。 */
+  onButtonPress(0xffff, (pressed) => {
+    if (displayOff() && pressed & ~(BTN.LTRIGGER | BTN.RTRIGGER | BTN.START)) {
+      setDisplayOff(false);
+    }
   });
 
   /* =======================================================
@@ -2305,7 +2355,7 @@ export default function Music() {
     }
 
     moveListRight();
-  });
+  }, { active: screenOn });
 
   /* =======================================================
    * BUTTON: CIRCLE
@@ -2318,7 +2368,7 @@ export default function Music() {
     }
 
     activateContent();
-  });
+  }, { active: screenOn });
 
   /* =======================================================
    * BUTTON: TRIANGLE
@@ -2351,16 +2401,30 @@ export default function Music() {
     }
 
     leaveContent();
-  });
+  }, { active: screenOn });
 
   /* =======================================================
    * OPTIMIZED FRAME LOOP
    * ======================================================= */
 
   let frameCounter = 0;
+  let lastFrameMs = 0;
 
   onFrame(() => {
     audioEngine.pump();
+
+    /* 息屏中又被切到后台（PS → LiveArea）再回来，帧循环会空一大段；
+     * 这时自动亮屏，免得回来面对一片黑还以为卡死了。 */
+    const nowMs = Date.now();
+    const frameGapMs = nowMs - lastFrameMs;
+    lastFrameMs = nowMs;
+    if (displayOff() && frameGapMs > 1500) {
+      logMsg("screen: on (back from background)");
+      setDisplayOff(false);
+    }
+
+    /* 息屏期间：黑屏遮罩已经盖上，UI 这一帧就不用算了（省 CPU/GPU）。 */
+    if (displayOff()) return;
     frameCounter += 1;
 
     /* Native state() 约 10Hz；两次采样之间由 audioEngine 平滑预测。 */
@@ -2378,6 +2442,13 @@ export default function Music() {
     if (!playing()) return;
 
     const currentTrack = track();
+    /* 息屏期间可能由原生侧（L/R 肩键）换过歌：回到前台时把 UI 同步过来。 */
+    if (snap.path && snap.path !== currentTrack.audioPath) {
+      const matched = tracks().find((song) => song.audioPath === snap.path);
+      if (matched && matched.id !== currentTrack.id) {
+        setCurrentTrackId(matched.id);
+      }
+    }
     const duration = currentTrack.durationMs || snap.durMs || getTrackDuration(currentTrack);
     const next = snap.posMs;
 
@@ -2632,6 +2703,10 @@ export default function Music() {
       <Text class={pTxt("footer")}>L PREV | R NEXT</Text>
       <Text class={pTxt("footer")}>◎ MENU</Text>
       </View>
+
+      {/* 息屏（Start）：一层纯黑遮罩盖住整个画面。屏幕其实还亮着，
+          所以按键照常进得来 —— 黑屏下 L/R 换曲靠的就是这一点。 */}
+      {displayOff() && <View class="absolute inset-0 z-50 bg-black" />}
     </View>
   );
 }
