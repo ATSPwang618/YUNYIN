@@ -23,7 +23,23 @@
 #define SCE_SEEK_END 2
 #endif
 
+/* 日志默认关（正式版不写 ux0:data/yunyin.log）：只有卡里存在
+ * ux0:data/yunyin/debug 时才写。要抓日志就建这个空文件再重开应用。 */
+#define YUNYIN_LOG_FLAG "ux0:data/yunyin/debug"
+
+static int yunyin_log_enabled(void) {
+    SceUID flag = sceIoOpen(YUNYIN_LOG_FLAG, SCE_O_RDONLY, 0);
+    if (flag >= 0) {
+        sceIoClose(flag);
+        return 1;
+    }
+    return 0;
+}
+
 static void yunyin_log(const char *msg) {
+    if (!yunyin_log_enabled()) {
+        return;
+    }
     SceUID f = sceIoOpen("ux0:data/yunyin.log",
                          SCE_O_WRONLY | SCE_O_CREAT, 0777);
     if (f >= 0) {
