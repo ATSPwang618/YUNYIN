@@ -2,20 +2,22 @@
 
 <img src="screenshots/icon0.png" width="104" align="right" alt="YUNYIN">
 
-一款用 [PocketJS](https://pocketjs.dev) 
-（Solid 前端 + Rust ，跑在 Vita 进程里），专为psvita开发的一款本地音乐播放器。
+一款用 [PocketJS](https://pocketjs.dev)
+（Solid 前端 + Rust 宿主，跑在 Vita 进程里）做的 PS Vita 本地音乐播放器。
 
-我受不了现有音乐播放器的古法UI，一直想要一个现代化、可自定义主题、支持中文歌词的本地音乐播放器，于是这个项目就诞生了。
+解码和出声都在本进程：`yplayer.c` 拉流解码，再灌进 `SCE_AUDIO_OUT_PORT_TYPE_BGM`。按 PS 不撕页，进程还在，BGM 口继续响；从 LiveArea 撕掉云音，进程结束，声音立刻停。
+
+我受不了现有音乐播放器的古法 UI，一直想要一个现代化、可自定义主题、支持中文歌词的本地音乐播放器，于是这个项目就诞生了。
 
 |  |  |
 | --- | --- |
-| 当前版本 | **0.5** |
+| 当前版本 | **0.61** |
 | 曲库目录 | `ux0:/data/yunyin/music` |
 | 音频格式 | MP3（最推荐格式！！） / OGG / WAV / FLAC / OPUS |
 | 界面 | 首页播放器 · 全部曲目 · 专辑 · 收藏 · 设置 |
 | 主题 | LIGHT / DARK / PURE / ANIME 四套，**默认 DARK** |
 
-> 建议先用 [MusicBrainz Picard](https://picard.musicbrainz.org/) 给音乐补全标签再放进去。
+> 建议先用Release的YUNYIN-TagCheck.exe 给音乐补全标签再放进去。
 > 歌名、歌手、专辑、封面、歌词全都来自音频内嵌标签，标签越全，界面越好看。
 
 
@@ -27,8 +29,8 @@
 3. 打开「云音」，第一次进入会自动扫描曲库，扫完就能听。
 4. 首页按 **○** 播放；**←→** 切按钮/切歌，**△** 返回，**↑↓** 换左侧页面。
 5. 播放中按 **START** 关掉画面（继续放）；黑屏下 **L / R** 切上一首 / 下一首，按任意其他键亮屏。
-6. 按 PS 回桌面，音乐继续；不听了就在 LiveArea 上把云音撕页关掉，音乐就停。
-7. 设置页可以换主题（LIGHT / DARK / PURE / ANIME）、开关音效和震动。
+6. 按 PS 回桌面，音乐继续（BGM 口仍由本进程灌着）；不听了就在 LiveArea 上把云音撕页关掉，进程结束，音乐就停。
+7. 设置页可以换主题（LIGHT / DARK / PURE / ANIME）、开关音效和震动。About 里显示 **VER 0.61**，○ 可在 **CJK BAKED（烘焙常用字）** 和 **CJK STREAM（非常用汉字后台加载）** 之间切换。
 
 ## 歌名/封面/歌词不显示？用配套工具修
 
@@ -103,8 +105,8 @@ wsl -d pocket-ubuntu -u root bash /mnt/d/AI-PSVITA/yunyin/scripts/build-variants
 
 ## 最后
 
-- 特别感谢pocketjs团队的努力付出！！
-- 感谢G大开源的libShellAudio库
+- 特别感谢 pocketjs 团队的努力付出！！
+- 播放后端对照 [ElevenMPVScrobbling](https://github.com/patchyfluffy/ElevenMPVScrobbling) 的本进程 BGM 口（不是 libShellAudio / SceShell）。
 - 主题文字颜色在 `app/colors.json` 里改，改完重新打包即可。
 - 日文版用的 MS Mincho 来自 Windows 自带字体，对外分发前请确认授权；
   `fonts/chinese/NotoSansSC-Medium.ttf` 是 Noto Sans SC（SIL OFL）。

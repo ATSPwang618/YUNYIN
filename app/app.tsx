@@ -12,6 +12,10 @@ import { after } from "@pocketjs/framework/clock";
 import { registerTexture } from "@pocketjs/framework";
 import { onButtonPress, onFrame } from "@pocketjs/framework/lifecycle";
 import { BTN, focusNode } from "@pocketjs/framework/input";
+import {
+  openFontArchive,
+  type TextResource,
+} from "@pocketjs/framework/fonts";
 
 import {
   createSignal,
@@ -19,7 +23,9 @@ import {
   createMemo,
   onMount,
   onCleanup,
+  untrack,
   For,
+  Show,
 } from "solid-js";
 
 /* 主题配色配置文件：改 app/colors.json 即可调整各主题文字颜色，重新打包生效。 */
@@ -438,6 +444,128 @@ const tBrand = () => PALETTES[uiTheme()].brand;
  * 值是完整类字面量，保证可被烘焙；UI 直接 pTxt(key) 取用。 */
 const PANEL_TXT = THEME_COLORS.ui as Record<UiSkin, Record<string, string>>;
 const pTxt = (key: string) => PANEL_TXT[uiTheme()][key] ?? "";
+
+/* 软件版本：About 页展示，和 param.sfo APP_VER 00.61 对齐。 */
+const APP_VERSION = "0.61";
+const POCKETJS_VERSION = "0.12.0";
+
+type CjkMode = "baked" | "stream";
+const [cjkMode, setCjkMode] = createSignal<CjkMode>(
+  (() => {
+    try {
+      return media()?.store_get?.("cjkMode") === "stream" ? "stream" : "baked";
+    } catch {
+      return "baked";
+    }
+  })(),
+);
+const [cjkStatus, setCjkStatus] = createSignal<"off" | "opening" | "ready" | "error">("off");
+const [cjkEpoch, setCjkEpoch] = createSignal(0);
+let cjkFont: ReturnType<typeof openFontArchive> | undefined;
+
+const streamHostReady = (): boolean => {
+  try {
+    const g = globalThis as unknown as {
+      ui?: { fontStreamConfigure?: unknown; fontStreamBatch?: unknown };
+      offload?: { local?: unknown };
+    };
+    return !!(g.ui?.fontStreamConfigure && g.ui?.fontStreamBatch && g.offload?.local);
+  } catch {
+    return false;
+  }
+};
+
+const slotFromClass = (cls: string): number => {
+  const bold = /\bfont-bold\b/.test(cls);
+  if (/\btext-sm\b/.test(cls)) return bold ? 8 : 1;
+  return bold ? 7 : 0;
+};
+
+const applyCjkMode = (next: CjkMode): void => {
+  setCjkMode(next);
+  try {
+    media()?.store_set?.("cjkMode", next);
+  } catch {
+    /* ignore */
+  }
+  if (next !== "stream") {
+    try {
+      cjkFont?.dispose();
+    } catch {
+      /* ignore */
+    }
+    cjkFont = undefined;
+    setCjkStatus("off");
+    setCjkEpoch((n) => n + 1);
+    return;
+  }
+  if (cjkFont) return;
+  if (!streamHostReady()) {
+    setCjkStatus("error");
+    setCjkEpoch((n) => n + 1);
+    return;
+  }
+  try {
+    setCjkStatus("opening");
+    cjkFont = openFontArchive({
+      path: "fonts/cjk.pjfa",
+      slots: [0, 7, 8],
+      provider: "local",
+      capacity: 384,
+      maxBytes: 2 * 1024 * 1024,
+      onChange: () => {
+        const st = cjkFont?.status().state;
+        if (st === "ready") setCjkStatus("ready");
+        else if (st === "error") setCjkStatus("error");
+        else if (st === "warming" || st === "opening") setCjkStatus("opening");
+      },
+    });
+    setCjkEpoch((n) => n + 1);
+  } catch {
+    cjkFont = undefined;
+    setCjkStatus("error");
+    setCjkEpoch((n) => n + 1);
+  }
+};
+
+function StreamText(props: { class: string; text: string }) {
+  const [res, setRes] = createSignal<TextResource | undefined>();
+  createEffect(() => {
+    const mode = cjkMode();
+    void cjkEpoch();
+    const t = props.text;
+    const cls = props.class;
+    const prev = untrack(() => res());
+    prev?.dispose();
+    setRes(undefined);
+    if (mode !== "stream" || !cjkFont) return;
+    const slot = slotFromClass(cls);
+    if (slot !== 0 && slot !== 7 && slot !== 8) return;
+    try {
+      setRes(cjkFont.prepareText(t, { slot }));
+    } catch {
+      /* baked fallback */
+    }
+  });
+  onCleanup(() => {
+    res()?.dispose();
+  });
+  return (
+    <Show
+      when={res()}
+      fallback={<Text class={props.class}>{props.text}</Text>}
+    >
+      {(r) => (
+        <Text
+          class={props.class}
+          resource={r()}
+          fallback={() => <Text class={props.class}>{props.text}</Text>}
+          errorFallback={() => <Text class={props.class}>{props.text}</Text>}
+        />
+      )}
+    </Show>
+  );
+}
 
 const getCoverClass = (coverId: string, fallbackCls?: string): string => {
   if (fallbackCls && fallbackCls.trim()) {
@@ -1737,6 +1865,9 @@ export default function Music() {
 
     focusNav();
     audioEngine.load(track());
+    if (cjkMode() === "stream") {
+      applyCjkMode("stream");
+    }
   });
 
   /* =======================================================
@@ -2169,7 +2300,7 @@ export default function Music() {
 
     if (screen() === "setting") {
       if (aboutVisible()) {
-        /* About 子界面：OK 不触发设置项，仅 △ 返回。 */
+        applyCjkMode(cjkMode() === "stream" ? "baked" : "stream");
         return;
       }
       activateSetting();
@@ -2855,9 +2986,9 @@ function HomePage(props: {
         <View class="relative w-[184] h-48 rounded-2xl">
           <Image src={useSkin().panel} class="absolute inset-0 w-full h-full" />
           <View class="relative flex-col justify-center gap-1 w-[184] h-48 p-1">
-            <Text class={pTxt("album")}>{clip(props.track().album, 24)}</Text>
-            <Text class={pTxt("title")}>{clip(props.track().title, 16)}</Text>
-            <Text class={pTxt("artist")}>{clip(props.track().artist, 28)}</Text>
+            <StreamText class={pTxt("album")} text={clip(props.track().album, 24)} />
+            <StreamText class={pTxt("title")} text={clip(props.track().title, 16)} />
+            <StreamText class={pTxt("artist")} text={clip(props.track().artist, 28)} />
 
             {/* PROGRESS */}
             <View class="flex-col gap-0">
@@ -2998,16 +3129,17 @@ function LyricsPage(props: {
       <View class="flex-row items-center justify-between h-7">
         <View class="flex-col">
           <Text class={pTxt("aboutTitle")}>LYRICS</Text>
-          <Text class={pTxt("lyricOther")}>{clip(props.track().title, 24)}</Text>
+          <StreamText class={pTxt("lyricOther")} text={clip(props.track().title, 24)} />
         </View>
 
         <Text class={pTxt("percent")}>{props.percent()}%</Text>
       </View>
 
       <View class="flex-row items-center justify-between h-5 gap-2 overflow-hidden">
-        <Text class={pTxt("detailArtist")}>
-          {clip(props.track().artist, 34)}
-        </Text>
+        <StreamText
+          class={pTxt("detailArtist")}
+          text={clip(props.track().artist, 34)}
+        />
 
         <Text
           class={props.playing() ? pTxt("navActive") : pTxt("lyricOther")}
@@ -3024,11 +3156,9 @@ function LyricsPage(props: {
           style={{ translateY: 0 }}
           class="flex-col items-center gap-1 overflow-hidden"
         >
-          <Text class={pTxt("lyricOther")}>{clip(windowed()[0], 44)}</Text>
-          <Text class={pTxt("lyricCur")}>
-            {clip(windowed()[1], 44)}
-          </Text>
-          <Text class={pTxt("lyricOther")}>{clip(windowed()[2], 44)}</Text>
+          <StreamText class={pTxt("lyricOther")} text={clip(windowed()[0], 44)} />
+          <StreamText class={pTxt("lyricCur")} text={clip(windowed()[1], 44)} />
+          <StreamText class={pTxt("lyricOther")} text={clip(windowed()[2], 44)} />
         </View>
       </View>
 
@@ -3102,10 +3232,8 @@ function MusicListPage(props: {
               </Text>
 
               <View class="flex-col">
-                <Text class={pTxt("status")}>
-                  {clip(song.title, 24)}
-                </Text>
-                <Text class={pTxt("detailArtist")}>{clip(song.artist, 32)}</Text>
+                <StreamText class={pTxt("status")} text={clip(song.title, 24)} />
+                <StreamText class={pTxt("detailArtist")} text={clip(song.artist, 32)} />
               </View>
             </View>
 
@@ -3309,17 +3437,14 @@ function AlbumTile(props: {
               }
             />
 
-            <Text
+            <StreamText
               class={
                 current ? pTxt("navActive") : pTxt("status")
               }
-            >
-              {clip(album.title, 7)}
-            </Text>
+              text={clip(album.title, 7)}
+            />
 
-            <Text class={pTxt("detailArtist")}>
-              {clip(album.artist, 8)}
-            </Text>
+            <StreamText class={pTxt("detailArtist")} text={clip(album.artist, 8)} />
           </View>
         );
       }}
@@ -3333,22 +3458,31 @@ function AlbumTile(props: {
  * ======================================================= */
 
 function AboutPage() {
+  const cjkLabel = () => {
+    if (cjkMode() !== "stream") return "CJK  BAKED 烘焙";
+    if (cjkStatus() === "ready") return "CJK  STREAM 流式";
+    if (cjkStatus() === "opening") return "CJK  LOADING";
+    if (cjkStatus() === "error") return "CJK  BAKED*";
+    return "CJK  STREAM";
+  };
   return (
-    <View class="relative overflow-hidden flex-col w-96 h-48 p-3 gap-2 rounded-xl">
+    <View class="relative overflow-hidden flex-col w-96 h-48 p-3 gap-1 rounded-xl">
       <Image src={useSkin().aboutBg} class="absolute inset-0 w-full h-full" />
-      <View class="relative flex-col w-96 h-48 p-3 gap-2">
+      <View class="relative flex-col w-96 h-48 p-3 gap-1">
         <View class="flex-row items-center justify-between h-7">
           <Text class={pTxt("aboutTitle")}>ABOUT US</Text>
           <Text class={pTxt("aboutSub")}>云音 YUNYIN</Text>
         </View>
         <View class="grow flex-col items-center justify-center gap-1">
           <Text class={pTxt("aboutTitle")}>YUNYIN 云音 for vita</Text>
+          <Text class={pTxt("aboutSub")}>VER {APP_VERSION}  ·  APP 00.61  ·  PJ {POCKETJS_VERSION}</Text>
           <Text class={pTxt("aboutSub")}>made by 阡陌</Text>
-          <Text class={pTxt("aboutSub")}>https://github.com/ATSPwang618/YUNYIN</Text>
-          <Text class={pTxt("aboutSub")}>敬请享受音乐的乐趣吧！</Text>
+          <Text class={cjkMode() === "stream" ? pTxt("aboutTitle") : pTxt("aboutSub")}>
+            {cjkLabel()}
+          </Text>
         </View>
         <View class="flex-row items-center justify-center h-5">
-          <Text class={pTxt("aboutSub")}>△ BACK 返回</Text>
+          <Text class={pTxt("aboutSub")}>○ CJK  △ BACK 返回</Text>
         </View>
       </View>
     </View>

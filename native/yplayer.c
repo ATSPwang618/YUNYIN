@@ -172,7 +172,7 @@ static int opus_open(const char *p) {
   int err = 0;
   g.of = op_open_file(p, &err);
   if (!g.of) return -1;
-  g.rate = 48000; /* opus decodes at 48k; round to 44100 upstream */
+  g.rate = 48000; /* opus decodes at 48 kHz; BGM port opens at this native rate */
   g.ch = op_channel_count(g.of, -1) >= 2 ? 2 : 1;
   g.fmt = 5;
   return 0;
@@ -225,9 +225,8 @@ int yp_decode(short *buf, int max_frames) {
   }
 }
 
-/* Jump to an absolute source frame.  Used to rewind the few frames that were
- * already decoded into the output ring when the user hits pause, so resuming
- * picks up exactly where the sound actually stopped. */
+/* Jump to an absolute source frame. Decoder stays on the current frame
+ * during pause (callback fills silence); seek is for explicit jumps. */
 int yp_seek(long long frame) {
   if (frame < 0) frame = 0;
   switch (g.fmt) {

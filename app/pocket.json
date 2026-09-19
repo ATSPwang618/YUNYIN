@@ -4,11 +4,11 @@
   "id": "dev.pocket-stack.yunyin",
   "name": "yunyin",
   "title": "云音",
-  "version": "1.13.0",
+  "version": "0.6.1",
   "engine": {
     "capabilities": {
       "requires": ["text.glyphs.baked", "input.buttons"],
-      "enhances": ["audio.pcm"]
+      "enhances": ["audio.pcm", "text.glyphs.streamed", "io.offload"]
     }
   },
   "app": {

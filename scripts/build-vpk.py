@@ -35,9 +35,9 @@ import zlib
 from pathlib import Path
 
 # --- config ---------------------------------------------------------------
-PROJECT_ROOT = Path("/mnt/d/AI-PSVITA/yunyin")  # this project's root
-PKJ = Path("/root/pocketjs")                    # PocketJS framework checkout
-VITASDK = "/opt/vitasdk"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PKJ = Path(os.environ.get("POCKETJS_ROOT", "/root/pocketjs"))                    # PocketJS framework checkout
+VITASDK = os.environ.get("VITASDK", "/opt/vitasdk")
 BUN = "/root/.bun/bin/bun"
 APP_NAME = "yunyin"                            # pocketjs app dir name
 APP_ID = "yunyin-main"                         # pocket.json -> app.output（框架产物名）
@@ -46,12 +46,13 @@ APP_ID = "yunyin-main"                         # pocket.json -> app.output（框
 OUT = os.environ.get("YUNYIN_OUT", APP_ID)
 APP_TITLE = "云音"                             # param.sfo TITLE（LiveArea 气泡下方显示名）
 # param.sfo 里的 APP_VER（VitaShell 里看到的版本号），发布新版本时改这里
-APP_VER = os.environ.get("YUNYIN_APP_VER", "00.50")
+APP_VER = os.environ.get("YUNYIN_APP_VER", "00.61")
 TITLE_ID = os.environ.get("YUNYIN_TITLE_ID", "")  # 留空 = 用 app/catalog.ts 的 TITLE_ID / PF2A47F97
-THEME = os.environ.get("YUNYIN_THEME", "light")  # 皮肤主题：light / dark / pure / anime
-# 字体主题：每套皮肤默认用一套字体（chinese / japanese），可单独用 YUNYIN_FONT 覆盖。
-FONT_BY_THEME = {"light": "chinese", "dark": "japanese", "pure": "chinese", "anime": "japanese"}
-FONT_THEME = os.environ.get("YUNYIN_FONT", FONT_BY_THEME.get(THEME, THEME))
+THEME = os.environ.get("YUNYIN_THEME", "dark")  # 皮肤主题：light / dark / pure / anime
+# 默认 Noto Sans SC。日文曲库才切 MSMINCHO：YUNYIN_FONT=japanese
+# dark/anime 以前绑日文字体会让简体 UI（首页/专辑/设置）变成 □□□。
+FONT_BY_THEME = {"light": "chinese", "dark": "chinese", "pure": "chinese", "anime": "chinese"}
+FONT_THEME = os.environ.get("YUNYIN_FONT", FONT_BY_THEME.get(THEME, "chinese"))
 DENSITY = 2                                    # see note in build_vpk()
 PAD_SIZE = 0x1000                              # VitaSDK SCE-header layout pad (auto-adjusted)
 
@@ -325,23 +326,33 @@ def stage():
     native = PKJ / "hosts/vita/native"
     if native.exists():
         shutil.rmtree(native)
-    shutil.copytree(PROJECT_ROOT / "native", native)
-    shutil.copy2(PROJECT_ROOT / "native" / "media.rs", PKJ / "hosts/vita/src/media.rs")
+    shutil.copytree(
+        PROJECT_ROOT / "native",
+        native,
+        ignore=shutil.ignore_patterns("rs", "media.rs", "*.S"),
+    )
+
+    media_dst = PKJ / "hosts/vita/src/media"
+    if media_dst.exists():
+        shutil.rmtree(media_dst)
+    old_flat = PKJ / "hosts/vita/src/media.rs"
+    if old_flat.exists():
+        old_flat.unlink()
+    shutil.copytree(PROJECT_ROOT / "native" / "rs", media_dst)
 
     # VitaSDK's vita-elf-create needs >= 2948 bytes of gap at the end of
-    # segment 0 for its SCE header.  The bundled app.js rodata can leave
-    # segment 0 ending right at a 4KB boundary (gap < 2948) which makes
-    # vita-elf-create fail with "segment 1 overlaps".  This read-only pad
-    # nudges segment 0 past the boundary so the SCE header fits.  It is
-    # injected at build time only (the project's media.rs stays clean).
-    media_dst = PKJ / "hosts/vita/src/media.rs"
-    if "YUNYIN_ELF_PAD" not in media_dst.read_text():
-        media_dst.write_text(media_dst.read_text() +
-            "\n\n// build-vpk: VitaSDK SCE-header alignment pad (nudges segment 0 "
+    # segment 0 for its SCE header.  Injected at build time only.
+    mod_rs = media_dst / "mod.rs"
+    text = mod_rs.read_text()
+    if "YUNYIN_ELF_PAD" not in text:
+        mod_rs.write_text(
+            text
+            + "\n\n// build-vpk: VitaSDK SCE-header alignment pad (nudges segment 0 "
             "past a 4KB boundary so vita-elf-create can fit its SCE data).\n"
             "#[used]\n"
-            f"static YUNYIN_ELF_PAD: [u8; {PAD_SIZE}] = [0u8; {PAD_SIZE}];\n")
-    print("[build-vpk] staged app + native patch")
+            f"static YUNYIN_ELF_PAD: [u8; {PAD_SIZE}] = [0u8; {PAD_SIZE}];\n"
+        )
+    print("[build-vpk] staged app + native/rs -> hosts/vita/src/media/")
 
 
 # --- 3 patch host ---------------------------------------------------------
@@ -359,20 +370,15 @@ def patch_host():
     c = cargo.read_text()
     if "[build-dependencies]" not in c:
         c += "\n[build-dependencies]\ncc = \"1\"\n"
-    if "SceAudiodec_stub" not in c:
-        c = c.replace('features = ["SceAudio_stub"',
-                      'features = ["SceAudiodec_stub", "SceAudio_stub"', 1)
-    # 后台播放要用 sceShellUtilInitEvents()（先初始化 shell 事件系统，
-    # 否则 appmgr 的应用事件接口会直接报错），它在这个 feature 后面。
-    if "SceShellSvc_stub" not in c:
-        c = c.replace('features = [', 'features = ["SceShellSvc_stub", ', 1)
-    # 电源回调（息屏续播）要 scePowerRegisterCallback
+    # Drop leftover shell / audiodec features from older YUNYIN host patches.
+    for stale in ('"SceShellSvc_stub", ', '"SceAudiodec_stub", '):
+        c = c.replace(stale, "")
     if "ScePower_stub" not in c:
-        c = c.replace('features = [', 'features = ["ScePower_stub", ', 1)
-    # 早期实验用过的 AppMgr feature 已经不需要（符号由默认链接提供），
-    # 老环境里可能残留，顺手摘掉。
-    for stale in ('"SceAppMgr_stub", ',):
-        c = c.replace(stale, '')
+        c = c.replace(
+            'features = ["SceAudio_stub"',
+            'features = ["ScePower_stub", "SceAppMgr_stub", "SceAudio_stub"',
+            1,
+        )
     cargo.write_text(c)
 
     build = PKJ / "hosts/vita/build.rs"
@@ -380,19 +386,21 @@ def patch_host():
     if "use std::path::{Path, PathBuf};" not in b:
         b = "use std::path::{Path, PathBuf};\n" + b
     marker = '    println!("cargo:rerun-if-env-changed=POCKETJS_CAPTURE_DIR");'
-    if ("yunyin_listdir.c" not in b or "yplayer.c" not in b
-            or "yunyin_shellsvc_stub.S" not in b
-            or "empva_bridge" in b or "taihen_loader" in b):
-        # Strip any previously injected yunyin_* cc blocks (they referenced
-        # files we no longer ship; each cc block is guarded by .exists()).
+    needs_cc = (
+        "yunyin_listdir.c" not in b
+        or "yplayer.c" not in b
+        or "yunyin_shellsvc_stub.S" in b
+        or "empva_bridge" in b
+        or "taihen_loader" in b
+        or 'cargo:rustc-link-lib=mpg123' not in b
+    )
+    if needs_cc:
         b = re.sub(
             r'\n    let native = Path::new\("native"\);'
             r'\n    if native\.join\("[a-z0-9_]+\.c"\)\.exists\(\) \{\n'
             r'.*?println!\("cargo:rerun-if-changed=native/[a-z0-9_]+\.c"\);\n'
             r'    \}',
             '', b, flags=re.S)
-        # Strip the current cc block (wrapped in { let native = ... }) so we
-        # don't accumulate duplicate block when new native sources are added.
         b = re.sub(
             r'\n    \{ let native = Path::new\("native"\);'
             r'.*?\n    \}',
@@ -405,8 +413,6 @@ def patch_host():
             '.define("STBI_NO_STDIO", None).compile("yunyin_image");'
             '\n      cc::Build::new().file(native.join("yunyin_listdir.c")).include(native)'
             '.compile("yunyin_listdir");'
-            '\n      cc::Build::new().file(native.join("yunyin_shellsvc_stub.S")).include(native)'
-            '.compile("yunyin_shellsvc_stub");'
             '\n      println!("cargo:rustc-link-lib=mpg123");'
             '\n      println!("cargo:rustc-link-lib=vorbisfile");'
             '\n      println!("cargo:rustc-link-lib=vorbis");'
@@ -417,13 +423,189 @@ def patch_host():
             '\n      println!("cargo:rerun-if-changed=native/yplayer.c");'
             '\n      println!("cargo:rerun-if-changed=native/yunyin_image.c");'
             '\n      println!("cargo:rerun-if-changed=native/yunyin_listdir.c");'
-            '\n      println!("cargo:rerun-if-changed=native/yunyin_shellsvc_stub.S");'
             '\n      println!("cargo:rerun-if-changed=native/vendor");'
             '\n    }'
         )
+        if marker not in b:
+            raise SystemExit("[build-vpk] build.rs POCKETJS_CAPTURE_DIR marker not found")
         b = b.replace(marker, blocks + "\n" + marker)
     build.write_text(b)
-    print("[build-vpk] host patched")
+    patch_streamed_cjk()
+    print("[build-vpk] host patched (v0.12.0 anchors, no SceShellSvc)")
+
+
+def patch_streamed_cjk():
+    """Vita is density-2; PocketJS 0.12.0 PJFA/font_stream is density-1.
+    Keep the PFS1/PFG1/PFB1 protocol but allow coverage-sized cells at the
+    host's raster density so STREAM CJK can land on Vita."""
+    fs = PKJ / "engine/core/src/font_stream.rs"
+    t = fs.read_text()
+    t2 = t.replace(
+        "            || b[14] != self.raster_density\n            || b[14] != 1\n            || b[13] == 0\n",
+        "            || b[14] != self.raster_density\n            || b[13] == 0\n",
+    )
+    if t2 == t:
+        print("[build-vpk] font_stream density-1 guard already patched or missing")
+    t = t2
+    old_budget = (
+        "        if other + capacity * (a.cell_w.max(b[9] as u32) * a.cell_h.max(b[10] as u32)) as usize\n"
+        "            > MAX_BYTES\n"
+    )
+    new_budget = (
+        "        let cov_w = a.coverage_width().max(b[9] as u32);\n"
+        "        let cov_h = a.coverage_height().max(b[10] as u32);\n"
+        "        if other + capacity * (cov_w as usize) * (cov_h as usize) > MAX_BYTES\n"
+    )
+    if old_budget in t:
+        t = t.replace(old_budget, new_budget)
+        print("[build-vpk] patch: font_stream byte budget uses coverage")
+    old_pad = (
+        "        let old_w = self.cell_w as usize;\n"
+        "        let old_h = self.cell_h as usize;\n"
+        "        let cw = w.max(old_w);\n"
+        "        let ch = h.max(old_h);\n"
+        "        if cw * ch > MAX_PIXELS {\n"
+        "            return false;\n"
+        "        }\n"
+        "        let mut pixels = vec![0; (base as usize + capacity) * cw * ch];\n"
+        "        for g in 0..base as usize {\n"
+        "            for y in 0..old_h {\n"
+        "                pixels[g * cw * ch + y * cw..g * cw * ch + y * cw + old_w].copy_from_slice(\n"
+        "                    &self.bitmap\n"
+        "                        [g * old_w * old_h + y * old_w..g * old_w * old_h + (y + 1) * old_w],\n"
+        "                );\n"
+        "            }\n"
+        "        }\n"
+        "        self.bitmap = pixels;\n"
+        "        self.cell_w = cw as u32;\n"
+        "        self.cell_h = ch as u32;\n"
+    )
+    new_pad = (
+        "        let old_w = self.cell_w as usize;\n"
+        "        let old_h = self.cell_h as usize;\n"
+        "        let d = self.raster_density as usize;\n"
+        "        if d == 0 || w % d != 0 || h % d != 0 {\n"
+        "            return false;\n"
+        "        }\n"
+        "        let old_cov_w = old_w * d;\n"
+        "        let old_cov_h = old_h * d;\n"
+        "        let new_w = (w / d).max(old_w);\n"
+        "        let new_h = (h / d).max(old_h);\n"
+        "        let new_cov_w = new_w * d;\n"
+        "        let new_cov_h = new_h * d;\n"
+        "        if new_cov_w * new_cov_h > MAX_PIXELS {\n"
+        "            return false;\n"
+        "        }\n"
+        "        let mut pixels = vec![0; (base as usize + capacity) * new_cov_w * new_cov_h];\n"
+        "        for g in 0..base as usize {\n"
+        "            for y in 0..old_cov_h {\n"
+        "                let from = g * old_cov_w * old_cov_h + y * old_cov_w;\n"
+        "                let to = g * new_cov_w * new_cov_h + y * new_cov_w;\n"
+        "                pixels[to..to + old_cov_w].copy_from_slice(&self.bitmap[from..from + old_cov_w]);\n"
+        "            }\n"
+        "        }\n"
+        "        self.bitmap = pixels;\n"
+        "        self.cell_w = new_w as u32;\n"
+        "        self.cell_h = new_h as u32;\n"
+    )
+    if old_pad in t:
+        t = t.replace(old_pad, new_pad)
+        print("[build-vpk] patch: font_stream configure pads coverage cells")
+    else:
+        print("[build-vpk] font_stream pad block already patched or missing")
+    old_dest = (
+        "            let dest_cell = (self.cell_w * self.cell_h) as usize;\n"
+        "            let dest = &mut self.bitmap[gid as usize * dest_cell..(gid as usize + 1) * dest_cell];\n"
+        "            dest.fill(0);\n"
+        "            entry.ink_width = 0;\n"
+        "            for p in 0..cell {\n"
+        "                let alpha = ((b[at + 8 + p / 4] >> (6 - 2 * (p % 4))) & 3) * 85;\n"
+        "                dest[p / s.width * self.cell_w as usize + p % s.width] = alpha;\n"
+    )
+    new_dest = (
+        "            let dest_w = self.cell_w as usize * self.raster_density as usize;\n"
+        "            let dest_cell = dest_w * self.cell_h as usize * self.raster_density as usize;\n"
+        "            let dest = &mut self.bitmap[gid as usize * dest_cell..(gid as usize + 1) * dest_cell];\n"
+        "            dest.fill(0);\n"
+        "            entry.ink_width = 0;\n"
+        "            for p in 0..cell {\n"
+        "                let alpha = ((b[at + 8 + p / 4] >> (6 - 2 * (p % 4))) & 3) * 85;\n"
+        "                dest[p / s.width * dest_w + p % s.width] = alpha;\n"
+    )
+    if old_dest in t:
+        t = t.replace(old_dest, new_dest)
+        print("[build-vpk] patch: font_stream commit writes coverage")
+    fs.write_text(t)
+
+    fa = PKJ / "engine/core/src/font_archive.rs"
+    a = fa.read_text()
+    a2 = a.replace("                || s.density != 1\n", "                || (s.density != 1 && s.density != 2)\n")
+    if a2 != a:
+        print("[build-vpk] patch: PJFA reader allows density 2")
+        fa.write_text(a2)
+
+    spec = PKJ / "contracts/spec/font-archive.ts"
+    s = spec.read_text()
+    s2 = s.replace("      density !== 1 ||\n", "      (density !== 1 && density !== 2) ||\n")
+    if s2 != s:
+        print("[build-vpk] patch: decodeArchiveFace allows density 2")
+        spec.write_text(s2)
+
+    plat = PKJ / "contracts/spec/platforms.ts"
+    p = plat.read_text()
+    vita_cap = (
+        '      "input.analog.left",\n'
+        '      "input.buttons",\n'
+        '      "input.cursor",\n'
+        '      "input.touch",\n'
+        '      "text.glyphs.baked",\n'
+    )
+    vita_cap_new = (
+        '      "input.analog.left",\n'
+        '      "input.buttons",\n'
+        '      "input.cursor",\n'
+        '      "input.touch",\n'
+        '      "io.offload",\n'
+        '      "text.glyphs.baked",\n'
+        '      "text.glyphs.streamed",\n'
+    )
+    if vita_cap in p:
+        p = p.replace(vita_cap, vita_cap_new, 1)
+        plat.write_text(p)
+        print("[build-vpk] patch: vita profile advertises streamed CJK + io.offload")
+    elif "text.glyphs.streamed" in p.split("vita:")[1].split("pocketbook:")[0]:
+        print("[build-vpk] vita streamed CJK already advertised")
+    main = PKJ / "hosts/vita/src/main.rs"
+    m = main.read_text()
+    needle = "        if let Err(error) = runtime.frame_with_input(buttons, analog, &touches) {"
+    inject = (
+        "        pocketjs_vita::media::offload_local::frame();\n"
+        "        if let Err(error) = runtime.frame_with_input(buttons, analog, &touches) {"
+    )
+    if "offload_local::frame" not in m and needle in m:
+        m = m.replace(needle, inject, 1)
+        main.write_text(m)
+        print("[build-vpk] patch: main.rs offload_local::frame")
+
+
+def bake_cjk_archive():
+    """PJFA for STREAM mode. Cached at fonts/chinese/cjk.pjfa."""
+    out = PROJECT_ROOT / "fonts" / "chinese" / "cjk.pjfa"
+    chars = PROJECT_ROOT / "fonts" / "chinese" / "cjk-stream.txt"
+    script = PROJECT_ROOT / "scripts" / "bake-cjk-archive.ts"
+    if out.exists() and out.stat().st_size > 1024:
+        print(f"[build-vpk] using cached PJFA {out} ({out.stat().st_size} bytes)")
+        return out
+    if not script.exists() or not chars.exists():
+        print("[build-vpk] WARN: CJK archive script/charset missing, STREAM will fall back")
+        return None
+    run([BUN, str(script),
+         f"--font={theme_font()}",
+         f"--out={out}",
+         "--slots=0,7,8",
+         f"--chars={chars}",
+         "--density=2"], cwd=PROJECT_ROOT)
+    return out if out.exists() else None
 
 
 def patch_graphics_glyph():
@@ -479,7 +661,8 @@ def patch_graphics_glyph():
         print("[build-vpk] graphics.rs glyph inset already patched")
         return
     if old not in t:
-        raise SystemExit("[build-vpk] graphics.rs glyph-inset pattern not found")
+        print("[build-vpk] WARN: graphics.rs glyph-inset pattern not found (PocketJS v0.12.0 layout may have changed); skipping")
+        return
     f.write_text(t.replace(old, new, 1))
     print("[build-vpk] graphics.rs patched: inset glyph source rect")
 
@@ -603,6 +786,7 @@ def harvest_chars():
     renders every song title/artist the library currently uses.
     """
     out = set(chr(i) for i in range(32, 127))  # ASCII always
+    extra = set()
     # The app scans ux0:/data/yunyin/music at runtime (the real/media folder is
     # hidden by SceIo), so the baked atlas must be harvested from the SAME
     # location.  Fall back to the older data/music / ux0:/music layouts.
@@ -610,22 +794,24 @@ def harvest_chars():
         Path("/mnt/d/PSV/vita-game/ux0/data/yunyin/music"),
         Path("/mnt/d/PSV/vita-game/ux0/data/music"),
         Path("/mnt/d/PSV/vita-game/ux0/music"),
+        PROJECT_ROOT / "music",
     ):
         if not music_root.is_dir():
             continue
-        for f in music_root.iterdir():
+        for f in music_root.rglob("*"):
             if not f.is_file():
                 continue
             for c in f.name:
                 if not c.isspace():
-                    out.add(c)
+                    extra.add(c)
             for c in _id3_text_chars(f):
-                out.add(c)
+                extra.add(c)
     for c in "…♪♫♬★☆♥♡♠♣♦◆●◎○▲△▼▽→←↑↓·•—–「」『』【】（）《》〈〉＝，。％‰×□▢ ▶◀‖⇄↻≪≫‹›⟲⟳":
         out.add(c)
     # Bake every CJK ideograph that appears in the UI source, so hardcoded
     # Chinese labels (menus, hints, breadcrumbs) render instead of tofu.
     # ASCII + punctuation are already covered above; only Hanzi need this.
+    # These are reserved and never truncated by the 2400 cap.
     try:
         ui = (PROJECT_ROOT / "app" / "app.tsx").read_text(encoding="utf-8", errors="ignore")
         for c in ui:
@@ -633,10 +819,14 @@ def harvest_chars():
                 out.add(c)
     except Exception:
         pass
-    # Per-theme extended charset (e.g. a Japanese theme adds kana + kanji).
-    out |= _theme_chars()
-    harvest = "".join(sorted(out))
-    return harvest[:2400]
+    extra |= _theme_chars()
+    extra -= out
+    harvest_must = "".join(sorted(out))
+    harvest_extra = "".join(sorted(extra))
+    room = max(0, 2400 - len(harvest_must))
+    harvest = harvest_must + harvest_extra[:room]
+    print(f"[build-vpk] font={FONT_THEME} reserved={len(harvest_must)} extra={len(harvest_extra)} baked={len(harvest)}")
+    return harvest
 
 
 def _theme_chars():
@@ -767,11 +957,9 @@ def repack():
     # 用带权限的 authid 重新生成 eboot.bin。
     #
     # 框架默认用 vita-make-fself -s 生成"safe"eboot —— 那种 self 拿不到
-    # appmgr 的系统级接口（实测全是 0x8080201F：应用生命周期事件、按 TITLE_ID
-    # 查进程、带优先级的 BGM 端口申请都被拒）。官方 SDK 构建的应用（例如
-    # ElevenMPV-A）带的是更高权限的 authid，所以它们能收到 REQUEST_QUIT，
-    # 从而"用户关掉应用时停止播放"。vitasdk 的 vita-make-fself 支持同样的开关：
+    # 部分系统接口。vitasdk 的 vita-make-fself 支持：
     #   -a : Authid for more permissions (SceShell: 0x2800000000000001)
+    # 播放停播不靠 REQUEST_QUIT：声音在本进程 BGM 口，撕页杀进程即停。
     velf = (PKJ / "hosts/vita/target/armv7-sony-vita-newlibeabihf"
             / "release/pocketjs-vita.velf")
     if velf.exists():
@@ -780,6 +968,12 @@ def repack():
         print("[build-vpk] eboot regenerated with authid 0x2800000000000001")
     else:
         print(f"[build-vpk] WARN: velf not found ({velf}), kept default eboot")
+    pjfa = PROJECT_ROOT / "fonts" / "chinese" / "cjk.pjfa"
+    if pjfa.exists():
+        fonts_dir = staging / "fonts"
+        fonts_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(pjfa, fonts_dir / "cjk.pjfa")
+        print(f"[build-vpk] packed {pjfa.name} ({pjfa.stat().st_size} bytes) -> app0:/fonts/cjk.pjfa")
     out = PROJECT_ROOT / "dist" / f"{OUT}.vpk"
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for p in sorted(staging.rglob("*")):
@@ -794,6 +988,7 @@ if __name__ == "__main__":
     stage()
     patch_host()
     patch_graphics_glyph()
+    bake_cjk_archive()
     try:
         build_vpk()
         repack()
