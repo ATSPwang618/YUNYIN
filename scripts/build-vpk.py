@@ -535,6 +535,30 @@ def patch_streamed_cjk():
     if old_dest in t:
         t = t.replace(old_dest, new_dest)
         print("[build-vpk] patch: font_stream commit writes coverage")
+
+    # density=2 的坑：ink_width 必须是"逻辑像素"宽度。原始代码用
+    # `p % s.width`（位图列号）来量墨迹宽度，density=2 时 s.width 是逻辑宽的
+    # 两倍；而这个值会存进 texture_cell_w，texture_coverage_width() 又会再乘
+    # 一次 raster_density —— GPU 单元格于是变成两倍宽，流式字形采样落到点阵
+    # 外面，画出来就是"有字宽、没字墨"（生僻字变空占位）。
+    # 这里把列号先换算回逻辑列：logical_col = bitmap_col / density。
+    old_ink = (
+        "                if alpha != 0 {\n"
+        "                    entry.ink_width = entry.ink_width.max((p % s.width + 1) as u32);\n"
+        "                }\n"
+    )
+    new_ink = (
+        "                if alpha != 0 {\n"
+        "                    entry.ink_width = entry.ink_width.max(\n"
+        "                        ((p % s.width) / self.raster_density as usize + 1) as u32,\n"
+        "                    );\n"
+        "                }\n"
+    )
+    if old_ink in t:
+        t = t.replace(old_ink, new_ink, 1)
+        print("[build-vpk] patch: font_stream ink_width in logical px (density 2)")
+    else:
+        print("[build-vpk] font_stream ink_width patch already applied or missing")
     fs.write_text(t)
 
     fa = PKJ / "engine/core/src/font_archive.rs"
