@@ -50,6 +50,7 @@ type VitaMedia = {
   state?: () => string;
   cover?: (path: string) => number;
   tags?: (path: string) => string;
+  setPsLock?: (on: boolean) => void;
   store_get?: (key: string) => string;
   store_set?: (key: string, value: string) => void;
 };
@@ -2579,6 +2580,22 @@ export default function Music() {
   /* =======================================================
    * OPTIMIZED FRAME LOOP
    * ======================================================= */
+
+  /* =======================================================
+   * PS 键锁：播放期间按 PS 出不去
+   *
+   * 按 PS 会回 LiveArea 把应用切后台；而后台继续出声需要 Vita 宿主那套
+   * 后台音频支持（上游 PocketJS 没做，实测切后台就断）。所以换个思路：
+   * **播放中锁住 PS 键**，想离开应用必须先暂停 —— 暂停 / 停止 / 放完立刻解锁。
+   * ======================================================= */
+  createEffect(() => {
+    const on = playing();
+    try {
+      media()?.setPsLock?.(on);
+    } catch {
+      /* ignore */
+    }
+  });
 
   let frameCounter = 0;
   let lastFrameMs = 0;

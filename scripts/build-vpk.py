@@ -370,15 +370,18 @@ def patch_host():
     c = cargo.read_text()
     if "[build-dependencies]" not in c:
         c += "\n[build-dependencies]\ncc = \"1\"\n"
-    # Drop leftover shell / audiodec features from older YUNYIN host patches.
-    for stale in ('"SceShellSvc_stub", ', '"SceAudiodec_stub", '):
-        c = c.replace(stale, "")
-    if "ScePower_stub" not in c:
-        c = c.replace(
-            'features = ["SceAudio_stub"',
-            'features = ["ScePower_stub", "SceAppMgr_stub", "SceAudio_stub"',
-            1,
-        )
+    # Drop leftover audiodec feature from older YUNYIN host patches
+    # (SceShellSvc IS needed now: sceShellUtilLock/Unlock 用来锁 PS 键).
+    c = c.replace('"SceAudiodec_stub", ', "")
+    # 需要的 stub：ScePower（power tick）/ SceAppMgr（BGM 口）/ SceShellSvc（锁 PS 键）。
+    # 逐个补进 features 列表，重复构建也安全。
+    for needed in ("ScePower_stub", "SceAppMgr_stub", "SceShellSvc_stub"):
+        if f'"{needed}"' not in c:
+            c = c.replace(
+                'vitasdk-sys = { version = "0.3.3", features = [',
+                f'vitasdk-sys = {{ version = "0.3.3", features = ["{needed}", ',
+                1,
+            )
     cargo.write_text(c)
 
     build = PKJ / "hosts/vita/build.rs"

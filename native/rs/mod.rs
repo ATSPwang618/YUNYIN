@@ -15,6 +15,7 @@ mod font_gpu;
 mod log;
 pub mod offload_local;
 mod power;
+mod ps_lock;
 mod store;
 mod tags;
 

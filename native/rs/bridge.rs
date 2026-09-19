@@ -134,6 +134,21 @@ unsafe extern "C" fn js_log(
     JS_NewInt32(ctx, 0)
 }
 
+/// 播放期间锁 PS 键：`setPsLock(true)` 锁、`false` 解锁（见 ps_lock.rs）。
+unsafe extern "C" fn js_set_ps_lock(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    argc: i32,
+    argv: *mut JSValue,
+) -> JSValue {
+    let mut on: i32 = 0;
+    if argc > 0 {
+        unsafe { JS_ToInt32(ctx, &mut on, *argv) };
+    }
+    crate::media::ps_lock::set_locked(on != 0);
+    JS_UNDEFINED
+}
+
 unsafe extern "C" fn js_store_get(
     ctx: *mut JSContext,
     _this: JSValue,
@@ -186,6 +201,7 @@ pub unsafe fn install(ctx: *mut JSContext, global: JSValue) {
     add_fn(ctx, obj, b"cover\0", js_cover, 1);
     add_fn(ctx, obj, b"tags\0", js_tags, 1);
     add_fn(ctx, obj, b"logMsg\0", js_log, 1);
+    add_fn(ctx, obj, b"setPsLock\0", js_set_ps_lock, 1);
     add_fn(ctx, obj, b"store_get\0", js_store_get, 1);
     add_fn(ctx, obj, b"store_set\0", js_store_set, 2);
     JS_SetPropertyStr(ctx, global, c"vitaMedia".as_ptr(), obj);
