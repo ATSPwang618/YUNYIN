@@ -17,7 +17,7 @@
 
 |  |  |
 | --- | --- |
-| 当前版本 | **0.61** —— [下载 / 历史版本](https://github.com/ATSPwang618/YUNYIN/releases) |
+| 当前版本 | **0.62** —— [下载 / 历史版本](https://github.com/ATSPwang618/YUNYIN/releases) |
 | 曲库目录 | `ux0:/data/yunyin/music`（可以分子文件夹，最多 240 首） |
 | 音频格式 | MP3（最推荐） / OGG / WAV / FLAC / OPUS |
 | 界面 | 首页播放器 · 全部曲目 · 专辑 · 收藏 · 设置 |
@@ -138,7 +138,7 @@ wsl -d pocket-ubuntu -u root bash -lc 'cd /mnt/d/AI-PSVITA/yunyin && python3 scr
 wsl -d pocket-ubuntu -u root bash /mnt/d/AI-PSVITA/yunyin/scripts/build-variants.sh
 ```
 
-- 版本号（`param.sfo` 里的 `APP_VER`，VitaShell 里能看到）在 `scripts/build-vpk.py` 顶部，默认 `00.61`；
+- 版本号（`param.sfo` 里的 `APP_VER`，VitaShell 里能看到）在 `scripts/build-vpk.py` 顶部，默认 `00.62`；
   也可以用环境变量 `YUNYIN_APP_VER=00.62` 覆盖。
 - PocketJS 装在别的地方：`POCKETJS_ROOT=/你的路径 python3 scripts/build-vpk.py`。
 - 流式字库 `fonts/chinese/cjk.pjfa` 由 `scripts/bake-cjk-archive.ts` 烘出来，构建时会直接用缓存；

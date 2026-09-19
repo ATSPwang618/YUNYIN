@@ -46,7 +46,7 @@ APP_ID = "yunyin-main"                         # pocket.json -> app.output（框
 OUT = os.environ.get("YUNYIN_OUT", APP_ID)
 APP_TITLE = "云音"                             # param.sfo TITLE（LiveArea 气泡下方显示名）
 # param.sfo 里的 APP_VER（VitaShell 里看到的版本号），发布新版本时改这里
-APP_VER = os.environ.get("YUNYIN_APP_VER", "00.61")
+APP_VER = os.environ.get("YUNYIN_APP_VER", "00.62")
 TITLE_ID = os.environ.get("YUNYIN_TITLE_ID", "")  # 留空 = 用 app/catalog.ts 的 TITLE_ID / PF2A47F97
 THEME = os.environ.get("YUNYIN_THEME", "dark")  # 皮肤主题：light / dark / pure / anime
 # 默认 Noto Sans SC。日文曲库才切 MSMINCHO：YUNYIN_FONT=japanese

@@ -446,8 +446,8 @@ const tBrand = () => PALETTES[uiTheme()].brand;
 const PANEL_TXT = THEME_COLORS.ui as Record<UiSkin, Record<string, string>>;
 const pTxt = (key: string) => PANEL_TXT[uiTheme()][key] ?? "";
 
-/* 软件版本：About 页展示，和 param.sfo APP_VER 00.61 对齐。 */
-const APP_VERSION = "0.61";
+/* 软件版本：About 页展示，和 param.sfo APP_VER 00.62 对齐。 */
+const APP_VERSION = "0.62";
 const POCKETJS_VERSION = "0.12.0";
 
 type CjkMode = "baked" | "stream";
@@ -3545,11 +3545,11 @@ function AboutPage() {
       <View class="relative flex-col w-96 h-48 p-3 gap-1">
         <View class="flex-row items-center justify-between h-7">
           <Text class={pTxt("aboutTitle")}>ABOUT US</Text>
-          <Text class={pTxt("aboutSub")}>云音 YUNYIN</Text>
+          <Text class={pTxt("aboutSub")}>YUNYIN</Text>
         </View>
         <View class="grow flex-col items-center justify-center gap-1">
           <Text class={pTxt("aboutTitle")}>YUNYIN 云音 for vita</Text>
-          <Text class={pTxt("aboutSub")}>VER {APP_VERSION}  ·  APP 00.61  ·  PJ {POCKETJS_VERSION}</Text>
+          <Text class={pTxt("aboutSub")}>VER {APP_VERSION}  ·  APP 00.62  ·  PJ {POCKETJS_VERSION}</Text>
           <Text class={pTxt("aboutSub")}>made by 阡陌</Text>
           <Text class={cjkMode() === "stream" ? pTxt("aboutTitle") : pTxt("aboutSub")}>
             {cjkLabel()}
