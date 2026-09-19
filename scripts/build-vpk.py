@@ -764,6 +764,140 @@ def patch_graphics_glyph():
     print("[build-vpk] graphics.rs patched: inset glyph source rect")
 
 
+# 流式 CJK 提交后刷新 GPU 图集用的宿主函数（追加到 graphics.rs 末尾）。
+REFRESH_FONT_ATLAS_FN = r"""
+/// 流式字形（CJK STREAM）提交后：把 gid >= baked 的格子就地写进已有纹理。
+///
+/// 上游 PocketJS 0.12.0 只在 PSP / WASM 上实现 streamed glyphs
+/// （docs/DYNAMIC_TEXT.md：other native hosts need these operations before they
+/// can advertise streamed glyph support），Vita 宿主缺的正是这一步：画字形时
+/// `gid >= font.glyph_count` 会被直接跳过，而 glyph_count 只在加载 baked 图集
+/// 时写过 —— 于是流式字形有字宽、没字墨（生僻字显示成空占位）。
+///
+/// 这里只重写流式那一段格子（baked 部分加载后不再变），不重建纹理
+/// （Vita3K 的 GXM 模拟反复销毁纹理容易出问题）。
+/// 返回 false = 纹理不存在或几何对不上，调用方应改用 register_font_atlas()。
+pub fn refresh_font_atlas(slot: u8, atlas: &Atlas) -> bool {
+    let coverage_w = atlas.coverage_width();
+    let coverage_h = atlas.coverage_height();
+    unsafe {
+        let Some(font) = fonts().get(&slot) else {
+            return false;
+        };
+        if font.glyph_count != atlas.glyph_count
+            || font.coverage_w != coverage_w
+            || font.coverage_h != coverage_h
+            || font.cols == 0
+        {
+            return false;
+        }
+        let from = font.baked.min(font.glyph_count);
+        let stride = vita2d_texture_get_stride(font.texture.ptr) as usize;
+        let dst = vita2d_texture_get_datap(font.texture.ptr) as *mut u8;
+        if dst.is_null() {
+            return false;
+        }
+        for gid in from..atlas.glyph_count {
+            let gx = (gid as u32 % font.cols) * coverage_w;
+            let gy = (gid as u32 / font.cols) * coverage_h;
+            let rows = atlas.glyph_rows(gid);
+            for y in 0..coverage_h as usize {
+                let src = rows.as_ptr().add(y * atlas.bytes_per_row());
+                for x in 0..coverage_w as usize {
+                    let out = dst.add((gy as usize + y) * stride + (gx as usize + x) * 4);
+                    *out = 255;
+                    *out.add(1) = 255;
+                    *out.add(2) = 255;
+                    *out.add(3) = *src.add(x);
+                }
+            }
+        }
+        true
+    }
+}
+"""
+
+
+def patch_font_gpu():
+    """CJK STREAM：让 Vita 宿主在流式字形提交后刷新 GPU 图集。
+
+    上游 v0.12.0 只在 PSP / WASM 上实现了 streamed glyphs（见
+    docs/DYNAMIC_TEXT.md 与 contracts/spec/platforms.ts：vita 的能力表里
+    只有 text.glyphs.baked）。Vita 宿主少了"提交后刷新纹理"这一步，画字形时
+    `gid >= font.glyph_count` 被跳过 → 流式字形有字宽没字墨（空占位）。
+    """
+    f = PKJ / "hosts/vita/src/graphics.rs"
+    t = f.read_text()
+
+    old_struct = (
+        "#[derive(Clone, Copy)]\n"
+        "struct FontTexture {\n"
+        "    texture: Texture,\n"
+        "    glyph_count: u16,\n"
+    )
+    new_struct = (
+        "#[derive(Clone, Copy)]\n"
+        "struct FontTexture {\n"
+        "    texture: Texture,\n"
+        "    glyph_count: u16,\n"
+        "    /// 第一次注册（baked 图集）时的字形数：gid >= baked 的都是流式字形。\n"
+        "    baked: u16,\n"
+    )
+    # 注意：先判"已打过"。打过补丁后，old_struct 仍然是新文本的前缀，
+    # 反过来判会重复插入一个 baked 字段（E0124）。
+    if "gid >= baked" in t:
+        print("[build-vpk] FontTexture.baked already patched")
+    elif old_struct in t:
+        t = t.replace(old_struct, new_struct, 1)
+        print("[build-vpk] patch: FontTexture.baked")
+    else:
+        raise SystemExit("[build-vpk] graphics.rs FontTexture anchor not found")
+
+    old_lit = (
+        "        let font = FontTexture {\n"
+        "            texture,\n"
+        "            glyph_count: atlas.glyph_count,\n"
+        "            coverage_w,\n"
+    )
+    new_lit = (
+        "        let baked = fonts()\n"
+        "            .get(&slot)\n"
+        "            .map_or(atlas.glyph_count, |old| old.baked.min(old.glyph_count));\n"
+        "        let font = FontTexture {\n"
+        "            texture,\n"
+        "            glyph_count: atlas.glyph_count,\n"
+        "            baked,\n"
+        "            coverage_w,\n"
+    )
+    if "let baked = fonts()" in t:
+        print("[build-vpk] register_font_atlas baked already patched")
+    elif old_lit in t:
+        t = t.replace(old_lit, new_lit, 1)
+        print("[build-vpk] patch: register_font_atlas keeps baked count")
+    else:
+        raise SystemExit("[build-vpk] register_font_atlas anchor not found")
+
+    if "fn refresh_font_atlas(" not in t:
+        t = t.rstrip() + "\n" + REFRESH_FONT_ATLAS_FN
+        print("[build-vpk] patch: graphics refresh_font_atlas()")
+    f.write_text(t)
+
+    m = PKJ / "hosts/vita/src/main.rs"
+    s = m.read_text()
+    if "refresh_font_atlases()" not in s:
+        old_tick = "        runtime.tick();\n"
+        new_tick = (
+            "        runtime.tick();\n"
+            "        pocketjs_vita::media::refresh_font_atlases();\n"
+        )
+        if old_tick not in s:
+            raise SystemExit("[build-vpk] main.rs runtime.tick anchor not found")
+        m.write_text(s.replace(old_tick, new_tick, 1))
+        print("[build-vpk] patch: main.rs refresh_font_atlases()")
+    else:
+        print("[build-vpk] main.rs refresh_font_atlases already patched")
+
+
 def app_const(name):
     src = PKJ / "apps" / APP_NAME / "catalog.ts"
     if not src.exists():
@@ -1085,6 +1219,7 @@ if __name__ == "__main__":
     stage()
     patch_host()
     patch_graphics_glyph()
+    patch_font_gpu()
     bake_cjk_archive()
     try:
         build_vpk()
@@ -1114,6 +1249,7 @@ if __name__ == "__main__":
             stage()
             patch_host()
             patch_graphics_glyph()
+            patch_font_gpu()
             try:
                 build_vpk()
                 repack()

@@ -11,11 +11,14 @@ mod bridge;
 mod cjk_host;
 mod decoder;
 mod fs;
+mod font_gpu;
 mod log;
 pub mod offload_local;
 mod power;
 mod store;
 mod tags;
+
+pub use font_gpu::refresh_font_atlases;
 
 pub(crate) const COVER_PX: u32 = 256;
 pub(crate) const MAX_ART: usize = 1024 * 1024;
