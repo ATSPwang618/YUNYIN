@@ -463,6 +463,47 @@ const [cjkStatus, setCjkStatus] = createSignal<"off" | "opening" | "ready" | "er
 const [cjkEpoch, setCjkEpoch] = createSignal(0);
 let cjkFont: ReturnType<typeof openFontArchive> | undefined;
 
+/* STREAM 模式的诊断日志（只有卡里有 ux0:/data/yunyin/debug 时才真的写）。
+ * host 里：resident = 常驻字形数，inked = 其中真的有墨的个数
+ * （inked 一直是 0 就说明字库读出来的点阵是空的），pending = 还在等的请求，
+ * rejected = 没空位被拒，unsupported = 字库里确实没有这个字；
+ * js 里：loaded = JS 侧累计提交成功的字数，requests = 还在飞的请求数。 */
+const logCjkStats = (): void => {
+  try {
+    const g = globalThis as unknown as {
+      ui?: { fontStreamStats?: () => string; fontStreamRequests?: () => string };
+    };
+    const host = g.ui?.fontStreamStats?.() ?? "n/a";
+    let want = "?";
+    try {
+      const reqs = JSON.parse(g.ui?.fontStreamRequests?.() ?? "[]") as number[][];
+      want =
+        String(reqs.length) +
+        ":" +
+        reqs
+          .slice(0, 6)
+          .map((r) => "U+" + Number(r[2]).toString(16).toUpperCase())
+          .join(",");
+    } catch {
+      /* ignore */
+    }
+    const st = cjkFont?.status() as
+      | { state?: string; requests?: number; loaded?: number; error?: string }
+      | undefined;
+    logMsg(
+      "cjk: mode=" + cjkMode() + " status=" + cjkStatus() + " host=" + host +
+        " js={state:" + (st?.state ?? "-") +
+        ",req:" + String(st?.requests ?? "-") +
+        ",loaded:" + String(st?.loaded ?? "-") +
+        ",err:" + (st?.error ?? "") + "} want=" + want,
+    );
+  } catch {
+    /* ignore */
+  }
+};
+
+let cjkDbgFrames = 0;
+
 const streamHostReady = (): boolean => {
   try {
     const g = globalThis as unknown as {
@@ -518,6 +559,7 @@ const applyCjkMode = (next: CjkMode): void => {
         if (st === "ready") setCjkStatus("ready");
         else if (st === "error") setCjkStatus("error");
         else if (st === "warming" || st === "opening") setCjkStatus("opening");
+        logCjkStats();
       },
     });
     setCjkEpoch((n) => n + 1);
@@ -2543,6 +2585,9 @@ export default function Music() {
 
   onFrame(() => {
     audioEngine.pump();
+
+    /* STREAM 诊断：约每秒把流式字库的状态写一行到日志（日志默认关）。 */
+    if (cjkMode() === "stream" && ++cjkDbgFrames % 60 === 0) logCjkStats();
 
     /* 息屏中又被切到后台（PS → LiveArea）再回来，帧循环会空一大段；
      * 这时自动亮屏，免得回来面对一片黑还以为卡死了。 */

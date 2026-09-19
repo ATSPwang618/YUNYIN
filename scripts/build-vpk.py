@@ -559,6 +559,79 @@ def patch_streamed_cjk():
         print("[build-vpk] patch: font_stream ink_width in logical px (density 2)")
     else:
         print("[build-vpk] font_stream ink_width patch already applied or missing")
+
+    # 诊断用：font_stream_stats() 除了原有的 resident/pending/rejected…，再多报
+    #   inked      常驻字形里"真的有墨"的个数（0 = 字库读出来的点阵是空的）
+    #   cellW/H、texCellW、density、base、capacity  图集几何
+    # 只读计数，不改变任何绘制行为；正式版日志默认关，只有卡里有 debug 文件时才写。
+    old_stats = (
+        "        let (mut resident, mut bytes, mut pending, mut evictions, mut rejected, mut absent) =\n"
+        "            (0, 0, 0, 0, 0, 0);\n"
+        "        for slot in 0..crate::spec::MAX_FONT_SLOTS {\n"
+        "            if let Some(a) = self.fonts.atlas(slot as u8) {\n"
+        "                if let Some(s) = &a.stream {\n"
+        "                    resident += s.entries.iter().filter(|e| e.cp != u32::MAX).count();\n"
+        "                    bytes += a.stream_bytes();\n"
+        "                    pending += s\n"
+        "                        .wanted\n"
+        "                        .iter()\n"
+        "                        .filter(|cp| a.lookup(**cp).is_none() && !s.absent.contains(cp))\n"
+        "                        .count();\n"
+        "                    evictions += s.evictions;\n"
+        "                    rejected += s.rejected;\n"
+        "                    absent += s.absent.len();\n"
+        "                }\n"
+        "            }\n"
+        "        }\n"
+        "        format!(\"{{\\\"resident\\\":{},\\\"bytes\\\":{},\\\"pending\\\":{},\\\"evictions\\\":{},\\\"rejected\\\":{},\\\"unsupported\\\":{}}}\",resident,bytes,pending,evictions,rejected,absent)\n"
+    )
+    new_stats = (
+        "        let (mut resident, mut bytes, mut pending, mut evictions, mut rejected, mut absent, mut inked) =\n"
+        "            (0, 0, 0, 0, 0, 0, 0);\n"
+        "        let (mut cell_w, mut cell_h, mut tex_cell_w, mut density, mut base, mut capacity) =\n"
+        "            (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);\n"
+        "        for slot in 0..crate::spec::MAX_FONT_SLOTS {\n"
+        "            if let Some(a) = self.fonts.atlas(slot as u8) {\n"
+        "                if let Some(s) = &a.stream {\n"
+        "                    let d = a.raster_density as usize;\n"
+        "                    let cell = (a.cell_w as usize * d) * (a.cell_h as usize * d);\n"
+        "                    if cell > 0 {\n"
+        "                        for (i, e) in s.entries.iter().enumerate() {\n"
+        "                            if e.cp == u32::MAX {\n"
+        "                                continue;\n"
+        "                            }\n"
+        "                            let from = (s.base as usize + i) * cell;\n"
+        "                            if a.bitmap.get(from..from + cell).map_or(false, |c| c.iter().any(|v| *v != 0)) {\n"
+        "                                inked += 1;\n"
+        "                            }\n"
+        "                        }\n"
+        "                    }\n"
+        "                    resident += s.entries.iter().filter(|e| e.cp != u32::MAX).count();\n"
+        "                    bytes += a.stream_bytes();\n"
+        "                    pending += s\n"
+        "                        .wanted\n"
+        "                        .iter()\n"
+        "                        .filter(|cp| a.lookup(**cp).is_none() && !s.absent.contains(cp))\n"
+        "                        .count();\n"
+        "                    evictions += s.evictions;\n"
+        "                    rejected += s.rejected;\n"
+        "                    absent += s.absent.len();\n"
+        "                    cell_w = a.cell_w;\n"
+        "                    cell_h = a.cell_h;\n"
+        "                    tex_cell_w = a.texture_cell_w;\n"
+        "                    density = a.raster_density as u32;\n"
+        "                    base = s.base as u32;\n"
+        "                    capacity = s.entries.len() as u32;\n"
+        "                }\n"
+        "            }\n"
+        "        }\n"
+        "        format!(\"{{\\\"resident\\\":{},\\\"bytes\\\":{},\\\"pending\\\":{},\\\"evictions\\\":{},\\\"rejected\\\":{},\\\"unsupported\\\":{},\\\"inked\\\":{},\\\"cellW\\\":{},\\\"cellH\\\":{},\\\"texCellW\\\":{},\\\"density\\\":{},\\\"base\\\":{},\\\"capacity\\\":{}}}\",resident,bytes,pending,evictions,rejected,absent,inked,cell_w,cell_h,tex_cell_w,density,base,capacity)\n"
+    )
+    if old_stats in t:
+        t = t.replace(old_stats, new_stats, 1)
+        print("[build-vpk] patch: font_stream_stats(+inked, +geometry)")
+    else:
+        print("[build-vpk] font_stream_stats patch already applied or missing")
     fs.write_text(t)
 
     fa = PKJ / "engine/core/src/font_archive.rs"
