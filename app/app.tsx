@@ -50,7 +50,7 @@ type VitaMedia = {
   state?: () => string;
   cover?: (path: string) => number;
   tags?: (path: string) => string;
-  setPsLock?: (on: boolean) => void;
+  setPsLock?: (on: boolean) => number;
   store_get?: (key: string) => string;
   store_set?: (key: string, value: string) => void;
 };
@@ -463,6 +463,8 @@ const [cjkMode, setCjkMode] = createSignal<CjkMode>(
 const [cjkStatus, setCjkStatus] = createSignal<"off" | "opening" | "ready" | "error">("off");
 const [cjkEpoch, setCjkEpoch] = createSignal(0);
 let cjkFont: ReturnType<typeof openFontArchive> | undefined;
+/* PS 键锁状态（显示在 About 页）：LOCKED / UNLOCKED / FAIL 0x… */
+const [psLockInfo, setPsLockInfo] = createSignal("PS KEY  UNLOCKED");
 
 /* STREAM 模式的诊断日志（只有卡里有 ux0:/data/yunyin/debug 时才真的写）。
  * host 里：resident = 常驻字形数，inked = 其中真的有墨的个数
@@ -2590,11 +2592,21 @@ export default function Music() {
    * ======================================================= */
   createEffect(() => {
     const on = playing();
+    let ret = 0;
     try {
-      media()?.setPsLock?.(on);
+      ret = media()?.setPsLock?.(on) ?? 0;
     } catch {
-      /* ignore */
+      ret = -1;
     }
+    /* 0 = 系统调用成功；非 0 会显示在 About 页上，方便确认锁到底有没有生效。 */
+    setPsLockInfo(
+      on
+        ? ret === 0
+          ? "PS KEY  LOCKED"
+          : "PS KEY  FAIL 0x" + (ret >>> 0).toString(16).toUpperCase()
+        : "PS KEY  UNLOCKED",
+    );
+    logMsg("ps lock: request=" + String(on) + " ret=" + String(ret));
   });
 
   let frameCounter = 0;
@@ -3542,6 +3554,7 @@ function AboutPage() {
           <Text class={cjkMode() === "stream" ? pTxt("aboutTitle") : pTxt("aboutSub")}>
             {cjkLabel()}
           </Text>
+          <Text class={pTxt("aboutSub")}>{psLockInfo()}</Text>
         </View>
         <View class="flex-row items-center justify-center h-5">
           <Text class={pTxt("aboutSub")}>○ CJK  △ BACK 返回</Text>

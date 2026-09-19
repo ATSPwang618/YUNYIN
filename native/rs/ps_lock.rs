@@ -9,7 +9,7 @@
 //! `sceShellUtilLock(SCE_SHELL_UTIL_LOCK_TYPE_PS_BTN)`。
 
 use alloc::format;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::media::log;
 
@@ -17,16 +17,28 @@ use crate::media::log;
 const LOCK_PS_BTN: i32 = 0x1;
 
 static LOCKED: AtomicBool = AtomicBool::new(false);
+/// 最近一次系统调用的返回值（0 = 成功），供 JS 显示/记录。
+static LAST_RET: AtomicI32 = AtomicI32::new(0);
 
 extern "C" {
+    /// SceShellUtil 的事件系统：**调 Lock/Unlock 之前必须先初始化**，
+    /// 否则这些接口会直接报错（0.5 时代踩过）。
+    fn sceShellUtilInitEvents(unk: i32) -> i32;
     fn sceShellUtilLock(kind: i32) -> i32;
     fn sceShellUtilUnlock(kind: i32) -> i32;
 }
 
+/// 启动时调一次（在 register 里）。
+pub fn init() {
+    let ret = unsafe { sceShellUtilInitEvents(0) };
+    log::append(&format!("shell util events init -> 0x{:08X}", ret as u32));
+}
+
 /// 播放状态变化时调用：true = 锁 PS 键，false = 解锁。同一个状态重复调用是空操作。
-pub fn set_locked(on: bool) {
+/// 返回最近一次系统调用的结果（0 = 成功）。
+pub fn set_locked(on: bool) -> i32 {
     if LOCKED.swap(on, Ordering::AcqRel) == on {
-        return;
+        return LAST_RET.load(Ordering::Acquire);
     }
     let ret = unsafe {
         if on {
@@ -35,5 +47,7 @@ pub fn set_locked(on: bool) {
             sceShellUtilUnlock(LOCK_PS_BTN)
         }
     };
+    LAST_RET.store(ret, Ordering::Release);
     log::append(&format!("ps btn lock: {} -> 0x{:08X}", on as i32, ret as u32));
+    ret
 }

@@ -48,6 +48,7 @@ pub(crate) fn json_escape(s: &str) -> String {
 pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_sys::JSValue) {
     log::init();
     log::append("yunyin: start (in-process BGM)");
+    ps_lock::init();
     bgm::acquire_on_start();
     power::start();
     bridge::install(ctx, global);

@@ -145,8 +145,8 @@ unsafe extern "C" fn js_set_ps_lock(
     if argc > 0 {
         unsafe { JS_ToInt32(ctx, &mut on, *argv) };
     }
-    crate::media::ps_lock::set_locked(on != 0);
-    JS_UNDEFINED
+    let ret = crate::media::ps_lock::set_locked(on != 0);
+    JS_NewInt32(ctx, ret)
 }
 
 unsafe extern "C" fn js_store_get(
