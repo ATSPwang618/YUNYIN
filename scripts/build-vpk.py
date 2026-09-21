@@ -777,10 +777,10 @@ REFRESH_FONT_ATLAS_FN = r"""
 /// `gid >= font.glyph_count` 会被直接跳过，而 glyph_count 只在加载 baked 图集
 /// 时写过 —— 于是流式字形有字宽、没字墨（生僻字显示成空占位）。
 ///
-/// 这里只重写流式那一段格子（baked 部分加载后不再变），不重建纹理
-/// （Vita3K 的 GXM 模拟反复销毁纹理容易出问题）。
+/// 这里只重写**这次真正变化**的那几个字形格子（dirty 由宿主给出），不重建纹理
+/// （Vita3K 的 GXM 模拟反复销毁纹理容易出问题），写之前等上一帧 GPU 画完。
 /// 返回 false = 纹理不存在或几何对不上，调用方应改用 register_font_atlas()。
-pub fn refresh_font_atlas(slot: u8, atlas: &Atlas) -> bool {
+pub fn refresh_font_atlas(slot: u8, atlas: &Atlas, dirty: i64) -> bool {
     let coverage_w = atlas.coverage_width();
     let coverage_h = atlas.coverage_height();
     unsafe {
@@ -794,13 +794,30 @@ pub fn refresh_font_atlas(slot: u8, atlas: &Atlas) -> bool {
         {
             return false;
         }
-        let from = font.baked.min(font.glyph_count);
+        /* 只上传变化的字形：dirty 是宿主给的 entry 下标闭区间（(lo<<16)|hi），
+         * -1 表示"没有增量信息"（刚申请容量）→ 退回整个流式区域。 */
+        let (from, to) = if dirty >= 0 {
+            let lo = (dirty >> 16) as u16;
+            let hi = (dirty & 0xffff) as u16;
+            (
+                font.baked.saturating_add(lo),
+                font.baked.saturating_add(hi),
+            )
+        } else {
+            (font.baked, font.glyph_count.saturating_sub(1))
+        };
+        if from >= font.glyph_count || to < from {
+            return true;
+        }
+        let to = to.min(font.glyph_count - 1);
+        /* 等上一帧 GPU 画完再改纹理内存：这些格子可能还在被采样。 */
+        vita2d_wait_rendering_done();
         let stride = vita2d_texture_get_stride(font.texture.ptr) as usize;
         let dst = vita2d_texture_get_datap(font.texture.ptr) as *mut u8;
         if dst.is_null() {
             return false;
         }
-        for gid in from..atlas.glyph_count {
+        for gid in from..=to {
             let gx = (gid as u32 % font.cols) * coverage_w;
             let gy = (gid as u32 / font.cols) * coverage_h;
             let rows = atlas.glyph_rows(gid);
@@ -880,7 +897,13 @@ def patch_font_gpu():
     else:
         raise SystemExit("[build-vpk] register_font_atlas anchor not found")
 
-    if "fn refresh_font_atlas(" not in t:
+    # 这段函数是追加在文件末尾的；已存在就整段换成新版（签名/内容会随版本变），
+    # 否则旧版函数会和调用方对不上（参数个数不同）。
+    marker = "/// 流式字形（CJK STREAM）提交后：把 gid >= baked 的格子就地写进已有纹理。"
+    if marker in t:
+        t = t[: t.index(marker)] + REFRESH_FONT_ATLAS_FN.lstrip("\n")
+        print("[build-vpk] patch: graphics refresh_font_atlas() refreshed")
+    else:
         t = t.rstrip() + "\n" + REFRESH_FONT_ATLAS_FN
         print("[build-vpk] patch: graphics refresh_font_atlas()")
     f.write_text(t)
@@ -899,6 +922,116 @@ def patch_font_gpu():
         print("[build-vpk] patch: main.rs refresh_font_atlases()")
     else:
         print("[build-vpk] main.rs refresh_font_atlases already patched")
+
+
+def patch_font_dirty():
+    """让 core 记录"这次到底写了哪几个流式字形"，宿主才能只上传那几个格子。
+
+    上游的 Stream 只 bump 一个整体 revision，宿主只能整片重传。这里加一对
+    dirty_lo/dirty_hi（entry 下标区间），提交时顺手标一下；再由 Ui 暴露
+    take_font_stream_dirty(slot) 取走并清空（查询即清除，天然合并同一帧的多次提交）。
+    """
+    fs = PKJ / "engine/core/src/font_stream.rs"
+    t = fs.read_text()
+
+    old_struct = (
+        "    evictions: u64,\n"
+        "    rejected: u64,\n"
+        "}\n"
+    )
+    new_struct = (
+        "    evictions: u64,\n"
+        "    rejected: u64,\n"
+        "    /// 上次被宿主取走的、发生变化的最小/最大 entry 下标。\n"
+        "    pub(crate) dirty_lo: Cell<usize>,\n"
+        "    pub(crate) dirty_hi: Cell<usize>,\n"
+        "}\n"
+    )
+    if "dirty_lo: Cell<usize>" in t:
+        print("[build-vpk] font_stream dirty range already patched")
+    elif old_struct in t:
+        t = t.replace(old_struct, new_struct, 1)
+        print("[build-vpk] patch: Stream dirty_lo/dirty_hi")
+    else:
+        raise SystemExit("[build-vpk] font_stream Stream struct anchor not found")
+
+    old_init = (
+        "            advance: b[13],\n"
+        "            evictions: 0,\n"
+        "            rejected: 0,\n"
+        "        });\n"
+    )
+    new_init = (
+        "            advance: b[13],\n"
+        "            evictions: 0,\n"
+        "            rejected: 0,\n"
+        "            dirty_lo: Cell::new(usize::MAX),\n"
+        "            dirty_hi: Cell::new(0),\n"
+        "        });\n"
+    )
+    if old_init in t:
+        t = t.replace(old_init, new_init, 1)
+        print("[build-vpk] patch: Stream dirty range init")
+
+    old_mark = (
+        "            );\n"
+        "            changed += 1;\n"
+        "        }\n"
+    )
+    new_mark = (
+        "            );\n"
+        "            /* 记下这次真正写了哪个字形：宿主只上传这一段。 */\n"
+        "            if index < s.dirty_lo.get() {\n"
+        "                s.dirty_lo.set(index);\n"
+        "            }\n"
+        "            if index > s.dirty_hi.get() {\n"
+        "                s.dirty_hi.set(index);\n"
+        "            }\n"
+        "            changed += 1;\n"
+        "        }\n"
+    )
+    if "s.dirty_lo.set(index)" in t:
+        print("[build-vpk] font_stream commit dirty mark already patched")
+    elif old_mark in t:
+        t = t.replace(old_mark, new_mark, 1)
+        print("[build-vpk] patch: Stream commit marks dirty range")
+    else:
+        raise SystemExit("[build-vpk] font_stream commit anchor not found")
+    fs.write_text(t)
+
+    lib = PKJ / "engine/core/src/lib.rs"
+    l = lib.read_text()
+    old_getter = (
+        "    pub fn font_atlas_revision(&self, slot: u8) -> u64 {\n"
+        "        self.font_revisions.get(slot as usize).copied().unwrap_or(0)\n"
+        "    }\n"
+    )
+    new_getter = old_getter + (
+        "\n"
+        "    /// 取走某个槽自上次调用以来变化的流式字形下标范围（entry 下标，闭区间，\n"
+        "    /// 返回值 (lo << 16) | hi）。没有变化返回 -1；查询即清除。\n"
+        "    pub fn take_font_stream_dirty(&mut self, slot: u8) -> i64 {\n"
+        "        let Some(atlas) = self.fonts.atlas_mut(slot) else {\n"
+        "            return -1;\n"
+        "        };\n"
+        "        let Some(stream) = atlas.stream.as_mut() else {\n"
+        "            return -1;\n"
+        "        };\n"
+        "        let lo = stream.dirty_lo.replace(usize::MAX);\n"
+        "        let hi = stream.dirty_hi.replace(0);\n"
+        "        if lo == usize::MAX || hi < lo {\n"
+        "            return -1;\n"
+        "        }\n"
+        "        ((lo as i64) << 16) | (hi as i64)\n"
+        "    }\n"
+    )
+    if "take_font_stream_dirty" in l:
+        print("[build-vpk] Ui::take_font_stream_dirty already patched")
+    elif old_getter in l:
+        lib.write_text(l.replace(old_getter, new_getter, 1))
+        print("[build-vpk] patch: Ui::take_font_stream_dirty")
+    else:
+        raise SystemExit("[build-vpk] lib.rs font_atlas_revision anchor not found")
 
 
 def app_const(name):
@@ -1223,6 +1356,7 @@ if __name__ == "__main__":
     patch_host()
     patch_graphics_glyph()
     patch_font_gpu()
+    patch_font_dirty()
     bake_cjk_archive()
     try:
         build_vpk()
@@ -1253,6 +1387,7 @@ if __name__ == "__main__":
             patch_host()
             patch_graphics_glyph()
             patch_font_gpu()
+            patch_font_dirty()
             try:
                 build_vpk()
                 repack()

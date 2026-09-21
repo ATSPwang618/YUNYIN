@@ -51,6 +51,7 @@ type VitaMedia = {
   cover?: (path: string) => number;
   tags?: (path: string) => string;
   setPsLock?: (on: boolean) => number;
+  logEnabled?: () => number;
   store_get?: (key: string) => string;
   store_set?: (key: string, value: string) => void;
 };
@@ -509,6 +510,15 @@ const logCjkStats = (): void => {
 
 let cjkDbgFrames = 0;
 
+/* 日志没开（正式版默认）时，连诊断数据的采集都省掉。 */
+const logEnabled = (): boolean => {
+  try {
+    return !!media()?.logEnabled?.();
+  } catch {
+    return false;
+  }
+};
+
 const streamHostReady = (): boolean => {
   try {
     const g = globalThis as unknown as {
@@ -584,28 +594,52 @@ const applyCjkMode = (next: CjkMode): void => {
   }
 };
 
+/* 流式文字：把一段文字交给 cjk.pjfa 按需补字形。
+ *
+ * - **只有「文字 + 字号槽」变了才重新申请字形资源**：光标移动 / 选中高亮只会
+ *   换颜色类名（槽位、文字都没变），这时复用手里的资源，不再走一遍请求→提交；
+ * - 字形还在取的时候，先按同样的布局画一段**透明**文字占位（占住行高，
+ *   不闪 口 也不跳版），等齐了整体换上去；
+ * - 真的取不到（字库没有这个字 / 出错）才退回**可见**的烘焙文字 —— 那时看到
+ *   的 口 就是字库确实缺字，不是没加载完。 */
 function StreamText(props: { class: string; text: string }) {
   const [res, setRes] = createSignal<TextResource | undefined>();
+  let key = "";
+  let current: TextResource | undefined;
+
+  const release = () => {
+    current?.dispose();
+    current = undefined;
+    setRes(undefined);
+  };
+
   createEffect(() => {
     const mode = cjkMode();
     void cjkEpoch();
-    const t = props.text;
-    const cls = props.class;
-    const prev = untrack(() => res());
-    prev?.dispose();
-    setRes(undefined);
-    if (mode !== "stream" || !cjkFont) return;
-    const slot = slotFromClass(cls);
-    if (slot !== 0 && slot !== 7 && slot !== 8) return;
+    const text = props.text;
+    const slot = slotFromClass(props.class);
+    const usable =
+      mode === "stream" && !!cjkFont && (slot === 0 || slot === 7 || slot === 8);
+    const next = usable ? slot + "\u0000" + text : "";
+    /* 颜色 / 高亮变化：key 没变就直接复用，绝不重新申请字形。 */
+    if (next === key && current) return;
+    key = next;
+    release();
+    if (!usable || !cjkFont) return;
     try {
-      setRes(cjkFont.prepareText(t, { slot }));
+      current = cjkFont.prepareText(text, { slot });
+      setRes(current);
     } catch {
-      /* baked fallback */
+      current = undefined;
+      key = "";
     }
   });
+
   onCleanup(() => {
-    res()?.dispose();
+    key = "";
+    release();
   });
+
   return (
     <Show
       when={res()}
@@ -615,7 +649,9 @@ function StreamText(props: { class: string; text: string }) {
         <Text
           class={props.class}
           resource={r()}
-          fallback={() => <Text class={props.class}>{props.text}</Text>}
+          fallback={() => (
+            <Text class={props.class} style={{ opacity: 0 }}>{props.text}</Text>
+          )}
           errorFallback={() => <Text class={props.class}>{props.text}</Text>}
         />
       )}
@@ -2626,8 +2662,12 @@ export default function Music() {
   onFrame(() => {
     audioEngine.pump();
 
-    /* STREAM 诊断：约每秒把流式字库的状态写一行到日志（日志默认关）。 */
-    if (cjkMode() === "stream" && ++cjkDbgFrames % 60 === 0) logCjkStats();
+    /* STREAM 诊断：约每秒把流式字库的状态写一行到日志。
+     * 日志默认关；关着的时候连统计都不采集，正式版零额外开销。 */
+    if (cjkMode() === "stream") {
+      cjkDbgFrames += 1;
+      if (cjkDbgFrames % 60 === 0 && logEnabled()) logCjkStats();
+    }
 
     /* 息屏中又被切到后台（PS → LiveArea）再回来，帧循环会空一大段；
      * 这时自动亮屏，免得回来面对一片黑还以为卡死了。 */
@@ -3206,6 +3246,36 @@ function LyricsPage(props: {
     const next = idx + 1 < ls.length ? ls[idx + 1]?.text ?? "" : "";
     return [prev, cur, next];
   });
+
+  /* 预取：把后面几行歌词的字形先取回来 —— 滚到下一行时不再"先缺字、后补齐"。
+   * 可见的三行由 StreamText 申请，这里补 idx+2..idx+5；每次换行先释放旧的
+   * 预取（别的租约还持有的字形不会被踢掉），离开歌词页/切模式时一并释放。 */
+  let prefetched: TextResource[] = [];
+  const dropPrefetch = () => {
+    for (const r of prefetched) r.dispose();
+    prefetched = [];
+  };
+  createEffect(() => {
+    const mode = cjkMode();
+    void cjkEpoch();
+    const idx = active();
+    const ls = props.lines();
+    const slot = slotFromClass(pTxt("lyricCur"));
+    const usable =
+      mode === "stream" && !!cjkFont && (slot === 0 || slot === 7 || slot === 8);
+    dropPrefetch();
+    if (!usable || !cjkFont) return;
+    for (let i = idx + 2; i <= idx + 5 && i < ls.length; i += 1) {
+      const text = clip(ls[i]?.text ?? "", 44).trim();
+      if (!text) continue;
+      try {
+        prefetched.push(cjkFont.prepareText(text, { slot }));
+      } catch {
+        /* 超出预算就算了，不影响正常显示 */
+      }
+    }
+  });
+  onCleanup(dropPrefetch);
 
   return (
     <View class="relative overflow-hidden flex-col w-96 h-48 p-2 gap-1 rounded-xl">
