@@ -465,6 +465,8 @@ const [cjkMode, setCjkMode] = createSignal<CjkMode>(
 const [cjkStatus, setCjkStatus] = createSignal<"off" | "opening" | "ready" | "error">("off");
 const [cjkEpoch, setCjkEpoch] = createSignal(0);
 let cjkFont: ReturnType<typeof openFontArchive> | undefined;
+/* PS 键锁状态（显示在 About 页）：LOCKED / UNLOCKED / FAIL 0x… */
+const [psLockInfo, setPsLockInfo] = createSignal("PS KEY  UNLOCKED");
 
 /* STREAM 模式的诊断日志（只有卡里有 ux0:/data/yunyin/debug 时才真的写）。
  * host 里：resident = 常驻字形数，inked = 其中真的有墨的个数
@@ -2607,7 +2609,14 @@ export default function Music() {
     } catch {
       ret = -1;
     }
-    /* 0 = 系统调用成功；失败只写日志（日志默认关，卡里放 debug 才写）。 */
+    /* 0 = 系统调用成功；非 0 在 About 页显示成 FAIL 0x…，方便确认锁有没有生效。 */
+    setPsLockInfo(
+      on
+        ? ret === 0
+          ? "PS KEY  LOCKED"
+          : "PS KEY  FAIL 0x" + (ret >>> 0).toString(16).toUpperCase()
+        : "PS KEY  UNLOCKED",
+    );
     logMsg("ps lock: request=" + String(on) + " ret=" + String(ret));
   });
 
@@ -3547,8 +3556,11 @@ function AboutPage() {
             VER {APP_VERSION}  ·  APP {APP_VER_SFO}  ·  PJ {POCKETJS_VERSION}
           </Text>
           <Text class={pTxt("aboutSub")}>made by 阡陌</Text>
-          <Text class={pTxt("aboutSub")}>感谢 PocketJS 团队的努力付出</Text>
-          <Text class={pTxt("aboutSub")}>播放后端参考 ElevenMPV-A 的本进程 BGM 口</Text>
+          <Text class={pTxt("aboutSub")}>致谢：PocketJS 团队 · ElevenMPV-A</Text>
+          {/* 播放期间锁 PS 键 —— 这行就是给你确认锁没锁上的（LOCKED / FAIL 会亮起来） */}
+          <Text class={psLockInfo() !== "PS KEY  UNLOCKED" ? pTxt("aboutTitle") : pTxt("aboutSub")}>
+            {psLockInfo()}
+          </Text>
         </View>
         <View class="flex-row items-center justify-center h-5">
           <Text class={pTxt("aboutSub")}>△ BACK 返回</Text>
