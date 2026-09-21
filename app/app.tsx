@@ -448,6 +448,8 @@ const pTxt = (key: string) => PANEL_TXT[uiTheme()][key] ?? "";
 
 /* 软件版本：About 页展示，和 param.sfo APP_VER 00.62 对齐。 */
 const APP_VERSION = "0.62";
+/* param.sfo 里的 APP_VER（VitaShell 里显示的那串），和 APP_VERSION 一起改。 */
+const APP_VER_SFO = "00.62";
 const POCKETJS_VERSION = "0.12.0";
 
 type CjkMode = "baked" | "stream";
@@ -463,8 +465,6 @@ const [cjkMode, setCjkMode] = createSignal<CjkMode>(
 const [cjkStatus, setCjkStatus] = createSignal<"off" | "opening" | "ready" | "error">("off");
 const [cjkEpoch, setCjkEpoch] = createSignal(0);
 let cjkFont: ReturnType<typeof openFontArchive> | undefined;
-/* PS 键锁状态（显示在 About 页）：LOCKED / UNLOCKED / FAIL 0x… */
-const [psLockInfo, setPsLockInfo] = createSignal("PS KEY  UNLOCKED");
 
 /* STREAM 模式的诊断日志（只有卡里有 ux0:/data/yunyin/debug 时才真的写）。
  * host 里：resident = 常驻字形数，inked = 其中真的有墨的个数
@@ -523,6 +523,15 @@ const slotFromClass = (cls: string): number => {
   const bold = /\bfont-bold\b/.test(cls);
   if (/\btext-sm\b/.test(cls)) return bold ? 8 : 1;
   return bold ? 7 : 0;
+};
+
+/* 设置页第一张卡片（CJK）上显示的短标签。 */
+const cjkCardValue = (): string => {
+  if (cjkMode() !== "stream") return "BAKED";
+  if (cjkStatus() === "ready") return "STREAM";
+  if (cjkStatus() === "opening") return "LOADING";
+  if (cjkStatus() === "error") return "ERROR";
+  return "STREAM";
 };
 
 const applyCjkMode = (next: CjkMode): void => {
@@ -1697,7 +1706,6 @@ export default function Music() {
     })(),
   );
 
-  const [sfx, setSfx] = createSignal(true);
   const [vibration, setVibration] = createSignal(false);
   const [brightness, setBrightness] = createSignal(3);
   const [theme, setTheme] = createSignal<Theme>("INDIGO");
@@ -2277,7 +2285,8 @@ export default function Music() {
     const index = settingCursor();
 
     if (index === 0) {
-      setSfx(!sfx());
+      /* CJK：切换 BAKED（只用烘焙字集）/ STREAM（生僻字按需从 cjk.pjfa 取）。 */
+      applyCjkMode(cjkMode() === "stream" ? "baked" : "stream");
       return;
     }
 
@@ -2345,7 +2354,7 @@ export default function Music() {
 
     if (screen() === "setting") {
       if (aboutVisible()) {
-        applyCjkMode(cjkMode() === "stream" ? "baked" : "stream");
+        /* About 是纯文字页，○ 在这里不做任何事（△ 返回）。 */
         return;
       }
       activateSetting();
@@ -2598,14 +2607,7 @@ export default function Music() {
     } catch {
       ret = -1;
     }
-    /* 0 = 系统调用成功；非 0 会显示在 About 页上，方便确认锁到底有没有生效。 */
-    setPsLockInfo(
-      on
-        ? ret === 0
-          ? "PS KEY  LOCKED"
-          : "PS KEY  FAIL 0x" + (ret >>> 0).toString(16).toUpperCase()
-        : "PS KEY  UNLOCKED",
-    );
+    /* 0 = 系统调用成功；失败只写日志（日志默认关，卡里放 debug 才写）。 */
     logMsg("ps lock: request=" + String(on) + " ret=" + String(ret));
   });
 
@@ -2888,7 +2890,6 @@ export default function Music() {
                 ) : (
                   <SettingPage
                     cursor={settingCursor}
-                    sfx={sfx}
                     vibration={vibration}
                     brightness={brightness}
                     theme={theme}
@@ -3532,13 +3533,6 @@ function AlbumTile(props: {
  * ======================================================= */
 
 function AboutPage() {
-  const cjkLabel = () => {
-    if (cjkMode() !== "stream") return "CJK  BAKED 烘焙";
-    if (cjkStatus() === "ready") return "CJK  STREAM 流式";
-    if (cjkStatus() === "opening") return "CJK  LOADING";
-    if (cjkStatus() === "error") return "CJK  BAKED*";
-    return "CJK  STREAM";
-  };
   return (
     <View class="relative overflow-hidden flex-col w-96 h-48 p-3 gap-1 rounded-xl">
       <Image src={useSkin().aboutBg} class="absolute inset-0 w-full h-full" />
@@ -3549,15 +3543,15 @@ function AboutPage() {
         </View>
         <View class="grow flex-col items-center justify-center gap-1">
           <Text class={pTxt("aboutTitle")}>YUNYIN 云音 for vita</Text>
-          <Text class={pTxt("aboutSub")}>VER {APP_VERSION}  ·  APP 00.62  ·  PJ {POCKETJS_VERSION}</Text>
-          <Text class={pTxt("aboutSub")}>made by 阡陌</Text>
-          <Text class={cjkMode() === "stream" ? pTxt("aboutTitle") : pTxt("aboutSub")}>
-            {cjkLabel()}
+          <Text class={pTxt("aboutSub")}>
+            VER {APP_VERSION}  ·  APP {APP_VER_SFO}  ·  PJ {POCKETJS_VERSION}
           </Text>
-          <Text class={pTxt("aboutSub")}>{psLockInfo()}</Text>
+          <Text class={pTxt("aboutSub")}>made by 阡陌</Text>
+          <Text class={pTxt("aboutSub")}>感谢 PocketJS 团队的努力付出</Text>
+          <Text class={pTxt("aboutSub")}>播放后端参考 ElevenMPV-A 的本进程 BGM 口</Text>
         </View>
         <View class="flex-row items-center justify-center h-5">
-          <Text class={pTxt("aboutSub")}>○ CJK  △ BACK 返回</Text>
+          <Text class={pTxt("aboutSub")}>△ BACK 返回</Text>
         </View>
       </View>
     </View>
@@ -3570,7 +3564,6 @@ function AboutPage() {
 
 function SettingPage(props: {
   cursor: () => number;
-  sfx: () => boolean;
   vibration: () => boolean;
   brightness: () => number;
   theme: () => Theme;
@@ -3602,8 +3595,10 @@ function SettingPage(props: {
               <Image src={cardImg(i)} class="absolute inset-0 w-full h-full" />
               {i === 0 && (
                 <>
-                  <Text class={props.cursor() === 0 ? pTxt("navActive") : pTxt("setTitle")}>SFX</Text>
-                  <Text class={props.sfx() ? pTxt("navActive") : pTxt("setVal")}>{props.sfx() ? "ON" : "OFF"}</Text>
+                  <Text class={props.cursor() === 0 ? pTxt("navActive") : pTxt("setTitle")}>CJK</Text>
+                  <Text class={cjkMode() === "stream" ? pTxt("navActive") : pTxt("setVal")}>
+                    {cjkCardValue()}
+                  </Text>
                 </>
               )}
               {i === 1 && (
