@@ -141,7 +141,7 @@ wsl -d pocket-ubuntu -u root bash /mnt/d/AI-PSVITA/yunyin/scripts/build-variants
 ## 最后
 
 - 特别感谢 [PocketJS](https://pocketjs.dev) 团队的努力付出！！
-- 播放后端对照 [ElevenMPVScrobbling](https://github.com/patchyfluffy/ElevenMPVScrobbling) 的"本进程 BGM 口"做法（不是 libShellAudio / SceShell）。
+- 播放后端对照 [ElevenMPVScrobbling](https://github.com/patchyfluffy/ElevenMPVScrobbling) 
 - 主题文字颜色在 `app/colors.json` 里改，改完重新打包即可。
 - 日文版用的 MS Mincho 来自 Windows 自带字体，对外分发前请确认授权；
   `fonts/chinese/NotoSansSC-Medium.ttf` 是 Noto Sans SC（SIL OFL）。
