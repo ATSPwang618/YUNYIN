@@ -17,7 +17,7 @@
 
 |  |  |
 | --- | --- |
-| 当前版本 | **0.62** —— [下载 / 历史版本](https://github.com/ATSPwang618/YUNYIN/releases) |
+| 当前版本 | **0.63** —— [下载 / 历史版本](https://github.com/ATSPwang618/YUNYIN/releases) |
 | 曲库目录 | `ux0:/data/yunyin/music`（可以分子文件夹，最多 240 首） |
 | 音频格式 | MP3（最推荐） / OGG / WAV / FLAC / OPUS |
 | 界面 | 首页播放器 · 全部曲目 · 专辑 · 收藏 · 设置 |
@@ -31,7 +31,7 @@
 1. 用 VitaShell 把 `yunyin-cn.vpk`（中文曲库）或 `yunyin-jp.vpk`（日文曲库）装到 PS Vita。
 2. 音乐放进 `ux0:/data/yunyin/music`。
 3. 打开「云音」，第一次进入会自动扫描曲库，扫完就能听。
-4. 设置页可以换主题、开关音效和震动；About 页显示版本号，按 **○** 切换 CJK 烘焙 / 流式。
+4. 设置页四张卡：**CJK** 切换烘焙 / 流式字库，**KEYS** 看按键操作说明，**ABOUT** 显示版本与致谢，**THEME** 换主题（都按 **○** 进入，**△** 返回）。
 5. **播放期间 PS 键是锁着的**：想退出应用，先按 **○** 暂停（暂停即解锁），再按 PS 回桌面；把云音撕页关掉，声音立刻停。
 
 ### 按键
@@ -138,8 +138,8 @@ wsl -d pocket-ubuntu -u root bash -lc 'cd /mnt/d/AI-PSVITA/yunyin && python3 scr
 wsl -d pocket-ubuntu -u root bash /mnt/d/AI-PSVITA/yunyin/scripts/build-variants.sh
 ```
 
-- 版本号（`param.sfo` 里的 `APP_VER`，VitaShell 里能看到）在 `scripts/build-vpk.py` 顶部，默认 `00.62`；
-  也可以用环境变量 `YUNYIN_APP_VER=00.62` 覆盖。
+- 版本号（`param.sfo` 里的 `APP_VER`，VitaShell 里能看到）在 `scripts/build-vpk.py` 顶部，默认 `00.63`；
+  也可以用环境变量 `YUNYIN_APP_VER=00.63` 覆盖。
 - PocketJS 装在别的地方：`POCKETJS_ROOT=/你的路径 python3 scripts/build-vpk.py`。
 - 流式字库 `fonts/chinese/cjk.pjfa` 由 `scripts/bake-cjk-archive.ts` 烘出来，构建时会直接用缓存；
   换了字体或改了 `fonts/chinese/cjk-stream.txt`，把这个文件删掉让它重烘。
