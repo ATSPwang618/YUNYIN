@@ -1409,9 +1409,11 @@ export default function Music() {
 
   const [homeCursor, setHomeCursor] = createSignal(1);
   const [lyricsVisible, setLyricsVisible] = createSignal(false);
-  const [aboutVisible, setAboutVisible] = createSignal(false);
   const [lyricsClosing, setLyricsClosing] = createSignal(false);
-  const [aboutClosing, setAboutClosing] = createSignal(false);
+  /* 设置页里的子页面：about（关于）/ keys（按键说明）/ null（没开）。
+   * 两者共用同一套进出动画和"△ 返回"，都只是一页静态文字。 */
+  const [subPage, setSubPage] = createSignal<"about" | "keys" | null>(null);
+  const [subClosing, setSubClosing] = createSignal(false);
 
   const [listCursor, setListCursor] = createSignal(0);
   const [listStart, setListStart] = createSignal(0);
@@ -1479,7 +1481,6 @@ export default function Music() {
     })(),
   );
 
-  const [vibration, setVibration] = createSignal(false);
   const [brightness, setBrightness] = createSignal(3);
   const [theme, setTheme] = createSignal<Theme>("INDIGO");
 
@@ -1742,8 +1743,8 @@ export default function Music() {
 
   const openSelectedNav = () => {
     const index = navIndex();
-    setAboutVisible(false);
-    setAboutClosing(false);
+    setSubPage(null);
+    setSubClosing(false);
 
     if (index === 0) {
       setScreen("home");
@@ -2066,14 +2067,17 @@ export default function Music() {
     }
 
     if (index === 1) {
-      setVibration(!vibration());
+      /* KEYS：按键操作说明（和 About 一样的静态文字页，△ 返回）。 */
+      setSubPage("keys");
+      setSubClosing(false);
+      focusContent();
       return;
     }
 
     if (index === 2) {
       /* ABOUT：打开 About Us 静态文字界面，△ 返回设置页。 */
-      setAboutVisible(true);
-      setAboutClosing(false);
+      setSubPage("about");
+      setSubClosing(false);
       focusContent();
       return;
     }
@@ -2128,8 +2132,8 @@ export default function Music() {
     }
 
     if (screen() === "setting") {
-      if (aboutVisible()) {
-        /* About 是纯文字页，○ 在这里不做任何事（△ 返回）。 */
+      if (subPage()) {
+        /* 子页面是纯文字，○ 在这里不做任何事（△ 返回）。 */
         return;
       }
       activateSetting();
@@ -2227,7 +2231,7 @@ export default function Music() {
     }
 
     if (screen() === "setting") {
-      if (aboutVisible()) {
+      if (subPage()) {
         return;
       }
       if (moveSettingLeft()) {
@@ -2307,7 +2311,7 @@ export default function Music() {
     }
 
     if (screen() === "setting") {
-      if (aboutVisible()) {
+      if (subPage()) {
         return;
       }
       moveSettingRight();
@@ -2346,8 +2350,8 @@ export default function Music() {
       return;
     }
 
-    if (screen() === "setting" && aboutVisible()) {
-      setAboutClosing(true);
+    if (screen() === "setting" && subPage()) {
+      setSubClosing(true);
       /* 焦点在离场动画播完后，由 PageInOut.onExitDone 归还到内容区。 */
       return;
     }
@@ -2663,22 +2667,21 @@ export default function Music() {
 
             {screen() === "setting" && (
               <PageEnter dir={1}>
-                {aboutVisible() || aboutClosing() ? (
+                {subPage() ? (
                   <PageInOut
                     dir={1}
-                    closing={() => aboutClosing()}
+                    closing={() => subClosing()}
                     onExitDone={() => {
-                      setAboutVisible(false);
-                      setAboutClosing(false);
+                      setSubPage(null);
+                      setSubClosing(false);
                       focusContent();
                     }}
                   >
-                    <AboutPage />
+                    {subPage() === "keys" ? <KeyGuidePage /> : <AboutPage />}
                   </PageInOut>
                 ) : (
                   <SettingPage
                     cursor={settingCursor}
-                    vibration={vibration}
                     brightness={brightness}
                     theme={theme}
                   />
@@ -3390,12 +3393,53 @@ function AboutPage() {
 }
 
 /* =========================================================
+ * KEY GUIDE —— 按键操作说明
+ *
+ * 设置页 KEYS 卡片进入，版式和 About 一样（静态文字 + △ 返回）。
+ * ======================================================= */
+
+const KEY_GUIDE_ROWS: [string, string][] = [
+  ["← → ↑ ↓", "切换页面 / 移动光标"],
+  ["○", "确认 · 播放 / 暂停"],
+  ["△", "返回"],
+  ["L / R", "上一首 / 下一首"],
+  ["START", "关屏继续播放"],
+  ["PS", "播放中锁定 · 先暂停再退出"],
+];
+
+function KeyGuidePage() {
+  return (
+    <View class="relative overflow-hidden flex-col w-96 h-48 p-3 gap-1 rounded-xl">
+      <Image src={useSkin().aboutBg} class="absolute inset-0 w-full h-full" />
+      <View class="relative flex-col w-96 h-48 p-3 gap-1">
+        <View class="flex-row items-center justify-between h-7">
+          <Text class={pTxt("aboutTitle")}>KEY GUIDE</Text>
+          <Text class={pTxt("aboutSub")}>操作说明</Text>
+        </View>
+        <View class="grow flex-col items-center justify-center">
+          <For each={KEY_GUIDE_ROWS}>
+            {(row) => (
+              <View class="flex-row items-center justify-between w-full">
+                <Text class={pTxt("aboutTitle")}>{row[0]}</Text>
+                <Text class={pTxt("aboutSub")}>{row[1]}</Text>
+              </View>
+            )}
+          </For>
+        </View>
+        <View class="flex-row items-center justify-center h-5">
+          <Text class={pTxt("aboutSub")}>△ BACK 返回</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+/* =========================================================
  * SETTINGS
  * ======================================================= */
 
 function SettingPage(props: {
   cursor: () => number;
-  vibration: () => boolean;
   brightness: () => number;
   theme: () => Theme;
 }) {
@@ -3434,8 +3478,8 @@ function SettingPage(props: {
               )}
               {i === 1 && (
                 <>
-                  <Text class={props.cursor() === 1 ? pTxt("navActive") : pTxt("setTitle")}>VIB</Text>
-                  <Text class={props.vibration() ? pTxt("navActive") : pTxt("setVal")}>{props.vibration() ? "ON" : "OFF"}</Text>
+                  <Text class={props.cursor() === 1 ? pTxt("navActive") : pTxt("setTitle")}>KEYS</Text>
+                  <Text class={pTxt("setInfo")}>INFO</Text>
                 </>
               )}
               {i === 2 && (
