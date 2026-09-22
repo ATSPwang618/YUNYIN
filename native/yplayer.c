@@ -104,19 +104,39 @@ static int ogg_open(const char *p) {
   return 0;
 }
 
+/* ov_read 一次只吐"当前 packet"的数据，短块（瞬态处）可能只有 128 / 576 个
+ * 采样点。以前只读一次就返回，上层把剩下的全部填静音 —— 这个 live 录音里
+ * 有 4332 个包短于一个 960 帧缓冲区，等于每三分之一不到的缓冲区漏一段，
+ * 听感就是"特别卡"。这里循环补齐整个缓冲区（和 mpg123 / dr_wav 一致）。 */
 static int ogg_decode(short *buf, int max_frames) {
-  int bits = 0;
+  if (max_frames <= 0) return 0;
   if (g.ch == 1) {
-    short mono[1024 * 2];
-    long n = ov_read(&g.vf, (char *)mono, max_frames * 2, 0, 2, 1, &bits);
-    if (n <= 0) return 0;
-    int frames = n / 2;
-    for (int i = 0; i < frames; i++) { buf[i * 2] = mono[i]; buf[i * 2 + 1] = mono[i]; }
+    short mono[2048];
+    int frames = 0;
+    while (frames < max_frames) {
+      int bits = 0;
+      int want = max_frames - frames;
+      if (want > (int)(sizeof mono / sizeof mono[0])) want = (int)(sizeof mono / sizeof mono[0]);
+      long n = ov_read(&g.vf, (char *)mono, want * 2, 0, 2, 1, &bits);
+      if (n <= 0) break;
+      int got = (int)(n / 2);
+      for (int i = 0; i < got; i++) {
+        buf[(frames + i) * 2] = mono[i];
+        buf[(frames + i) * 2 + 1] = mono[i];
+      }
+      frames += got;
+    }
     return frames;
   }
-  long n = ov_read(&g.vf, (char *)buf, max_frames * 4, 0, 2, 1, &bits);
-  if (n <= 0) return 0;
-  return n / 4;
+  int frames = 0;
+  while (frames < max_frames) {
+    int bits = 0;
+    long n = ov_read(&g.vf, (char *)(buf + frames * 2),
+                     (max_frames - frames) * 4, 0, 2, 1, &bits);
+    if (n <= 0) break;
+    frames += (int)(n / 4);
+  }
+  return frames;
 }
 
 /* -------- WAV (dr_wav) -------- */
@@ -178,19 +198,27 @@ static int opus_open(const char *p) {
   return 0;
 }
 
+/* op_read 同理：一次一个 packet（2.5–60ms），也要循环补齐整个缓冲区。 */
 static int yp_opus_decode(short *buf, int max_frames) {
-  /* op_read returns samples per channel; we request stereo into pcm[2*max] */
+  if (max_frames <= 0) return 0;
   short pcm[1024 * 2];
-  int cap = max_frames;
-  if (cap > 1024) cap = 1024;
-  int n = op_read(g.of, pcm, cap, NULL);
-  if (n <= 0) return 0;
-  if (g.ch == 1) {
-    for (int i = 0; i < n; i++) { buf[i * 2] = pcm[i]; buf[i * 2 + 1] = pcm[i]; }
-  } else {
-    memcpy(buf, pcm, (size_t)n * 4);
+  int frames = 0;
+  while (frames < max_frames) {
+    int want = max_frames - frames;
+    if (want > 1024) want = 1024;
+    int n = op_read(g.of, pcm, want, NULL);
+    if (n <= 0) break;
+    if (g.ch == 1) {
+      for (int i = 0; i < n; i++) {
+        buf[(frames + i) * 2] = pcm[i];
+        buf[(frames + i) * 2 + 1] = pcm[i];
+      }
+    } else {
+      memcpy(buf + frames * 2, pcm, (size_t)n * 4);
+    }
+    frames += n;
   }
-  return n;
+  return frames;
 }
 
 /* -------- public -------- */
