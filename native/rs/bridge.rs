@@ -206,7 +206,7 @@ pub unsafe fn install(ctx: *mut JSContext, global: JSValue) {
     add_fn(ctx, obj, b"roots\0", js_roots, 0);
     add_fn(ctx, obj, b"play\0", js_play, 1);
     add_fn(ctx, obj, b"pause\0", js_pause, 0);
-    add_fn(ctx, obj, b"resume\0", js_resume, 0);
+    add_fn(ctx, obj, b"resume\0", js_resume, 1);
     add_fn(ctx, obj, b"stop\0", js_stop, 0);
     add_fn(ctx, obj, b"state\0", js_state, 0);
     add_fn(ctx, obj, b"cover\0", js_cover, 1);

@@ -111,7 +111,6 @@ function collectAudio(
 type Screen = "home" | "list" | "album" | "loved" | "setting";
 type FocusZone = "nav" | "content";
 type PlaybackMode = "sequence" | "repeat-one";
-type Theme = "INDIGO" | "EMERALD" | "AMBER" | "ROSE";
 
 /* =========================================================
  * TRACK / ALBUM DATA MODEL
@@ -1481,8 +1480,6 @@ export default function Music() {
     })(),
   );
 
-  const [brightness, setBrightness] = createSignal(3);
-  const [theme, setTheme] = createSignal<Theme>("INDIGO");
 
   const navRefs: (NodeMirror | undefined)[] = [];
   let contentRef: NodeMirror | undefined;
@@ -2680,11 +2677,7 @@ export default function Music() {
                     {subPage() === "keys" ? <KeyGuidePage /> : <AboutPage />}
                   </PageInOut>
                 ) : (
-                  <SettingPage
-                    cursor={settingCursor}
-                    brightness={brightness}
-                    theme={theme}
-                  />
+                  <SettingPage cursor={settingCursor} />
                 )}
               </PageEnter>
             )}
@@ -3440,8 +3433,6 @@ function KeyGuidePage() {
 
 function SettingPage(props: {
   cursor: () => number;
-  brightness: () => number;
-  theme: () => Theme;
 }) {
   const cardClass = (index: number) => {
     return props.cursor() === index

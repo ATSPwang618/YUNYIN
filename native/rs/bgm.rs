@@ -30,7 +30,6 @@ extern "C" {
     fn sceAudioOutReleasePort(port: i32) -> i32;
     fn sceAudioOutSetVolume(port: i32, ch: i32, vol: *mut i32) -> i32;
     fn sceAppMgrAcquireBgmPort() -> i32;
-    fn sceAppMgrReleaseBgmPort() -> i32;
 }
 
 static PLAYING: AtomicBool = AtomicBool::new(false);

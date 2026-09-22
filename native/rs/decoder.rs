@@ -5,7 +5,6 @@ use std::ffi::CString;
 extern "C" {
     fn yp_open(path: *const i8) -> i32;
     fn yp_rate() -> i32;
-    fn yp_channels() -> i32;
     fn yp_decode(buf: *mut i16, max_frames: i32) -> i32;
     fn yp_seek(frame: i64) -> i32;
     fn yp_position() -> i64;
@@ -26,10 +25,6 @@ pub fn close() {
 
 pub fn rate() -> i32 {
     unsafe { yp_rate() }.max(1)
-}
-
-pub fn channels() -> i32 {
-    unsafe { yp_channels() }.max(1)
 }
 
 pub fn decode(buf: &mut [i16], max_frames: i32) -> i32 {
