@@ -12,6 +12,7 @@ mod cjk_host;
 mod decoder;
 mod fs;
 mod font_gpu;
+mod frame_skip;
 mod log;
 pub mod offload_local;
 mod power;
@@ -20,6 +21,7 @@ mod store;
 mod tags;
 
 pub use font_gpu::refresh_font_atlases;
+pub use frame_skip::frame_changed;
 
 pub(crate) const COVER_PX: u32 = 256;
 pub(crate) const MAX_ART: usize = 1024 * 1024;

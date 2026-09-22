@@ -923,6 +923,27 @@ def patch_font_gpu():
     else:
         print("[build-vpk] main.rs refresh_font_atlases already patched")
 
+    # 画面内容没变就跳过这一帧的 render+present（见 native/rs/frame_skip.rs）。
+    old_present = (
+        "        pocketjs_vita::media::refresh_font_atlases();\n"
+        "        runtime.render();\n"
+        "        graphics::present();\n"
+    )
+    new_present = (
+        "        pocketjs_vita::media::refresh_font_atlases();\n"
+        "        if pocketjs_vita::media::frame_changed() {\n"
+        "            runtime.render();\n"
+        "            graphics::present();\n"
+        "        }\n"
+    )
+    if "media::frame_changed()" in s:
+        print("[build-vpk] main.rs frame_changed already patched")
+    elif old_present in s:
+        m.write_text(s.replace(old_present, new_present, 1))
+        print("[build-vpk] patch: main.rs skip unchanged frames")
+    else:
+        print("[build-vpk] WARN: main.rs render/present anchor not found; frames not skipped")
+
 
 def patch_font_dirty():
     """让 core 记录"这次到底写了哪几个流式字形"，宿主才能只上传那几个格子。
@@ -1362,26 +1383,38 @@ if __name__ == "__main__":
         build_vpk()
         repack()
     except subprocess.CalledProcessError:
-        # VitaSDK's SCE header needs 2824 bytes of free space at the end of
-        # segment 0.  As the JS bundle grows, segment 0 can end too close to a
-        # 4KB boundary and vita-elf-create reports "segment 1 overlaps".
-        # Shrink the injected rodata pad a little at a time and relink until it
-        # fits, keeping a small safety buffer so one retry is enough.
-        for _ in range(12):
+        # VitaSDK's SCE header needs up to 4096 bytes of free space at the end of
+        # segment 0 (实测 2824–2988，随构建大小浮动).  As the JS bundle grows,
+        # segment 0 can end too close to a 4KB boundary and vita-elf-create
+        # reports "segment 1 overlaps".  The injected rodata pad
+        # (YUNYIN_ELF_PAD) shifts where segment 0 ends, so we relink with a
+        # different pad until one lands early enough in its 4KB page.
+        #
+        # 注意：这个"差多少补多少"是模 4096 的，所以 pad 缩到 0 之后要再从
+        # 小的往大试；以前只往下试、而且拿不到段信息就直接放弃，日文版那种
+        # 更大的字库就会一直失败。
+        need = 4096
+        lower_first = True
+        for attempt in range(24):
             gap = _elf_gap()
-            if not gap:
-                raise
-            seg0_end, seg1_start = gap
-            deficit = 2824 - (seg1_start - seg0_end)
-            if deficit <= 0:
-                # No overlap now (e.g. a later relink happened) but build still
-                # failed for another reason.
-                raise
-            shrink = deficit + 64
-            PAD_SIZE = max(0, PAD_SIZE - shrink)
+            if gap is not None:
+                _, seg1_start = gap
+                seg0_end = gap[0]
+                free = seg1_start - seg0_end
+                shrink = (need - free) + 64 if need > free else 512
+            else:
+                shrink = 512
+            if lower_first:
+                if PAD_SIZE - shrink >= 0:
+                    PAD_SIZE -= shrink
+                else:
+                    lower_first = False
+                    PAD_SIZE = shrink
+            else:
+                PAD_SIZE += shrink
             print(
-                f"[build-vpk] SCE overlap gap={seg1_start - seg0_end} need=2824 "
-                f"-> pad 0x{PAD_SIZE:x} (-{shrink})"
+                f"[build-vpk] SCE realign #{attempt + 1}: free={gap and (gap[1] - gap[0])} "
+                f"need={need} -> pad 0x{PAD_SIZE:x}"
             )
             stage()
             patch_host()

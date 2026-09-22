@@ -1796,6 +1796,8 @@ export default function Music() {
     if (!api || !api.cover) return;
     const visible = albums().slice(albumStart(), albumStart() + 3);
     const log = (m: string) => {
+      /* 诊断日志默认关：关着连字符串都不拼，省掉每次重跑的这点开销。 */
+      if (!logEnabled()) return;
       try {
         (media() as unknown as { logMsg?: (s: string) => void })?.logMsg?.(m);
       } catch { /* ignore */ }
@@ -2713,12 +2715,14 @@ export default function Music() {
       return;
     }
 
-    /* position 仍保持 60Hz，保证进度条、歌词和视觉动画流畅。 */
-    if (next !== position()) setPosition(next);
-
-    /* 律动条保持原来的约 30fps。 */
+    /* 进度/律动条统一降到约 30fps：位置信号每变一次就要重排整棵受影响子树，
+     * 60Hz 对这个"慢慢爬的进度条 + 五根柱子"没有可见收益，30Hz 已经把
+     * 每帧的刷新点砍掉一半（歌词高亮 33ms 精度也完全够）。 */
     barsFrameTick += 1;
-    if ((barsFrameTick & 1) === 0) setBarsFrame((value) => value + 1);
+    if ((barsFrameTick & 1) === 0) {
+      if (next !== position()) setPosition(next);
+      setBarsFrame((value) => value + 1);
+    }
   });
 
   /* =======================================================
@@ -3089,6 +3093,11 @@ function HomePage(props: {
     return Math.min(180, (currentPosition / duration) * 180);
   };
 
+  /* 时间文字按秒刷新：位置信号每帧都在动，但 m:ss 只在秒变化时才需要重排。
+   * （memo 的值不变就不会通知下游，比每次渲染重新拼字符串省一个刷新点。） */
+  const posLabel = createMemo(() => formatMs(props.position()));
+  const durLabel = createMemo(() => formatMs(getTrackDuration(props.track())));
+
   return (
     <View class="relative w-[368] h-48 mx-[8] rounded-xl overflow-hidden">
       <Image src={useSkin().appBg} class="absolute inset-0 w-full h-full" />
@@ -3120,8 +3129,8 @@ function HomePage(props: {
                 <View class="w-0 h-1 rounded-md bg-orange-500" style={{ width: progressWidth() }} />
               </View>
               <View class="flex-row items-center justify-between w-45">
-                <Text class={pTxt("percent")}>{formatMs(props.position())}</Text>
-                <Text class={pTxt("percent")}>{formatMs(getTrackDuration(props.track()))}</Text>
+                <Text class={pTxt("percent")}>{posLabel()}</Text>
+                <Text class={pTxt("percent")}>{durLabel()}</Text>
               </View>
             </View>
 
@@ -3238,13 +3247,18 @@ function LyricsPage(props: {
     animate(listRef, "translateY", 0, { dur: 170, easing: "out" });
   });
 
-  const windowed = createMemo(() => {
+  /* 三行歌词拆成三个**字符串** memo：之前 windowed() 每次重算都返回新数组，
+   * 数组 !== 旧数组，于是每帧都通知下游（三个 StreamText 跟着每帧重跑）。
+   * 拆开之后只有"这一行真的换了"才通知。 */
+  const prevLine = createMemo(() => {
     const idx = active();
+    return idx > 0 ? props.lines()[idx - 1]?.text ?? "" : "";
+  });
+  const curLine = createMemo(() => props.lines()[active()]?.text ?? "");
+  const nextLine = createMemo(() => {
+    const idx = active() + 1;
     const ls = props.lines();
-    const prev = idx - 1 >= 0 ? ls[idx - 1]?.text ?? "" : "";
-    const cur = ls[idx]?.text ?? "";
-    const next = idx + 1 < ls.length ? ls[idx + 1]?.text ?? "" : "";
-    return [prev, cur, next];
+    return idx < ls.length ? ls[idx]?.text ?? "" : "";
   });
 
   /* 预取：把后面几行歌词的字形先取回来 —— 滚到下一行时不再"先缺字、后补齐"。
@@ -3310,9 +3324,9 @@ function LyricsPage(props: {
           style={{ translateY: 0 }}
           class="flex-col items-center gap-1 overflow-hidden"
         >
-          <StreamText class={pTxt("lyricOther")} text={clip(windowed()[0], 44)} />
-          <StreamText class={pTxt("lyricCur")} text={clip(windowed()[1], 44)} />
-          <StreamText class={pTxt("lyricOther")} text={clip(windowed()[2], 44)} />
+          <StreamText class={pTxt("lyricOther")} text={clip(prevLine(), 44)} />
+          <StreamText class={pTxt("lyricCur")} text={clip(curLine(), 44)} />
+          <StreamText class={pTxt("lyricOther")} text={clip(nextLine(), 44)} />
         </View>
       </View>
 
