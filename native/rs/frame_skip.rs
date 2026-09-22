@@ -8,10 +8,14 @@
 //! raster_revision**（纹理/字体/样式内容的版本号）做成一个哈希，和上一帧一样
 //! 就返回 false，宿主跳过这一帧的绘制。第一帧一定画（不然后面永远空屏）。
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use alloc::format;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+use crate::media::log;
 
 static LAST_HASH: AtomicU64 = AtomicU64::new(0);
 static SEEN: AtomicBool = AtomicBool::new(false);
+static FRAME_TICKS: AtomicU32 = AtomicU32::new(0);
 
 pub fn frame_changed() -> bool {
     let ui = unsafe { crate::ffi::ui() };
@@ -25,9 +29,21 @@ pub fn frame_changed() -> bool {
     }
     hash ^= revision.rotate_left(7);
     let seen = SEEN.swap(true, Ordering::AcqRel);
-    if seen && LAST_HASH.load(Ordering::Acquire) == hash {
-        return false;
+    let changed = !(seen && LAST_HASH.load(Ordering::Acquire) == hash);
+    if changed {
+        LAST_HASH.store(hash, Ordering::Release);
     }
-    LAST_HASH.store(hash, Ordering::Release);
-    true
+    /* 日志开着时，每 60 帧记一行：这一帧绘制字数量 + 有没有真的重绘。
+     * 用来判断"卡"在哪一层（words 就是 DrawList 的大小，1 个字 = 1 个绘制参数）。 */
+    if log::enabled() {
+        let tick = FRAME_TICKS.fetch_add(1, Ordering::AcqRel) + 1;
+        if tick % 60 == 0 {
+            log::append(&format!(
+                "frame: words={} present={}",
+                list.words.len(),
+                if changed { 1 } else { 0 }
+            ));
+        }
+    }
+    changed
 }
