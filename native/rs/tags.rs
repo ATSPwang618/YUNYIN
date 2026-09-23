@@ -52,6 +52,13 @@ fn le32(b: &[u8]) -> usize {
     (b[0] as usize) | ((b[1] as usize) << 8) | ((b[2] as usize) << 16) | ((b[3] as usize) << 24)
 }
 
+fn be64(b: &[u8]) -> usize {
+    if b.len() < 8 {
+        return 0;
+    }
+    ((be32(&b[0..4]) as u64) << 32 | be32(&b[4..8]) as u64) as usize
+}
+
 fn cstr_skip(p: &[u8]) -> Option<usize> {
     p.iter().position(|&c| c == 0).map(|i| i + 1)
 }
@@ -435,8 +442,14 @@ fn extract_ogg_picture(bytes: &[u8]) -> Option<Vec<u8>> {
                 let comment = core::str::from_utf8(&body[p..p + n]).unwrap_or("");
                 p += n;
                 if let Some((_, rest)) = comment.split_once('=') {
-                    if comment.len() >= 24
-                        && comment[..24].eq_ignore_ascii_case("METADATA_BLOCK_PICTURE=")
+                    /* Byte comparison, not `comment[..24]`: the slice would
+                     * panic when byte 24 lands inside a multi-byte character,
+                     * which is the normal case for a CJK-tagged comment
+                     * ("TITLE=宇多田…").  A panic there unwinds into the C
+                     * frames of the JS engine and takes the whole app down. */
+                    if comment.as_bytes().len() >= 24
+                        && comment.as_bytes()[..24]
+                            .eq_ignore_ascii_case(b"METADATA_BLOCK_PICTURE=")
                     {
                         if let Some(block) = b64_decode(rest) {
                             if let Some(pic) = flac_picture_data(&block) {
@@ -555,6 +568,241 @@ fn extract_cover_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
         .and_then(|raw| image_payload(&raw).or(Some(raw)))
 }
 
+/* ------------------------------------------------------------------ M4A ---- */
+/*
+ * M4A is a container: the metadata lives in moov/udta/meta/ilst, the audio is
+ * AAC inside mdat.  Two things make this different from the other formats:
+ *
+ *   - moov can sit at the *start* (NetEase-style "fast start") or at the very
+ *     end of the file, so tags cannot be read from a fixed prefix — the box
+ *     chain has to be walked with seeks.
+ *   - Text and artwork are typed `data` atoms (1 = UTF-8), not key/value pairs.
+ */
+
+/// A moov with a big cover can be a few MB; this bounds the read.
+const MP4_MOOV_CAP: usize = 8 * 1024 * 1024;
+
+fn is_mp4(bytes: &[u8]) -> bool {
+    bytes.len() >= 12 && &bytes[4..8] == b"ftyp"
+}
+
+/// Walk the top-level box chain and return the whole `moov` box (header
+/// included) — empty when the file has none or it is unreasonably large.
+///
+/// Only `moov` is size-capped: `mdat` is legitimately bigger than any sensible
+/// cap, and refusing it here is what will hide a trailing moov.
+fn mp4_moov(path: &str) -> Vec<u8> {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return Vec::new();
+    };
+    let mut off: u64 = 0;
+    while off + 8 <= len {
+        let mut hdr = [0u8; 16];
+        if f.seek(SeekFrom::Start(off)).is_err() {
+            return Vec::new();
+        }
+        let Ok(n) = f.read(&mut hdr) else {
+            return Vec::new();
+        };
+        if n < 8 {
+            return Vec::new();
+        }
+        let size32 = be32(&hdr[0..4]) as u64;
+        let (hdr_len, total) = if size32 == 1 {
+            if n < 16 {
+                return Vec::new();
+            }
+            (16u64, be64(&hdr[8..16]) as u64)
+        } else if size32 == 0 {
+            (8u64, len - off)
+        } else {
+            (8u64, size32)
+        };
+        if total < hdr_len || off + total > len {
+            return Vec::new();
+        }
+        if &hdr[4..8] == b"moov" {
+            if total > MP4_MOOV_CAP as u64 {
+                return Vec::new();
+            }
+            let mut buf = vec![0u8; total as usize];
+            if f.seek(SeekFrom::Start(off)).is_err() {
+                return Vec::new();
+            }
+            let got = f.read(&mut buf).unwrap_or(0);
+            buf.truncate(got);
+            return buf;
+        }
+        off += total;
+    }
+    Vec::new()
+}
+
+/// Child box inside `buf[start..end]` -> (payload offset, payload length).
+fn mp4_box(buf: &[u8], start: usize, end: usize, typ: &[u8; 4]) -> Option<(usize, usize)> {
+    let end = end.min(buf.len());
+    let mut off = start;
+    while off + 8 <= end {
+        let size = be32(&buf[off..off + 4]) as usize;
+        let kind = &buf[off + 4..off + 8];
+        let (hdr, total) = if size == 1 {
+            if off + 16 > end {
+                return None;
+            }
+            (16usize, be64(&buf[off + 8..off + 16]))
+        } else if size == 0 {
+            (8usize, end - off)
+        } else {
+            (8usize, size)
+        };
+        if total < hdr || off + total > end {
+            return None;
+        }
+        if kind == typ {
+            return Some((off + hdr, total - hdr));
+        }
+        off += total;
+    }
+    None
+}
+
+/// The `ilst` payload inside a moov box (handles moov/meta and moov/udta/meta).
+fn mp4_ilst(moov: &[u8]) -> Option<(usize, usize)> {
+    /* mp4_moov hands back the whole box, header included: skip those 8 bytes
+     * and walk its payload (mvhd / trak / udta). */
+    if moov.len() < 8 || &moov[4..8] != b"moov" {
+        return None;
+    }
+    let body = 8usize;
+    let moov_end = moov.len();
+    if let Some((mb, ml)) = mp4_box(moov, body, moov_end, b"udta") {
+        if let Some((meta, mlen)) = mp4_box(moov, mb, mb + ml, b"meta") {
+            // `meta` is a full box: version+flags come before its children.
+            if let Some(ilst) = mp4_box(moov, meta + 4, meta + mlen, b"ilst") {
+                return Some(ilst);
+            }
+        }
+    }
+    if let Some((meta, mlen)) = mp4_box(moov, body, moov_end, b"meta") {
+        if let Some(ilst) = mp4_box(moov, meta + 4, meta + mlen, b"ilst") {
+            return Some(ilst);
+        }
+    }
+    None
+}
+
+/// Iterate the atom (`©nam`, `covr`, `----`, …) with the given fourcc.
+fn mp4_atom(moov: &[u8], key: &[u8; 4]) -> Option<(usize, usize)> {
+    let (ilst, len) = mp4_ilst(moov)?;
+    mp4_box(moov, ilst, ilst + len, key)
+}
+
+/// First `data` atom inside an ilst atom -> (well-known type, payload).
+fn mp4_atom_data(moov: &[u8], atom: (usize, usize)) -> Option<(usize, &[u8])> {
+    let (body, len) = atom;
+    let end = (body + len).min(moov.len());
+    let mut off = body;
+    while off + 8 <= end {
+        let size = be32(&moov[off..off + 4]) as usize;
+        if size < 8 || off + size > end {
+            return None;
+        }
+        if &moov[off + 4..off + 8] == b"data" {
+            if size < 16 {
+                return None;
+            }
+            let dtype = be32(&moov[off + 8..off + 12]);
+            return Some((dtype, &moov[off + 16..off + size]));
+        }
+        off += size;
+    }
+    None
+}
+
+/// A UTF-8 / UTF-16 text tag.
+fn mp4_text(moov: &[u8], key: &[u8; 4]) -> String {
+    let Some(atom) = mp4_atom(moov, key) else {
+        return String::new();
+    };
+    let Some((dtype, payload)) = mp4_atom_data(moov, atom) else {
+        return String::new();
+    };
+    if payload.is_empty() {
+        return String::new();
+    }
+    match dtype {
+        2 => {
+            // UTF-16BE
+            let units: Vec<u16> = payload
+                .chunks_exact(2)
+                .map(|c| ((c[0] as u16) << 8) | c[1] as u16)
+                .collect();
+            String::from_utf16_lossy(&units).trim().to_string()
+        }
+        _ => String::from_utf8_lossy(payload).trim().to_string(),
+    }
+}
+
+/// Freeform tag (`----:com.apple.iTunes:LYRICS`), keyed by its `name`.
+fn mp4_freeform(moov: &[u8], name: &[u8]) -> String {
+    let (body, len) = mp4_ilst(moov).unwrap_or((0, 0));
+    let end = (body + len).min(moov.len());
+    let mut off = body;
+    while off + 8 <= end {
+        let size = be32(&moov[off..off + 4]) as usize;
+        if size < 8 || off + size > end {
+            break;
+        }
+        if &moov[off + 4..off + 8] == b"----" {
+            let atom_end = off + size;
+            let mut inner = off + 8;
+            let mut hit = false;
+            while inner + 8 <= atom_end {
+                let isize = be32(&moov[inner..inner + 4]) as usize;
+                if isize < 8 || inner + isize > atom_end {
+                    break;
+                }
+                let kind = &moov[inner + 4..inner + 8];
+                if kind == b"name" {
+                    let skip = if isize >= 12 { 12 } else { 8 };
+                    let val = &moov[inner + skip..inner + isize];
+                    if val.eq_ignore_ascii_case(name) {
+                        hit = true;
+                    }
+                } else if kind == b"data" && hit && isize >= 16 {
+                    let payload = &moov[inner + 16..inner + isize];
+                    return String::from_utf8_lossy(payload).trim().to_string();
+                }
+                inner += isize;
+            }
+        }
+        off += size;
+    }
+    String::new()
+}
+
+/// Embedded artwork (`covr`): JPEG/PNG bytes, the same shape as the other
+/// formats hand to decode_cover_rgba.
+fn mp4_cover(moov: &[u8]) -> Option<Vec<u8>> {
+    let atom = mp4_atom(moov, b"covr")?;
+    let (_, payload) = mp4_atom_data(moov, atom)?;
+    if payload.is_empty() {
+        return None;
+    }
+    image_payload(payload).or_else(|| Some(payload.to_vec()))
+}
+
+fn mp4_lyrics(moov: &[u8]) -> String {
+    let l = mp4_text(moov, b"\xa9lyr");
+    if !l.trim().is_empty() {
+        return l;
+    }
+    mp4_freeform(moov, b"LYRICS")
+}
+
 fn decode_cover_rgba(art: &[u8]) -> Option<Vec<u8>> {
     let mut ptr: *mut u8 = core::ptr::null_mut();
     let mut w: i32 = 0;
@@ -614,6 +862,20 @@ fn fnv64(data: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+/// Embedded artwork for any supported format.  M4A keeps its tags inside moov,
+/// which may sit at the end of the file, so that format is read through the box
+/// chain instead of the fixed prefix the other formats use.
+fn cover_bytes(path: &str) -> Option<Vec<u8>> {
+    let prefix = read_prefix(path);
+    if is_mp4(&prefix) {
+        let moov = mp4_moov(path);
+        if !moov.is_empty() {
+            return mp4_cover(&moov);
+        }
+    }
+    extract_cover_bytes(&prefix)
 }
 
 fn cover_cache_path(path: &str) -> Option<String> {
@@ -681,11 +943,7 @@ pub(crate) fn upload_cover(path: &str) -> i32 {
     let rgba = match cached {
         Some(v) => v,
         None => {
-            let prefix = read_prefix(path);
-            if prefix.is_empty() {
-                return -1;
-            }
-            let art = match extract_cover_bytes(&prefix) {
+            let art = match cover_bytes(path) {
                 Some(a) => a,
                 None => return -1,
             };
@@ -718,6 +976,35 @@ pub(crate) fn tags_json(path: &str) -> String {
     let bytes = read_prefix(path);
     if bytes.is_empty() {
         return "{\"title\":\"\",\"artist\":\"\",\"album\":\"\",\"cover\":false}".into();
+    }
+    /* M4A: the fourcc-keyed ilst atoms, read from moov wherever it lives. */
+    if is_mp4(&bytes) {
+        let moov = mp4_moov(path);
+        let (title, artist, album, cover, lyrics) = if moov.is_empty() {
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                false,
+                String::new(),
+            )
+        } else {
+            (
+                mp4_text(&moov, b"\xa9nam"),
+                mp4_text(&moov, b"\xa9ART"),
+                mp4_text(&moov, b"\xa9alb"),
+                mp4_cover(&moov).is_some(),
+                mp4_lyrics(&moov),
+            )
+        };
+        return format!(
+            "{{\"title\":\"{}\",\"artist\":\"{}\",\"album\":\"{}\",\"cover\":{},\"lyrics\":\"{}\"}}",
+            super::json_escape(&title),
+            super::json_escape(&artist),
+            super::json_escape(&album),
+            if cover { "true" } else { "false" },
+            super::json_escape(&lyrics)
+        );
     }
     let mut title = extract_id3_text(&bytes, b"TIT2");
     let mut artist = extract_id3_text(&bytes, b"TPE1");

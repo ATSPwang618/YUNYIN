@@ -11,7 +11,7 @@
 use alloc::format;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-use crate::media::log;
+use crate::media::platform::log;
 
 /// SCE_SHELL_UTIL_LOCK_TYPE_PS_BTN
 const LOCK_PS_BTN: i32 = 0x1;

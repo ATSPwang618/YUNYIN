@@ -3,25 +3,34 @@
 //! All formats decode in-process (`yplayer.c`) and play through the Vita BGM
 //! port (ElevenMPVScrobbling path). Sound belongs to this process, so tearing
 //! the LiveArea bubble stops playback without a QUIT watchdog.
+//!
+//! Layout:
+//!
+//! ```text
+//! bgm.rs decoder.rs bridge.rs tags.rs   the player (audio thread, FFI, JS, tags)
+//! source/ net/ provider/                the audio engine seam (see docs/ARCHITECTURE.md)
+//! platform/                             power, PS-key lock, fs, log, settings
+//! ui/                                   CJK streaming, font atlas, frame skip
+//! ```
 
 use alloc::string::String;
 
 pub mod bgm;
 mod bridge;
-mod cjk_host;
 mod decoder;
-mod fs;
-mod font_gpu;
-mod frame_skip;
-mod log;
-pub mod offload_local;
-mod power;
-mod ps_lock;
-mod store;
+pub mod net;
+mod platform;
+pub mod provider;
+pub mod source;
 mod tags;
+mod ui;
 
-pub use font_gpu::refresh_font_atlases;
-pub use frame_skip::frame_changed;
+/* Explicit re-exports: the PocketJS host calls these by name, and the rest of
+ * the tree keeps using the short paths (`log`, `ps_lock`, ...) it always did. */
+pub use platform::{fs, log, power, ps_lock, store};
+pub use ui::{cjk_host, font_gpu, frame_skip, offload_local};
+pub use ui::font_gpu::refresh_font_atlases;
+pub use ui::frame_skip::frame_changed;
 
 pub(crate) const COVER_PX: u32 = 256;
 pub(crate) const MAX_ART: usize = 1024 * 1024;

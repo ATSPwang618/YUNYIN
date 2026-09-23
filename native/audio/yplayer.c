@@ -12,9 +12,20 @@
 #define DR_FLAC_IMPLEMENTATION
 #include "vendor/dr_flac.h"
 #include "vendor/opus/opusfile.h"
+#include "ym4a.h"
+#include "yaac.h"
+#include "host/yunyin_log.h"
+
+/* One decoded AAC frame is 1024 samples (2048 with SBR); the hardware decoder
+ * never emits more than SCE_AUDIODEC_AAC_MAX_SAMPLES per access unit. */
+#define YP_AAC_MAX_FRAMES 2048
+
+/* Opus is always handed to us as stereo at 48 kHz.  opusfile's own docs
+ * recommend a 120 ms block, which is what the carry buffer is sized for. */
+#define YP_OPUS_CARRY_FRAMES 5760
 
 typedef struct {
-  int fmt;   /* 0 none, 1 mp3, 2 ogg, 3 wav, 4 flac, 5 opus */
+  int fmt;   /* 0 none, 1 mp3, 2 ogg, 3 wav, 4 flac, 5 opus, 6 m4a */
   int rate;  /* native source rate */
   int ch;    /* native source channels (1 or 2) */
   mpg123_handle *mp3;
@@ -26,6 +37,19 @@ typedef struct {
   drflac *flac;
   unsigned long long flac_frames;
   OggOpusFile *of;
+  /* Opus carry buffer: op_read/op_read_stereo give out at most a full packet
+   * per call, so we decode a big block once and drain it over several output
+   * buffers (see yp_opus_decode). */
+  short opus_pcm[YP_OPUS_CARRY_FRAMES * 2];
+  int opus_len;
+  int opus_pos;
+  long long opus_played; /* frames already handed to the output */
+  /* M4A: the demuxer hands out one AAC access unit, the hardware decoder turns
+   * it into PCM, and the player drains that PCM over several output buffers. */
+  short m4a_pcm[YP_AAC_MAX_FRAMES * 2];
+  int m4a_pcm_len;
+  int m4a_pcm_pos;
+  long long m4a_pos; /* last reported position, for the gap before a decode */
   unsigned char *cover;
   size_t cover_len;
 } yp_state;
@@ -38,6 +62,8 @@ static void yp_clear(void) {
   if (g.wav_ok) { drwav_uninit(&g.wav); g.wav_ok = 0; }
   if (g.flac) { drflac_close(g.flac); g.flac = NULL; }
   if (g.of) { op_free(g.of); g.of = NULL; }
+  yaac_close();
+  ym4a_close();
   if (g.cover) { free(g.cover); g.cover = NULL; }
   g.cover_len = 0;
   g.rate = 0;
@@ -45,6 +71,12 @@ static void yp_clear(void) {
   g.fmt = 0;
   g.wav_frames = 0;
   g.flac_frames = 0;
+  g.opus_len = 0;
+  g.opus_pos = 0;
+  g.opus_played = 0;
+  g.m4a_pcm_len = 0;
+  g.m4a_pcm_pos = 0;
+  g.m4a_pos = 0;
 }
 
 /* -------- MP3 (mpg123) -------- */
@@ -193,32 +225,159 @@ static int opus_open(const char *p) {
   g.of = op_open_file(p, &err);
   if (!g.of) return -1;
   g.rate = 48000; /* opus decodes at 48 kHz; BGM port opens at this native rate */
-  g.ch = op_channel_count(g.of, -1) >= 2 ? 2 : 1;
+  /* Always stereo out: op_read_stereo downmixes mono and multichannel sources,
+   * which is also what the reference Vita backend does. */
+  g.ch = 2;
+  g.opus_len = 0;
+  g.opus_pos = 0;
+  g.opus_played = 0;
   g.fmt = 5;
   return 0;
 }
 
-/* op_read 同理：一次一个 packet（2.5–60ms），也要循环补齐整个缓冲区。 */
+/*
+ * Opus decoding, shaped like the reference Vita backend.
+ *
+ * Two things about the opusfile API are easy to get wrong, and both have real
+ * consequences:
+ *
+ *   - `_buf_size` counts VALUES (frames x channels); the return value counts
+ *     frames.  Passing a frame count as the buffer size makes every call a
+ *     tiny one — down to a single value at the tail of an output block.
+ *   - A call whose buffer cannot hold one full frame answers 0.  The caller
+ *     (bgm.rs) fills the rest of the block with silence, so that becomes a
+ *     one-sample hole at an audible cadence — the "warble" this fixes.
+ *
+ * So: pull a whole 120 ms block into the carry buffer with one call, and drain
+ * it across however many output buffers that takes.
+ */
+static int opus_fill(void) {
+  int n = op_read_stereo(g.of, g.opus_pcm, YP_OPUS_CARRY_FRAMES * 2);
+  if (n <= 0) return 0;
+  if (n > YP_OPUS_CARRY_FRAMES) n = YP_OPUS_CARRY_FRAMES;
+  g.opus_len = n;
+  g.opus_pos = 0;
+  return 1;
+}
+
 static int yp_opus_decode(short *buf, int max_frames) {
+  int done = 0;
   if (max_frames <= 0) return 0;
-  short pcm[1024 * 2];
-  int frames = 0;
-  while (frames < max_frames) {
-    int want = max_frames - frames;
-    if (want > 1024) want = 1024;
-    int n = op_read(g.of, pcm, want, NULL);
-    if (n <= 0) break;
+  while (done < max_frames) {
+    int avail, want;
+    if (g.opus_pos >= g.opus_len && !opus_fill()) break;
+    avail = g.opus_len - g.opus_pos;
+    want = max_frames - done;
+    if (want > avail) want = avail;
+    if (want <= 0) break;
+    memcpy(buf + done * 2, g.opus_pcm + g.opus_pos * 2, (size_t)want * 4);
+    g.opus_pos += want;
+    done += want;
+  }
+  g.opus_played += done;
+  return done;
+}
+
+/* -------- M4A / AAC (ym4a + hardware SceAudiodec) -------- */
+
+static int m4a_open(const char *p) {
+  int rc = ym4a_open(p);
+  if (rc != YM4A_OK) {
+    char msg[64];
+    snprintf(msg, sizeof msg, "yplayer: ym4a_open rc=%d\n", rc);
+    yunyin_log(msg);
+    return -1;
+  }
+  g.rate = ym4a_rate();
+  g.ch = ym4a_channels(); /* 1 or 2; mono is doubled up in m4a_decode */
+
+  /* isSbr=1 unconditionally: the access unit carries no SBR flag, and both
+   * public Vita references pass 1.  With AAC-LC the decoder still returns 1024
+   * frames per unit, so this is a capability hint rather than a forced
+   * upsample — and the real output size is read back from the decoder. */
+  if (yaac_open(ym4a_channels(), ym4a_rate(), 0, 1) != 0) {
+    yunyin_log("yplayer: yaac_open failed\n");
+    ym4a_close();
+    return -1;
+  }
+  {
+    char msg[128];
+    snprintf(msg, sizeof msg,
+             "yplayer: m4a %s rate=%d ch=%d aot=%d sbr=%d samples=%d\n",
+             ym4a_codec_name(), g.rate, g.ch, ym4a_object_type(), ym4a_sbr(),
+             ym4a_sample_count());
+    yunyin_log(msg);
+  }
+  g.m4a_pcm_len = 0;
+  g.m4a_pcm_pos = 0;
+  g.m4a_pos = 0;
+  g.fmt = 6;
+  return 0;
+}
+
+/* PCM frame of the sample currently in the PCM buffer, plus what has already
+ * been drained out of it. */
+static long long m4a_position(void) {
+  int idx = ym4a_cur_sample();
+  if (idx < 0) return g.m4a_pos;
+  return ym4a_sample_start_frame(idx) + (long long)g.m4a_pcm_pos;
+}
+
+/* Pull one access unit from the container and decode it.  A frame the decoder
+ * rejects is skipped and logged, with a small retry budget: one damaged AAC
+ * frame should cost a few milliseconds of audio, not the rest of the song. */
+static int m4a_fill(void) {
+  unsigned char au[YAAC_ES_CAP];
+  int n, got, failures = 0;
+  while (failures < 4) {
+    n = ym4a_next_sample(au, (int)sizeof au);
+    if (n <= 0) return 0; /* end of track (or unreadable sample) */
+    got = yaac_decode(au, n, g.m4a_pcm, YP_AAC_MAX_FRAMES);
+    if (got < 0) {
+      failures++;
+      continue;
+    }
+    if (got == 0) continue; /* decoder had nothing to emit for this frame */
+    /* The last unit is usually padded out: trim it to the duration the
+     * container declares so position and length agree.  Only the final unit is
+     * trimmed — mid-track output is trusted as-is. */
+    if (ym4a_cur_sample() == ym4a_sample_count() - 1) {
+      int declared = ym4a_sample_frames(ym4a_cur_sample());
+      if (declared > 0 && declared < got) got = declared;
+    }
+    g.m4a_pcm_len = got;
+    g.m4a_pcm_pos = 0;
+    return 1;
+  }
+  yunyin_log("yplayer: AAC decode gave up on this track\n");
+  return 0;
+}
+
+static int m4a_decode(short *buf, int max_frames) {
+  int done = 0;
+  if (max_frames <= 0) return 0;
+  while (done < max_frames) {
+    int avail, want, i;
+    if (g.m4a_pcm_pos >= g.m4a_pcm_len && !m4a_fill()) break;
+    avail = g.m4a_pcm_len - g.m4a_pcm_pos;
+    want = max_frames - done;
+    if (want > avail) want = avail;
+    if (want <= 0) break;
     if (g.ch == 1) {
-      for (int i = 0; i < n; i++) {
-        buf[(frames + i) * 2] = pcm[i];
-        buf[(frames + i) * 2 + 1] = pcm[i];
+      for (i = 0; i < want; i++) {
+        short s = g.m4a_pcm[g.m4a_pcm_pos + i];
+        buf[(done + i) * 2] = s;
+        buf[(done + i) * 2 + 1] = s;
       }
     } else {
-      memcpy(buf + frames * 2, pcm, (size_t)n * 4);
+      memcpy(buf + done * 2, g.m4a_pcm + g.m4a_pcm_pos * 2,
+             (size_t)want * 4);
     }
-    frames += n;
+    g.m4a_pcm_pos += want;
+    done += want;
   }
-  return frames;
+  if (done > 0) g.m4a_pos = m4a_position();
+  return done;
 }
 
 /* -------- public -------- */
@@ -236,6 +395,10 @@ int yp_open(const char *path) {
   if (strstr(lo, ".wav")) return wav_open(path);
   if (strstr(lo, ".flac")) return flac_open(path);
   if (strstr(lo, ".opus") || strstr(lo, ".oga")) return opus_open(path);
+  /* M4A is the container; the audio inside is AAC.  `.mp4`/`.m4b` are accepted
+   * too — the demuxer always picks the `soun` track. */
+  if (strstr(lo, ".m4a") || strstr(lo, ".m4b") || strstr(lo, ".mp4"))
+    return m4a_open(path);
   return -1;
 }
 
@@ -249,6 +412,7 @@ int yp_decode(short *buf, int max_frames) {
     case 3: return wav_decode(buf, max_frames);
     case 4: return flac_decode(buf, max_frames);
     case 5: return yp_opus_decode(buf, max_frames);
+    case 6: return m4a_decode(buf, max_frames);
     default: return 0;
   }
 }
@@ -276,7 +440,17 @@ int yp_seek(long long frame) {
       return 0;
     case 5:
       if (!g.of) return -1;
-      return op_pcm_seek(g.of, (ogg_int64_t)frame) == 0 ? 0 : -1;
+      if (op_pcm_seek(g.of, (ogg_int64_t)frame) != 0) return -1;
+      g.opus_len = 0;
+      g.opus_pos = 0;
+      g.opus_played = frame;
+      return 0;
+    case 6:
+      if (ym4a_seek_frame(frame) != 0) return -1;
+      g.m4a_pcm_len = 0;
+      g.m4a_pcm_pos = 0;
+      g.m4a_pos = frame;
+      return 0;
   }
   return -1;
 }
@@ -286,7 +460,10 @@ long long yp_position(void) {
   if (g.fmt == 2 && g.vf_ok) return (long long)ov_pcm_tell(&g.vf);
   if (g.fmt == 3 && g.wav_ok) return (long long)g.wav_frames;
   if (g.fmt == 4 && g.flac) return (long long)g.flac_frames;
-  if (g.fmt == 5 && g.of) return (long long)op_pcm_tell(g.of);
+  /* Played frames, not op_pcm_tell: the carry buffer runs up to 120 ms ahead
+   * of what the output has actually consumed. */
+  if (g.fmt == 5) return g.opus_played;
+  if (g.fmt == 6) return m4a_position();
   return 0;
 }
 
@@ -296,6 +473,7 @@ long long yp_length(void) {
   if (g.fmt == 3 && g.wav_ok) return (long long)g.wav.totalPCMFrameCount;
   if (g.fmt == 4 && g.flac) return (long long)g.flac->totalPCMFrameCount;
   if (g.fmt == 5 && g.of) return (long long)op_pcm_total(g.of, -1);
+  if (g.fmt == 6) return ym4a_total_frames();
   return 0;
 }
 

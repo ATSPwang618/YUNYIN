@@ -15,7 +15,11 @@ extern "C" {
  *   - cover() returns a pointer to embedded JPEG/PNG bytes (0 if none)
  *
  * Formats: MP3 (mpg123), OGG (vorbisfile), WAV (dr_wav),
- *          FLAC (dr_flac), OPUS (opusfile).
+ *          FLAC (dr_flac), OPUS (opusfile), M4A/AAC (ym4a.c + yaac.c).
+ *
+ * M4A is a container, not a codec: `ym4a.c` walks the MP4 boxes and hands out
+ * the raw AAC access units stored in `mdat`, `yaac.c` decodes them on the
+ * Vita's hardware AAC block.  Nothing here needs FFmpeg.
  */
 int  yp_open(const char *path);
 int  yp_rate(void);

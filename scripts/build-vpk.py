@@ -11,7 +11,8 @@ End-to-end pipeline:
   6. repack the VPK with the app's TITLE_ID
 
 Requires (inside the WSL2 distro):
-  * VitaSDK  at /opt/vitasdk   (must include libSceAudiodec_stub.a)
+  * VitaSDK  at /opt/vitasdk   (must include libSceAudiodec_stub.a and
+                               libSceSysmem_stub.a — M4A/AAC needs both)
   * bun      at /root/.bun/bin/bun
   * the PocketJS framework checkout at /root/pocketjs
 
@@ -46,7 +47,7 @@ APP_ID = "yunyin-main"                         # pocket.json -> app.output（框
 OUT = os.environ.get("YUNYIN_OUT", APP_ID)
 APP_TITLE = "云音"                             # param.sfo TITLE（LiveArea 气泡下方显示名）
 # param.sfo 里的 APP_VER（VitaShell 里看到的版本号），发布新版本时改这里
-APP_VER = os.environ.get("YUNYIN_APP_VER", "00.63")
+APP_VER = os.environ.get("YUNYIN_APP_VER", "00.66")
 TITLE_ID = os.environ.get("YUNYIN_TITLE_ID", "")  # 留空 = 用 app/catalog.ts 的 TITLE_ID / PF2A47F97
 THEME = os.environ.get("YUNYIN_THEME", "dark")  # 皮肤主题：light / dark / pure / anime
 # 默认 Noto Sans SC。日文曲库才切 MSMINCHO：YUNYIN_FONT=japanese
@@ -370,12 +371,15 @@ def patch_host():
     c = cargo.read_text()
     if "[build-dependencies]" not in c:
         c += "\n[build-dependencies]\ncc = \"1\"\n"
-    # Drop leftover audiodec feature from older YUNYIN host patches
-    # (SceShellSvc IS needed now: sceShellUtilLock/Unlock 用来锁 PS 键).
-    c = c.replace('"SceAudiodec_stub", ', "")
-    # 需要的 stub：ScePower（power tick）/ SceAppMgr（BGM 口）/ SceShellSvc（锁 PS 键）。
+    # 需要的 stub：
+    #   ScePower      电源 tick
+    #   SceAppMgr     BGM 口（sceAppMgrAcquireBgmPort）
+    #   SceShellSvc   锁 PS 键（sceShellUtilLock/Unlock）
+    #   SceAudiodec   M4A 里的 AAC 硬件解码（sceAudiodecInitLibrary/CreateDecoder/Decode）
+    #   SceSysmem     上面那条要的 uncached memblock（sceKernelAllocMemBlock 等）
     # 逐个补进 features 列表，重复构建也安全。
-    for needed in ("ScePower_stub", "SceAppMgr_stub", "SceShellSvc_stub"):
+    for needed in ("ScePower_stub", "SceAppMgr_stub", "SceShellSvc_stub",
+                   "SceAudiodec_stub", "SceSysmem_stub"):
         if f'"{needed}"' not in c:
             c = c.replace(
                 'vitasdk-sys = { version = "0.3.3", features = [',
@@ -389,9 +393,17 @@ def patch_host():
     if "use std::path::{Path, PathBuf};" not in b:
         b = "use std::path::{Path, PathBuf};\n" + b
     marker = '    println!("cargo:rerun-if-env-changed=POCKETJS_CAPTURE_DIR");'
+    # Rewrite the native block unless it already matches exactly what this
+    # project ships.  An older experiment left the PocketJS checkout's block
+    # referencing ym4a.c/yhttp.c files that stage() had already deleted, so the
+    # stale block simply broke the next build; comparing against every file we
+    # ship keeps the two in step.
     needs_cc = (
-        "yunyin_listdir.c" not in b
-        or "yplayer.c" not in b
+        "host/yunyin_listdir.c" not in b
+        or "audio/yplayer.c" not in b
+        or "audio/ym4a.c" not in b
+        or "audio/yaac.c" not in b
+        or "yhttp.c" in b
         or "yunyin_shellsvc_stub.S" in b
         or "empva_bridge" in b
         or "taihen_loader" in b
@@ -410,11 +422,26 @@ def patch_host():
             '\n', b, flags=re.S)
         blocks = (
             '\n    { let native = Path::new("native");'
-            '\n      cc::Build::new().file(native.join("yplayer.c")).include(native)'
+            # C sources are grouped: audio/ (player + M4A + AAC hardware),
+            # host/ (image + directory listing + the shared log helper).
+            # Both folders are include roots so a file can say "ym4a.h"
+            # (same folder) or "vendor/dr_wav.h" (native/ root).
+            '\n      let audio = native.join("audio");'
+            '\n      let host = native.join("host");'
+            '\n      cc::Build::new().file(audio.join("yplayer.c"))'
+            '.include(native).include(&audio).include(&host)'
             '.define("YPLAYER", None).compile("yplayer");'
-            '\n      cc::Build::new().file(native.join("yunyin_image.c")).include(native)'
+            '\n      cc::Build::new().file(audio.join("ym4a.c"))'
+            '.include(native).include(&audio).include(&host)'
+            '.compile("ym4a");'
+            '\n      cc::Build::new().file(audio.join("yaac.c"))'
+            '.include(native).include(&audio).include(&host)'
+            '.compile("yaac");'
+            '\n      cc::Build::new().file(host.join("yunyin_image.c"))'
+            '.include(native).include(&host)'
             '.define("STBI_NO_STDIO", None).compile("yunyin_image");'
-            '\n      cc::Build::new().file(native.join("yunyin_listdir.c")).include(native)'
+            '\n      cc::Build::new().file(host.join("yunyin_listdir.c"))'
+            '.include(native).include(&host)'
             '.compile("yunyin_listdir");'
             '\n      println!("cargo:rustc-link-lib=mpg123");'
             '\n      println!("cargo:rustc-link-lib=vorbisfile");'
@@ -423,9 +450,8 @@ def patch_host():
             '\n      println!("cargo:rustc-link-lib=opusfile");'
             '\n      println!("cargo:rustc-link-lib=opus");'
             '\n      println!("cargo:rustc-link-search=native/libs");'
-            '\n      println!("cargo:rerun-if-changed=native/yplayer.c");'
-            '\n      println!("cargo:rerun-if-changed=native/yunyin_image.c");'
-            '\n      println!("cargo:rerun-if-changed=native/yunyin_listdir.c");'
+            '\n      println!("cargo:rerun-if-changed=native/audio");'
+            '\n      println!("cargo:rerun-if-changed=native/host");'
             '\n      println!("cargo:rerun-if-changed=native/vendor");'
             '\n    }'
         )
@@ -923,7 +949,7 @@ def patch_font_gpu():
     else:
         print("[build-vpk] main.rs refresh_font_atlases already patched")
 
-    # 画面内容没变就跳过这一帧的 render+present（见 native/rs/frame_skip.rs）。
+    # 画面内容没变就跳过这一帧的 render+present（见 native/rs/ui/frame_skip.rs）。
     old_present = (
         "        pocketjs_vita::media::refresh_font_atlases();\n"
         "        runtime.render();\n"
@@ -1426,6 +1452,19 @@ if __name__ == "__main__":
                 repack()
                 break
             except subprocess.CalledProcessError:
+                # Only alignment problems are worth another relink.  A compile
+                # error used to keep this loop spinning through all 24 attempts
+                # (10+ minutes) and then blame the SCE header; ask
+                # vita-elf-create directly and re-raise anything else.
+                elf = (PKJ / "hosts/vita/target/armv7-sony-vita-newlibeabihf"
+                       / "release/pocketjs-vita.elf")
+                probe = subprocess.run(
+                    [f"{VITASDK}/bin/vita-elf-create", str(elf), "/tmp/elf-probe.velf"],
+                    capture_output=True)
+                if probe.returncode == 0:
+                    raise SystemExit(
+                        "[build-vpk] the ELF itself is fine, so the failure above "
+                        "is not an SCE alignment problem — fix that error first")
                 continue
         else:
             raise SystemExit("[build-vpk] SCE alignment still failing after retries")

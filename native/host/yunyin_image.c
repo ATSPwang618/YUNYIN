@@ -5,7 +5,7 @@
 #define STBI_ONLY_JPEG
 #define STBI_ONLY_PNG
 #define STBI_NO_THREAD_LOCALS
-#include "stb_image.h"
+#include "vendor/stb_image.h"
 
 #include <stdint.h>
 #include <stdlib.h>

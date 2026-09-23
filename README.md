@@ -14,12 +14,14 @@
 - **进应用默认是暂停**，按 **○** 才开始放。
 - 四套主题、逐句同步的歌词，封面 / 歌手 / 专辑全都读音频内嵌标签。
 - 中日两套字形，外加**流式 CJK**：常用字烘焙进包里，生僻字按需从后台加载。
+- **M4A 也能放**（网易云下载的那种 `.m4a`）。M4A 只是盒子，里面装的是 AAC：
+  播放器自己拆盒子、把 AAC 交给 Vita 的硬件解码器，不需要 FFmpeg，也不用转码。
 
 |  |  |
 | --- | --- |
-| 当前版本 | **0.63** —— [下载 / 历史版本](https://github.com/ATSPwang618/YUNYIN/releases) |
+| 当前版本 | **0.66** —— [下载 / 历史版本](https://github.com/ATSPwang618/YUNYIN/releases) |
 | 曲库目录 | `ux0:/data/yunyin/music`（可以分子文件夹，最多 240 首） |
-| 音频格式 | MP3（最推荐） / OGG / WAV / FLAC / OPUS |
+| 音频格式 | MP3（最推荐） / M4A（AAC） / OGG / WAV / FLAC / OPUS |
 | 界面 | 首页播放器 · 全部曲目 · 专辑 · 收藏 · 设置 |
 | 主题 | LIGHT / DARK / PURE / ANIME 四套，**默认 DARK** |
 
@@ -99,10 +101,13 @@ Release 里有一个 **`YUNYIN-TagCheck.exe`**（Windows，免安装），把 mp
 | MP3 标签编码字节写着 Latin-1，里面却塞 GBK / Big5 字节（国内工具常见） | 中文全变乱码 |
 | 只有文件尾那种老式 ID3v1，或者压根没有标签 | 只显示文件名，歌手 `Local`、专辑 `Unknown` |
 | 封面不是内嵌的 JPEG / PNG，或体积超过 1MB | 显示默认封面 |
+| M4A 是 ALAC（无损）而不是 AAC | 放不了（只支持 M4A 里的 AAC） |
 
 ### 自己想写标签时的规范建议
 
 - MP3：ID3v2.3 / 2.4，文字用 **UTF-8**（或带 BOM 的 UTF-16）
+- M4A：MP4 的 `ilst` 标签（`©nam` / `©ART` / `©alb` / `covr` / `©lyr`），
+  编码用 AAC-LC 最稳；moov 在文件头或文件尾都能读
 - FLAC / OGG / OPUS：Vorbis comment（UTF-8），键名用 TITLE / ARTIST / ALBUM / LYRICS
 - 封面：内嵌 JPEG 或 PNG，建议 500×500 以内、**不要超过 1MB**
 - 歌词：内嵌（ID3 的 USLT、Vorbis 的 LYRICS），带时间轴更佳（LRC 格式）
@@ -115,6 +120,33 @@ Release 里有一个 **`YUNYIN-TagCheck.exe`**（Windows，免安装），把 mp
 1. 在卡里 `ux0:/data/yunyin/` 下建一个**空文件**，名字就叫 `debug`（不要扩展名）。
 2. 重新打开云音，日志会写进 `ux0:data/yunyin.log`。
 3. 抓完把 `debug` 删掉，下次启动就又不写了。
+
+## 代码结构
+
+```text
+app/                 PocketJS 界面（Solid + TSX），曲库扫描、播放控制、歌词
+native/              C 侧
+  audio/            yplayer.c（六个格式的解码循环）
+                    ym4a.c + yaac.c（M4A 解复用 + SceAudiodec 硬件 AAC）
+  host/             目录列举、图片解码、日志（单一实现，共用）
+  vendor/           第三方头文件（stb_image / dr_wav / dr_flac / opus）
+  libs/             预编译静态库（mpg123 / vorbis / opus / ogg）
+native/rs/           Rust 宿主
+  bgm.rs            BGM 口生命周期 + 音频线程（960 帧模型）
+  decoder.rs        yplayer.c 的 FFI
+  bridge.rs         globalThis.vitaMedia 绑定（含 panic 防护）
+  tags.rs           本地标签 / 封面（MP3·FLAC·OGG·OPUS·M4A）
+  source/ net/ provider/   ← 播放引擎模块化接缝（本地 + 流媒体同一入口）
+  platform/         电源、PS 键锁、文件、日志、设置
+  ui/               流式 CJK、字体图集、跳帧
+scripts/             构建、字体烘焙、标签体检工具
+docs/                架构说明与重构计划
+```
+
+流媒体方向的架构与第一阶段计划见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+和 [docs/REFACTOR_PLAN.md](docs/REFACTOR_PLAN.md)：核心是一条
+`AudioSource → Decoder → 现有 BGM 输出` 的接缝，上层不认识 HTTP，
+下层不认识网易云；本地六个格式保持现状不动。
 
 ## 自行构建
 

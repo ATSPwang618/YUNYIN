@@ -7,7 +7,7 @@ use core::ffi::c_char;
 use libquickjs_sys::*;
 
 use crate::ffi::{add_fn, ui};
-use crate::media::offload_local;
+use crate::media::ui::offload_local;
 
 extern "C" {
     fn JS_ParseJSON(

@@ -9,7 +9,7 @@
 //! no host `crate::audio`, no QUIT watchdog.
 
 use crate::media::decoder;
-use crate::media::log;
+use crate::media::platform::log;
 use alloc::format;
 use alloc::string::String;
 use core::ffi::c_void;

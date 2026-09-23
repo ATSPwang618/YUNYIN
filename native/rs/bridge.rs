@@ -1,6 +1,7 @@
 //! `globalThis.vitaMedia` QuickJS bindings. Method names are a frozen contract.
 
-use crate::media::{bgm, fs, log, store, tags};
+use crate::media::platform::{fs, log, store};
+use crate::media::{bgm, tags};
 use alloc::string::String;
 use libquickjs_sys::*;
 
@@ -33,6 +34,24 @@ unsafe fn js_str(ctx: *mut JSContext, s: &str) -> JSValue {
     JS_NewStringLen(ctx, s.as_ptr(), s.len())
 }
 
+/// Run `body` with panics contained.
+///
+/// A Rust panic must never unwind out of an `extern "C"` callback: QuickJS's
+/// frames carry no unwind tables, so the unwinder walks off into whatever
+/// memory follows.  That is not theoretical — a `&str` slice panic while
+/// reading an OGG tag landed the program counter inside the app's own JS
+/// bundle string on real hardware ("undefined instruction exception").
+/// Anything the native side can trip over now degrades to `fallback` instead.
+fn guarded<T>(what: &str, fallback: T, body: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(v) => v,
+        Err(_) => {
+            log::append(&format!("media: caught panic in {what}"));
+            fallback
+        }
+    }
+}
+
 unsafe extern "C" fn js_list(
     ctx: *mut JSContext,
     _this: JSValue,
@@ -40,7 +59,7 @@ unsafe extern "C" fn js_list(
     argv: *mut JSValue,
 ) -> JSValue {
     let path = arg_string(ctx, argc, argv, 0);
-    js_str(ctx, &fs::list_dir(&path))
+    js_str(ctx, &guarded("list", String::new(), || fs::list_dir(&path)))
 }
 
 unsafe extern "C" fn js_roots(
@@ -49,7 +68,7 @@ unsafe extern "C" fn js_roots(
     _argc: i32,
     _argv: *mut JSValue,
 ) -> JSValue {
-    js_str(ctx, fs::roots_json())
+    js_str(ctx, guarded("roots", "", fs::roots_json))
 }
 
 unsafe extern "C" fn js_play(
@@ -100,7 +119,7 @@ unsafe extern "C" fn js_state(
     _argc: i32,
     _argv: *mut JSValue,
 ) -> JSValue {
-    js_str(ctx, &bgm::state_json())
+    js_str(ctx, &guarded("state", String::new(), bgm::state_json))
 }
 
 unsafe extern "C" fn js_cover(
@@ -110,7 +129,7 @@ unsafe extern "C" fn js_cover(
     argv: *mut JSValue,
 ) -> JSValue {
     let path = arg_string(ctx, argc, argv, 0);
-    JS_NewInt32(ctx, tags::upload_cover(&path))
+    JS_NewInt32(ctx, guarded("cover", -1, || tags::upload_cover(&path)))
 }
 
 unsafe extern "C" fn js_tags(
@@ -120,7 +139,7 @@ unsafe extern "C" fn js_tags(
     argv: *mut JSValue,
 ) -> JSValue {
     let path = arg_string(ctx, argc, argv, 0);
-    js_str(ctx, &tags::tags_json(&path))
+    js_str(ctx, &guarded("tags", String::new(), || tags::tags_json(&path)))
 }
 
 unsafe extern "C" fn js_log(
@@ -156,7 +175,7 @@ unsafe extern "C" fn js_set_ps_lock(
     if argc > 0 {
         unsafe { JS_ToInt32(ctx, &mut on, *argv) };
     }
-    let ret = crate::media::ps_lock::set_locked(on != 0);
+    let ret = crate::media::platform::ps_lock::set_locked(on != 0);
     JS_NewInt32(ctx, ret)
 }
 
@@ -167,7 +186,7 @@ unsafe extern "C" fn js_store_get(
     argv: *mut JSValue,
 ) -> JSValue {
     let key = arg_string(ctx, argc, argv, 0);
-    js_str(ctx, &store::get(&key))
+    js_str(ctx, &guarded("store_get", String::new(), || store::get(&key)))
 }
 
 unsafe extern "C" fn js_store_set(

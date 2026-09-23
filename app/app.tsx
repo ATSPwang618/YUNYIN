@@ -73,8 +73,8 @@ const logMsg = (m: string): void => {
  * ux0:/data/music（如 E:\data\music）即可被扫描到。不再扫整张卡。 */
 const LIB_MOUNTS = ["ux0:/data/yunyin/music"];
 
-/* 音频扩展名：mp3/ogg/wav + 原生支持的 flac/opus/ogg(x)。 */
-const AUDIO_RE = /\.(mp3|ogg|wav|flac|opus|oga)$/i;
+/* 音频扩展名：mp3/ogg/wav + 原生支持的 flac/opus/ogg(x) + m4a（里面是 AAC）。 */
+const AUDIO_RE = /\.(mp3|ogg|wav|flac|opus|oga|m4a)$/i;
 
 type FsEntry = { name: string; path: string; dir: boolean };
 
@@ -1111,7 +1111,7 @@ function scanLibrary(): Track[] {
  * onFrame 只从 backend 读当前位置。
  *
  * 优先级：
- *   1) 有 audioPath 且 host 挂了 vitaMedia：走 Vita 原生解码 (MP3/OGG/WAV)
+ *   1) 有 audioPath 且 host 挂了 vitaMedia：走 Vita 原生解码 (MP3/OGG/WAV/FLAC/OPUS/M4A)
  *   2) 否则墙钟模拟
  * ======================================================= */
 

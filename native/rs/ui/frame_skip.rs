@@ -11,7 +11,7 @@
 use alloc::format;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use crate::media::log;
+use crate::media::platform::log;
 
 static LAST_HASH: AtomicU64 = AtomicU64::new(0);
 static SEEN: AtomicBool = AtomicBool::new(false);

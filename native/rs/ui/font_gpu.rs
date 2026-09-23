@@ -17,7 +17,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use pocketjs_core::spec;
 
-use crate::media::log;
+use crate::media::platform::log;
 
 static LAST_REV: [AtomicU64; spec::MAX_FONT_SLOTS] =
     [const { AtomicU64::new(0) }; spec::MAX_FONT_SLOTS];
