@@ -19,7 +19,7 @@
 
 |  |  |
 | --- | --- |
-| 当前版本 | **0.66** —— [下载 / 历史版本](https://github.com/ATSPwang618/YUNYIN/releases) |
+| 当前版本 | **0.71** —— [下载 / 历史版本](https://github.com/ATSPwang618/YUNYIN/releases) |
 | 曲库目录 | `ux0:/data/yunyin/music`（可以分子文件夹，最多 240 首） |
 | 音频格式 | MP3（最推荐） / M4A（AAC） / OGG / WAV / FLAC / OPUS |
 | 界面 | 首页播放器 · 全部曲目 · 专辑 · 收藏 · 设置 |
@@ -129,6 +129,7 @@ native/              C 侧
   audio/            yplayer.c（六个格式的解码循环）
                     ym4a.c + yaac.c（M4A 解复用 + SceAudiodec 硬件 AAC）
   host/             目录列举、图片解码、日志（单一实现，共用）
+  net/              网络传输层（Phase 0 探针：HTTPS / Range / Cookie / 取消 / 内存）
   vendor/           第三方头文件（stb_image / dr_wav / dr_flac / opus）
   libs/             预编译静态库（mpg123 / vorbis / opus / ogg）
 native/rs/           Rust 宿主

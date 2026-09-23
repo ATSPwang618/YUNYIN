@@ -105,6 +105,7 @@ native/
 │              ym4a.c/.h（M4A 解复用）  yaac.c/.h（SceAudiodec 硬件 AAC）
 ├── host/      yunyin_listdir.c（目录列举） yunyin_image.c（图片解码）
 │              yunyin_log.h（唯一一份日志实现）
+├── net/       yhttp.c/.h（Phase 0 薄传输层：SceNet + SceSsl + SceHttp）
 ├── vendor/    stb_image.h  dr_wav.h  dr_flac.h  opus/
 ├── libs/      预编译静态库（mpg123 / vorbisfile / vorbis / ogg / opusfile / opus）
 └── rs/        Rust 宿主：bgm.rs decoder.rs bridge.rs tags.rs
@@ -116,7 +117,7 @@ native/
 | 模块 | 职责 | 现在 |
 | --- | --- | --- |
 | `rs/source/` | AudioSource 接缝、本地实现、HTTP Range 源、字节缓存 | 本地/缓存/接口已实现并测试；HTTP 源为 Phase 2 桩 |
-| `rs/net/` | 传输层（HTTP/TLS/Range/Cookie/取消），对应 `host` 上的 `yhttp.c` | 接口与类型已就位，实现待 Phase 0/2 |
+| `rs/net/` | 传输层（HTTP/TLS/Range/Cookie/取消）+ Phase 0 探针驱动 | 类型/接缝已就位；探针可实机运行，生产路径待 Phase 2 |
 | `rs/provider/` | Provider 接缝 + `AudioInfo` + 格式嗅探 | 已实现 |
 | `rs/provider/netease/` | 网易云 API/加密/账号/URL 缓存 | URL 缓存策略已实现，API 待 Phase 3 |
 | `rs/bgm.rs` | BGM 口生命周期 + 音频线程 | **不动** |

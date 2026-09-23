@@ -1,0 +1,141 @@
+# Phase 0 网络探针：怎么跑、看什么
+
+探针代码在 `native/net/yhttp.c`（薄传输层）+ `native/rs/net/probe.rs`（跑目标、写报告）。
+它**默认不运行**，只有卡里放了开关文件才跑。
+
+## 1. 打开
+
+两种方式，任选其一：
+
+```text
+A. 测内置目标（网易云 outer/url 链、favicon 的 Range/206、证书校验）
+   在卡里建空文件： ux0:/data/yunyin/debug
+
+B. 只测你自己的 URL
+   建文件 ux0:/data/yunyin/netprobe.url，内容两行：
+       第一行：完整的 https URL
+       第二行（可省略）：Referer
+```
+
+> 你卡里如果还留着 `ux0:/data/yunyin/debug`，装上包**启动就会自动跑一遍**并写报告。
+
+## 2. 拿报告
+
+```text
+ux0:data/yunyin-netprobe.log      ← 探针的完整报告（每行一条事实）
+ux0:data/yunyin.log               ← 同一批内容也会以 [net] 前缀进主日志
+```
+
+报告里每一轮都长这样：
+
+```text
+NET attempt   [range/206 on API host] tls=default range=bytes=0-2047 url=...
+NET result    status=206 bytes=2048 cl=... range=0-2047/... audio=... redirected=0 headers=... took=...ms
+NET payload   first=49443304 magic=MP3(ID3)
+NET verdict   [range/206 on API host] range206=true body=true PASS
+```
+
+失败时会多一行：
+
+```text
+NET error     stage=send code=0x80436002 RESOLVER_ENODNS (DNS)
+NET tls       ssl_error=0x80435060 detail=0x00000000
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `stage` | init / create / send / status / read / abort —— 卡在哪一步 |
+| `code` | Vita 原始错误码（已附人类可读名，DNS/TLS/超时/取消都能区分） |
+| `range206` | 是否真的返回 206 且带 Content-Range |
+| `abort stop_after_abort=…ms` | 调用 `sceHttpAbortRequest` 后多久真正停下 |
+| `NET memory` | SceHttp / SceSsl 内存池用量与峰值（§27 的内存结论就靠它） |
+
+## 3. 从界面/脚本再跑一次
+
+`vitaMedia.netProbe()` 会立刻再跑一遍（不受开关文件限制），返回：
+
+```json
+{"enabled":true,"started":true,"running":false,"runs":2,"report":"ux0:data/yunyin-netprobe.log"}
+```
+
+## 4. 验收清单（任务书 §26）
+
+| 项 | 报告里看哪一行 |
+| --- | --- |
+| DNS | `NET error … RESOLVER_ENODNS`（没这行说明 DNS 通过） |
+| HTTPS 握手 | `NET result status=<非 0>` 且无 `NET error stage=send` |
+| 证书校验 | `tls=verify` 那一轮：`status=206` 通过；`HTTPS_CERT` 即证书被拒 |
+| 302 | `redirected=1` 且 `status=206` |
+| Cookie / Referer | `cookie header reaches server` 那一轮返回 206 |
+| Range / 206 | `range206=true` |
+| Content-Length | `cl=`（不是 -1） |
+| Content-Range | `range=0-2047/…` |
+| 取消 | `NET abort … aborted=1 stop_after_abort=<1000ms PASS` |
+| 网络权限 | 上面任何一项通过即说明 `ATTRIBUTE2=12` 够用；全部 `stage=init` 失败则说明不够 |
+
+把 `ux0:data/yunyin-netprobe.log` 整份发回来即可，我按这张表逐项判定并给出 Phase 1 的参数
+（缓存大小、TLS 模式、池尺寸）。
+
+## 5. 已经踩过的坑（别重复）
+
+第一次真机跑的时候，探针其实**已经把要测的都测到了**（DNS/TLS/206/Content-Range 全过），
+但随后整个应用崩溃，dump 显示 PC 落在 newlib 的 `_svfprintf_r`：
+
+| 坑 | 后果 | 正确做法 |
+| --- | --- | --- |
+| 把 `sceHttpGetAllResponseHeaders` 返回的指针 `free()` 了 | 那是 SceHttp 内存池里的指针，释放会破坏库的堆，之后任何 printf/malloc 都可能跑飞 | **只读，不释放**；它随请求一起失效 |
+| 用 `printf("%.150s", value)` 打印头部 | 那个块**不保证 NUL 结尾**，`%s` 会读过头缓冲区的尾端 → Data abort | 一律用 `%.*s` + 长度，扫描也按 `headerSize` 限界 |
+| 把 `sceKernelStartThread` 的参数当成"共享结构体" | 该 API 会把参数**拷贝**到新线程栈上，主线程看到的永远是原结构体（全 0）；后来改成 `argp=NULL` 却还在 worker 里解引用 → 写地址 0，`DFAR=0x0` | 线程间共享状态用**静态/堆**结构体，`sceKernelStartThread(thid, 0, NULL)` |
+| abort 后立刻删除请求 | worker 可能还在那次读里，删掉请求等于抽掉地板 | 等 worker 退出再删；没退出就**宁可泄漏也不删** |
+
+两条都已经写进 `native/net/yhttp.c` 的注释里，Phase 2 的 `HttpRangeSource` 也要遵守。
+
+## 6. Phase 0 实测结论（真机，00.68）
+
+> **状态：全部通过**（00.71 完成最后一项"取消"）。验收清单 §26 的九项都有真机证据，
+> 池尺寸与校验策略可以据此定稿，Phase 1 可以开始。
+
+| 项 | 结果 | 证据 |
+| --- | --- | --- |
+| 网络权限 `ATTRIBUTE2=12` | **够用** | `netctl state=3`、`ip=10.195.41.100`，HTTPS 请求正常 |
+| DNS / HTTPS 握手 | **通过** | 三个目标全部 206，无 `RESOLVER_*` 错误 |
+| Range / 206 / Content-Length / Content-Range | **通过** | `status=206 cl=65536 range=0-65535/3863085` |
+| 网易云实际链路 | **通过** | `outer/url` → CDN：`Content-Type: audio/mpeg`、首字节 `49443304`（"ID3"）、总长 3,863,085 B |
+| Cookie / Referer | **通过** | 带头请求同样 206 |
+| 302 | **通过** | 关闭自动重定向后直接看到 `status=302` + `Location` |
+| **CDN 是明文 HTTP** | **重要发现** | 302 的 Location 是 `http://m801.music.126.net/...` —— 音频数据不走 TLS，只有 API 主机走 |
+| **取消（§24）** | **通过** | `aborted=1 bytes_in_flight=24576 stop_after_abort=1ms last_read=0x80410104`（`SCE_NET_ERROR_EINTR`：socket 读被立刻打断，不用等 10 s 超时） |
+| 单次请求耗时 | 1.8–2.7 s（含 DNS+connect+TLS） | 后续靠 keep-alive 与预取覆盖，Phase 2 要先量首包时间 |
+| 内存 | http 池 used 912 B / peak 24.7 KB；**ssl 池 peak 130.4 KB** | Phase 2 池配置：ssl ≥ 512 KiB，http ≥ 256 KiB |
+| **证书校验默认就是开的** | **通过（§23 达成）** | 自签名 `self-signed.badssl.com` 与过期 `expired.badssl.com` 两条都被**拒绝**（`stage=send code=0x80431075` = `SCE_HTTP_ERROR_SSL`）→ 固件用自己的根证书库在验 |
+| 额外注册根证书 | 做不到，但不影响 | `sceHttpsLoadCert(47)` 在 ssl/http = 256K→512K→1M→2M 四档全部 `0x80431022`（OUT_OF_MEMORY），而 2 MB 的 http 池实际只用了 912 B —— 它不是从这两个池分配；该 API 只是"额外注册根证书"，默认校验不依赖它 |
+
+关于证书校验的处置（Phase 2 必须明确写下策略）：
+
+* 参考项目 vitaspotify 用 libcurl 时直接 `CURLOPT_SSL_VERIFYPEER=0` /
+  `VERIFYHOST=0`，即**不做证书校验**；这是该平台 homebrew 的普遍做法。
+* **实测结论：这台机器的 SceHttp/SceSsl 默认就校验证书** —— 自签名与过期证书主机都被
+  拒绝（`SCE_HTTP_ERROR_SSL` / `0x80431075`）。所以 YUNYIN 的 HTTPS 是**加密 + 校验**，
+  比参考项目更严（它们是不校验）。
+* 因此 Phase 2 的策略定为：**API 跳走 HTTPS（默认校验开着，什么都不用额外做）**；
+  音频 CDN 跳是明文 `http://`（实测），照常带 Referer 即可。
+* 探针每轮仍会跑那两个坏证书目标：一旦哪天返回 200，说明校验被关掉了，日志会直接
+  显示 `cert-reject=false … CHECK`。
+
+### 6.1 两种"开校验"的方式不是一回事（00.70 起）
+
+```c
+/* 真正把检查打开：进程级，没有 id 参数 */
+sceHttpsEnableOption(SCE_HTTPS_FLAG_SERVER_VERIFY   /* 0x01 */
+                   | SCE_HTTPS_FLAG_CN_CHECK        /* 0x04 */
+                   | SCE_HTTPS_FLAG_NOT_AFTER_CHECK /* 0x08 */
+                   | SCE_HTTPS_FLAG_NOT_BEFORE_CHECK/* 0x10 */
+                   | SCE_HTTPS_FLAG_KNOWN_CA_CHECK);/* 0x20 */
+
+/* 只是"额外注册根证书"；这台固件上必然 OOM，失败也不代表校验关着 */
+sceHttpsLoadCert(...);
+```
+
+00.70 起 verify 模式两个都做：先 `sceHttpsEnableOption` 打开五个检查（结果记进
+`flags=0x…`），再尝试加载 CA（结果记进 `ca=0/1`）；**判定交给
+`self-signed.badssl.com` / `expired.badssl.com` 这两个目标**——它们被拒绝才算校验真的生效。

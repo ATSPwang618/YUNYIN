@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 pub mod http;
+pub mod probe;
 
 /// Where the network layer is in its bring-up.  Reported to the UI so the
 /// About page can say "network: not implemented" instead of pretending.
@@ -25,5 +26,6 @@ pub enum NetState {
 }
 
 pub fn state() -> NetState {
+    /* Phase 0: the transport probe exists, but no provider does yet. */
     NetState::Absent
 }

@@ -165,6 +165,19 @@ unsafe extern "C" fn js_log_enabled(
 }
 
 /// 播放期间锁 PS 键：`setPsLock(true)` 锁、`false` 解锁（见 ps_lock.rs）。
+unsafe extern "C" fn js_net_probe(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    _argc: i32,
+    _argv: *mut JSValue,
+) -> JSValue {
+    /* Phase 0: 立刻跑一次网络探针（不被 netprobe.url 开关限制），返回状态 JSON。
+     * 详细证据写在 ux0:data/yunyin-netprobe.log。 */
+    crate::media::net::probe::run_now();
+    js_str(ctx, &guarded("net_probe", String::new(), crate::media::net::probe::state_json))
+}
+
+/// 播放期间锁 PS 键：`setPsLock(true)` 锁、`false` 解锁（见 ps_lock.rs）。
 unsafe extern "C" fn js_set_ps_lock(
     ctx: *mut JSContext,
     _this: JSValue,
@@ -233,6 +246,7 @@ pub unsafe fn install(ctx: *mut JSContext, global: JSValue) {
     add_fn(ctx, obj, b"logMsg\0", js_log, 1);
     add_fn(ctx, obj, b"logEnabled\0", js_log_enabled, 0);
     add_fn(ctx, obj, b"setPsLock\0", js_set_ps_lock, 1);
+    add_fn(ctx, obj, b"netProbe\0", js_net_probe, 0);
     add_fn(ctx, obj, b"store_get\0", js_store_get, 1);
     add_fn(ctx, obj, b"store_set\0", js_store_set, 2);
     JS_SetPropertyStr(ctx, global, c"vitaMedia".as_ptr(), obj);

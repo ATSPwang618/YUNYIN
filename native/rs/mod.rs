@@ -64,4 +64,7 @@ pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_s
     power::start();
     bridge::install(ctx, global);
     cjk_host::install(ctx, global);
+    /* Phase 0 network probe: inert unless the card asks for it
+     * (ux0:/data/yunyin/netprobe.url or the debug flag). */
+    net::probe::start_once();
 }

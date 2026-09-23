@@ -36,7 +36,7 @@ Audio Thread                            Network Thread
 | `native/rs/source/*` | — | 不存在 | **新增**：AudioSource 接缝、本地源、字节缓存、HTTP 源 | — |
 | `native/rs/net/*` | — | 不存在 | **新增**：HTTP 类型 + 传输接缝（`yhttp.c` 的 Rust 面） | — |
 | `native/rs/provider/*` | — | 不存在 | **新增**：Provider 接缝、`AudioInfo`、格式嗅探、网易云 | — |
-| `native/yhttp.c/.h` | — | 不存在 | Phase 0/2 新增（上一次实验的残留已备份，未污染仓库） | — |
+| `native/net/yhttp.c/.h` | 薄传输层：init/request/Range/read/status/abort/redirect/超时 | 本轮新建（Phase 0 探针） | Phase 2 在此之上加 `HttpRangeSource` 的取数接口 | 传输职责边界 |
 | `scripts/build-vpk.py` | 构建 VPK | 曾把任意失败当成 SCE 对齐问题重试 24 次 | 已修：先探 ELF，非对齐失败立刻报错 | 构建主流程 |
 | `app/app.tsx` | UI + 曲库扫描 | 无在线入口 | Phase 5 加在线曲库/缓冲状态 | 现有本地流程与 UI |
 
@@ -106,7 +106,7 @@ CJK / font / UI
 
 | Phase | 内容 | 验收 |
 | --- | --- | --- |
-| **0** | HTTP 冒烟测试：`GET` + `Range` + 206 + cookie + 取消；顺带测网络内存与权限 | 真机日志给出 206 与完整响应头 |
+| **0** | HTTP 冒烟测试：`GET` + `Range` + 206 + cookie + 取消；顺带测网络内存与权限 | **已通过真机验收**（00.71）：DNS / HTTPS（证书默认校验生效）/ Range 206 / Content-Range / 302 / Cookie·Referer / 取消 1 ms / 池用量实测，逐项见 `docs/PHASE0_NETPROBE.md` §6 |
 | **1** | Decoder IO 抽象：`yp_io` + `yp_open_io` + handle 化（六个格式）+ duration hint + Gate | **本地六个格式播放不回退**（本文件第一条铁律） |
 | **2** | `HttpRangeSource` 落地：头部/尾部窗口、按需 Range、seek、断网恢复 | 远端文件可以 seek、暂停、断网 30 秒后继续 |
 | **3** | `NetEaseProvider`：API + 加密 + 账号 + URL 缓存 | songId → 能播的 `AudioInfo` |
@@ -136,6 +136,22 @@ native/rs/{cjk_host,font_gpu,frame_skip,offload_local}.rs → native/rs/ui/
 ```
 
 `yunyin_listdir.c` 里那份重复的日志实现已删除，全 C 侧共用 `host/yunyin_log.h`。
+
+Phase 0 探针（本轮新增，默认不运行）：
+
+```text
+native/net/yhttp.h/.c        SceNet + SceSsl + SceHttp 的薄传输层：
+                             init / 建连 / 请求 / Range·Referer·Cookie 头 /
+                             status / Content-Length / Content-Range 解析 /
+                             read / abort（工作线程里取消）/ 超时 / 内存池统计
+native/rs/net/probe.rs       目标列表 + 报告（ux0:data/yunyin-netprobe.log）
+vitaMedia.netProbe()         从 JS 立刻再跑一次
+docs/PHASE0_NETPROBE.md      开关方式、报告字段、§26 验收对照表
+```
+
+真机验证方式：卡里放 `ux0:/data/yunyin/debug`（跑内置目标）或
+`ux0:/data/yunyin/netprobe.url`（第一行 URL、第二行 Referer），把
+`ux0:data/yunyin-netprobe.log` 取回来即可逐项判定 §26 清单。
 
 验证方式（都在电脑上针对**要发布的源码**跑）：
 

@@ -47,7 +47,7 @@ APP_ID = "yunyin-main"                         # pocket.json -> app.output（框
 OUT = os.environ.get("YUNYIN_OUT", APP_ID)
 APP_TITLE = "云音"                             # param.sfo TITLE（LiveArea 气泡下方显示名）
 # param.sfo 里的 APP_VER（VitaShell 里看到的版本号），发布新版本时改这里
-APP_VER = os.environ.get("YUNYIN_APP_VER", "00.66")
+APP_VER = os.environ.get("YUNYIN_APP_VER", "00.71")
 TITLE_ID = os.environ.get("YUNYIN_TITLE_ID", "")  # 留空 = 用 app/catalog.ts 的 TITLE_ID / PF2A47F97
 THEME = os.environ.get("YUNYIN_THEME", "dark")  # 皮肤主题：light / dark / pure / anime
 # 默认 Noto Sans SC。日文曲库才切 MSMINCHO：YUNYIN_FONT=japanese
@@ -379,7 +379,10 @@ def patch_host():
     #   SceSysmem     上面那条要的 uncached memblock（sceKernelAllocMemBlock 等）
     # 逐个补进 features 列表，重复构建也安全。
     for needed in ("ScePower_stub", "SceAppMgr_stub", "SceShellSvc_stub",
-                   "SceAudiodec_stub", "SceSysmem_stub"):
+                   "SceAudiodec_stub", "SceSysmem_stub",
+                   # Phase 0 network probe (native/net/yhttp.c)
+                   "SceHttp_stub", "SceSsl_stub", "SceNet_stub",
+                   "SceNetCtl_stub"):
         if f'"{needed}"' not in c:
             c = c.replace(
                 'vitasdk-sys = { version = "0.3.3", features = [',
@@ -403,7 +406,8 @@ def patch_host():
         or "audio/yplayer.c" not in b
         or "audio/ym4a.c" not in b
         or "audio/yaac.c" not in b
-        or "yhttp.c" in b
+        or "net/yhttp.c" not in b
+        or 'join("yhttp.c")' in b  # the abandoned flat-path block
         or "yunyin_shellsvc_stub.S" in b
         or "empva_bridge" in b
         or "taihen_loader" in b
@@ -443,6 +447,11 @@ def patch_host():
             '\n      cc::Build::new().file(host.join("yunyin_listdir.c"))'
             '.include(native).include(&host)'
             '.compile("yunyin_listdir");'
+            # Phase 0 transport probe: Vita-only (SceNet/SceSsl/SceHttp).
+            '\n      let net = native.join("net");'
+            '\n      cc::Build::new().file(net.join("yhttp.c"))'
+            '.include(native).include(&net).include(&host)'
+            '.compile("yhttp");'
             '\n      println!("cargo:rustc-link-lib=mpg123");'
             '\n      println!("cargo:rustc-link-lib=vorbisfile");'
             '\n      println!("cargo:rustc-link-lib=vorbis");'
@@ -452,6 +461,7 @@ def patch_host():
             '\n      println!("cargo:rustc-link-search=native/libs");'
             '\n      println!("cargo:rerun-if-changed=native/audio");'
             '\n      println!("cargo:rerun-if-changed=native/host");'
+            '\n      println!("cargo:rerun-if-changed=native/net");'
             '\n      println!("cargo:rerun-if-changed=native/vendor");'
             '\n    }'
         )
