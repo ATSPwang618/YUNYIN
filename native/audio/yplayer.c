@@ -16,12 +16,12 @@
 #include "yaac.h"
 #include "host/yunyin_log.h"
 
-/* One decoded AAC frame is 1024 samples (2048 with SBR); the hardware decoder
- * never emits more than SCE_AUDIODEC_AAC_MAX_SAMPLES per access unit. */
+/* 一帧 AAC 解出来是 1024 个采样（带 SBR 时 2048）；硬件解码器单帧输出
+ * 绝不会超过 SCE_AUDIODEC_AAC_MAX_SAMPLES。 */
 #define YP_AAC_MAX_FRAMES 2048
 
-/* Opus is always handed to us as stereo at 48 kHz.  opusfile's own docs
- * recommend a 120 ms block, which is what the carry buffer is sized for. */
+/* Opus 交给我们的永远是 48 kHz 立体声。opusfile 官方文档推荐一次 120 ms，
+ * 携带缓冲区就按这个尺寸开。 */
 #define YP_OPUS_CARRY_FRAMES 5760
 
 typedef struct {
@@ -37,15 +37,14 @@ typedef struct {
   drflac *flac;
   unsigned long long flac_frames;
   OggOpusFile *of;
-  /* Opus carry buffer: op_read/op_read_stereo give out at most a full packet
-   * per call, so we decode a big block once and drain it over several output
-   * buffers (see yp_opus_decode). */
+  /* Opus 携带缓冲区：op_read/op_read_stereo 一次最多给一个完整 packet，
+   * 所以这里一次解一大块，再用好几个输出缓冲区慢慢放（见 yp_opus_decode）。 */
   short opus_pcm[YP_OPUS_CARRY_FRAMES * 2];
   int opus_len;
   int opus_pos;
   long long opus_played; /* frames already handed to the output */
-  /* M4A: the demuxer hands out one AAC access unit, the hardware decoder turns
-   * it into PCM, and the player drains that PCM over several output buffers. */
+  /* M4A：解复用器一帧一帧给裸 AAC，硬件解码器把它变成 PCM，
+   * 播放器再用几个输出缓冲区把这些 PCM 放完。 */
   short m4a_pcm[YP_AAC_MAX_FRAMES * 2];
   int m4a_pcm_len;
   int m4a_pcm_pos;
@@ -97,7 +96,7 @@ static int mp3_open(const char *p) {
   mpg123_format_none(g.mp3);
   mpg123_format(g.mp3, r, 2, MPG123_ENC_SIGNED_16);
 
-  /* Embedded cover (type 3 = front cover, 0 = other). */
+  /* 内嵌封面（type 3 = 正面封面，0 = 其他）。 */
   mpg123_id3v1 *v1 = NULL;
   mpg123_id3v2 *v2 = NULL;
   if (mpg123_id3(g.mp3, &v1, &v2) == MPG123_OK && v2) {
@@ -225,8 +224,8 @@ static int opus_open(const char *p) {
   g.of = op_open_file(p, &err);
   if (!g.of) return -1;
   g.rate = 48000; /* opus decodes at 48 kHz; BGM port opens at this native rate */
-  /* Always stereo out: op_read_stereo downmixes mono and multichannel sources,
-   * which is also what the reference Vita backend does. */
+  /* 一律输出立体声：op_read_stereo 会把单声道/多声道下混成两声道，
+   * 参考的 Vita 后端也是这么做的。 */
   g.ch = 2;
   g.opus_len = 0;
   g.opus_pos = 0;
@@ -236,20 +235,16 @@ static int opus_open(const char *p) {
 }
 
 /*
- * Opus decoding, shaped like the reference Vita backend.
+ * Opus 解码，形态照参考的 Vita 后端。
  *
- * Two things about the opusfile API are easy to get wrong, and both have real
- * consequences:
+ * opusfile 的接口有两处很容易写错，而且都会真的出问题：
  *
- *   - `_buf_size` counts VALUES (frames x channels); the return value counts
- *     frames.  Passing a frame count as the buffer size makes every call a
- *     tiny one — down to a single value at the tail of an output block.
- *   - A call whose buffer cannot hold one full frame answers 0.  The caller
- *     (bgm.rs) fills the rest of the block with silence, so that becomes a
- *     one-sample hole at an audible cadence — the "warble" this fixes.
+ *   - `_buf_size` 的单位是"值"（帧 × 声道），返回值才是"帧"。把帧数当缓冲区
+ *     容量传进去，每次调用都会变得极小 —— 一个输出块的尾巴上甚至只剩一个值。
+ *   - 缓冲区装不下一整帧时，libopusfile 返回 0。上层（bgm.rs）会把块里剩下的
+ *     部分补静音，于是变成"每隔一小段掉一个采样"—— 也就是这里修掉的"颤音"。
  *
- * So: pull a whole 120 ms block into the carry buffer with one call, and drain
- * it across however many output buffers that takes.
+ * 所以：一次调用拉满 120 ms 到携带缓冲区，再用任意多个输出缓冲区把它放完。
  */
 static int opus_fill(void) {
   int n = op_read_stereo(g.of, g.opus_pcm, YP_OPUS_CARRY_FRAMES * 2);
@@ -278,7 +273,7 @@ static int yp_opus_decode(short *buf, int max_frames) {
   return done;
 }
 
-/* -------- M4A / AAC (ym4a + hardware SceAudiodec) -------- */
+/* -------- M4A / AAC（ym4a 解复用 + SceAudiodec 硬件解码） -------- */
 
 static int m4a_open(const char *p) {
   int rc = ym4a_open(p);
@@ -291,10 +286,9 @@ static int m4a_open(const char *p) {
   g.rate = ym4a_rate();
   g.ch = ym4a_channels(); /* 1 or 2; mono is doubled up in m4a_decode */
 
-  /* isSbr=1 unconditionally: the access unit carries no SBR flag, and both
-   * public Vita references pass 1.  With AAC-LC the decoder still returns 1024
-   * frames per unit, so this is a capability hint rather than a forced
-   * upsample — and the real output size is read back from the decoder. */
+  /* 一律传 isSbr=1：裸帧里没有 SBR 标志位，两个公开的 Vita 参考实现也都传 1。
+   * 对 AAC-LC，解码器每帧仍然只给 1024 个采样，所以它只是"能力提示"、
+   * 不是强制上采样 —— 真实输出长度以解码器回报为准。 */
   if (yaac_open(ym4a_channels(), ym4a_rate(), 0, 1) != 0) {
     yunyin_log("yplayer: yaac_open failed\n");
     ym4a_close();
@@ -315,17 +309,15 @@ static int m4a_open(const char *p) {
   return 0;
 }
 
-/* PCM frame of the sample currently in the PCM buffer, plus what has already
- * been drained out of it. */
+/* 当前在 PCM 缓冲区里的那一帧 AAC 对应的 PCM 起始帧号，加上已经被放掉的量。 */
 static long long m4a_position(void) {
   int idx = ym4a_cur_sample();
   if (idx < 0) return g.m4a_pos;
   return ym4a_sample_start_frame(idx) + (long long)g.m4a_pcm_pos;
 }
 
-/* Pull one access unit from the container and decode it.  A frame the decoder
- * rejects is skipped and logged, with a small retry budget: one damaged AAC
- * frame should cost a few milliseconds of audio, not the rest of the song. */
+/* 从容器取一帧并解码。解不出来的帧记一条日志后跳过（给一点重试预算）：
+ * 坏一帧只该损失几毫秒音频，不该毁掉整首歌。 */
 static int m4a_fill(void) {
   unsigned char au[YAAC_ES_CAP];
   int n, got, failures = 0;
@@ -338,9 +330,8 @@ static int m4a_fill(void) {
       continue;
     }
     if (got == 0) continue; /* decoder had nothing to emit for this frame */
-    /* The last unit is usually padded out: trim it to the duration the
-     * container declares so position and length agree.  Only the final unit is
-     * trimmed — mid-track output is trusted as-is. */
+    /* 最后一帧通常是补齐过的：按容器声明的时长裁掉多余部分，
+     * 让进度和总长对得上。只裁最后一帧 —— 中间的输出原样信任。 */
     if (ym4a_cur_sample() == ym4a_sample_count() - 1) {
       int declared = ym4a_sample_frames(ym4a_cur_sample());
       if (declared > 0 && declared < got) got = declared;
@@ -395,8 +386,7 @@ int yp_open(const char *path) {
   if (strstr(lo, ".wav")) return wav_open(path);
   if (strstr(lo, ".flac")) return flac_open(path);
   if (strstr(lo, ".opus") || strstr(lo, ".oga")) return opus_open(path);
-  /* M4A is the container; the audio inside is AAC.  `.mp4`/`.m4b` are accepted
-   * too — the demuxer always picks the `soun` track. */
+  /* M4A 是容器，里面是 AAC。`.mp4`/`.m4b` 也接受 —— 解复用器总是挑 `soun` 音轨。 */
   if (strstr(lo, ".m4a") || strstr(lo, ".m4b") || strstr(lo, ".mp4"))
     return m4a_open(path);
   return -1;
@@ -417,8 +407,8 @@ int yp_decode(short *buf, int max_frames) {
   }
 }
 
-/* Jump to an absolute source frame. Decoder stays on the current frame
- * during pause (callback fills silence); seek is for explicit jumps. */
+/* 跳到某个绝对源帧。暂停时解码器停在当前帧不动（上层补静音）；
+ * seek 只用于用户明确的跳转。 */
 int yp_seek(long long frame) {
   if (frame < 0) frame = 0;
   switch (g.fmt) {
@@ -460,8 +450,7 @@ long long yp_position(void) {
   if (g.fmt == 2 && g.vf_ok) return (long long)ov_pcm_tell(&g.vf);
   if (g.fmt == 3 && g.wav_ok) return (long long)g.wav_frames;
   if (g.fmt == 4 && g.flac) return (long long)g.flac_frames;
-  /* Played frames, not op_pcm_tell: the carry buffer runs up to 120 ms ahead
-   * of what the output has actually consumed. */
+  /* 用"已播帧数"，而不是 op_pcm_tell：携带缓冲区最多领先实际输出 120 ms。 */
   if (g.fmt == 5) return g.opus_played;
   if (g.fmt == 6) return m4a_position();
   return 0;

@@ -1,48 +1,46 @@
 //! `HttpRangeSource` — the network side of the seam (Phase 2, task book §78).
 //!
-//! Phase 0/1 status: interface + design only.  Every method reports
-//! `Unsupported` until `net::http` can do real range requests on the Vita.
+//! 当前状态：只有接口与设计。在 `net::http` 能在 Vita 上真正发 Range 请求之前，
+//! 每个方法都返回 `Unsupported`。
 //!
-//! The shape is taken from cspot's `CDNAudioFile` (the reference in §7), which
-//! is the same problem solved on the same hardware:
+//! 形态照抄 cspot 的 `CDNAudioFile`（§7 指定的参考实现）—— 同样的硬件、同样的问题，
+//! 它已经解过一遍：
 //!
 //! ```text
-//! open  -> Range: bytes=0-8191        (header window: decoders sniff magic here)
-//!       -> Range: bytes=-12288        (footer window: Ogg/Opus seek needs the tail)
-//! read  -> serve from the byte cache; on a miss, one range request of ~14 KiB
-//!          at the current position (never one request per decoder read)
-//! seek  -> move the cursor and drop the window; the next read refetches,
-//!          keeping a small margin so a short backward seek stays in cache (§54)
+//! open  -> Range: bytes=0-8191        头部窗口：解码器在这里嗅探魔数
+//!       -> Range: bytes=-12288        尾部窗口：Ogg/Opus 的 seek 需要文件尾
+//! read  -> 先从字节缓存取；取不到就按当前位置发一次约 14 KiB 的 Range
+//!          （绝不做"解码器每读一次就发一次请求"）
+//! seek  -> 移动游标、丢掉窗口；下一次 read 重新取，并留一点 margin，
+//!          这样小幅回退不用重新请求（§54）
 //! ```
 //!
-//! Two consequences carried over from §15:
-//!   - the decoders never see a socket: they see cached bytes or `WouldBlock`;
-//!   - a seek is expressed in *bytes* here, and the decoder is responsible for
-//!     mapping time to bytes.
+//! §15 的两条推论：
+//!   - 解码器永远看不到 socket：它只看到缓存里的字节，或者 `WouldBlock`；
+//!   - 这里的 seek 以**字节**为单位，"时间 → 字节"由解码器自己换算。
 #![allow(dead_code)]
 
 use super::cache::{ByteCache, CacheConfig};
 use super::{AudioSource, SourceError, SourceKind};
 use alloc::string::String;
 
-/// Where a fetch asked the network thread to start, and how much it wants.
+/// 一次取数请求：从哪开始、要多少。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FetchRequest {
     pub offset: u64,
     pub len: usize,
 }
 
-/// Network thread handoff.  `HttpRangeSource` publishes what it needs; the
-/// network thread performs the transfer and pushes bytes back (§9).
+/// 交给网络线程的接口：`HttpRangeSource` 只申明"我要什么"，
+/// 网络线程负责真正传输，并把字节推回来（§9）。
 pub trait RangeFetcher {
-    /// Start a transfer at `offset`.  Later calls supersede earlier ones (§56).
+    /// 从 `offset` 开始传；后一次调用会顶掉前一次（§56）。
     fn request(&mut self, req: FetchRequest) -> Result<(), SourceError>;
-    /// Cancel whatever is in flight (track change).
+    /// 取消正在进行的传输（切歌时用）。
     fn cancel(&mut self) -> Result<(), SourceError>;
 }
 
-/// Sizes from the reference implementation; both are small on purpose, because
-/// the Vita's network buffers are the scarce resource (§66).
+/// 尺寸取自参考实现。两个值都故意取小 —— Vita 上稀缺的是网络缓冲（§66）。
 pub const HEADER_WINDOW: usize = 8 * 1024;
 pub const FOOTER_WINDOW: usize = 12 * 1024;
 pub const SEEK_MARGIN: u64 = 4 * 1024;
@@ -51,15 +49,15 @@ pub struct HttpRangeSource {
     url: String,
     cache: ByteCache,
     pos: u64,
-    /// Total stream size from Content-Length, when the server sent one.
+    /// 服务器给了 Content-Length 时的流总长度。
     size: Option<u64>,
     error: Option<SourceError>,
 }
 
 impl HttpRangeSource {
-    /// Bind to a resolved URL.  The caller (a provider) owns URL lifetime; when
-    /// the CDN answers 403/404 the provider re-resolves and this object is
-    /// rebuilt, which is why `SourceError::Expired` exists (§52).
+    /// 绑定到已解析出的 URL。URL 的生命周期归调用方（Provider）：
+    /// CDN 回 403/404 时由 Provider 重新解析并重建这个对象
+    /// —— 这就是 `SourceError::Expired` 存在的原因（§52）。
     pub fn new(url: &str, cfg: CacheConfig) -> Self {
         Self {
             url: String::from(url),
@@ -74,8 +72,7 @@ impl HttpRangeSource {
         &self.url
     }
 
-    /// What the network thread should fetch next, or `None` when the window is
-    /// already above the refill watermark.
+    /// 网络线程下一次该取什么；窗口已经在 refill 水位之上时返回 `None`。
     pub fn next_fetch(&self) -> Option<FetchRequest> {
         if self.cache.is_eof() {
             return None;
@@ -93,7 +90,7 @@ impl HttpRangeSource {
         &self.cache
     }
 
-    /// Hand downloaded bytes to the window (called by the network thread).
+    /// 把下载好的字节交给窗口（由网络线程调用）。
     pub fn deliver(&mut self, data: &[u8]) {
         self.cache.push(data);
     }
@@ -112,8 +109,8 @@ impl AudioSource for HttpRangeSource {
         if self.cache.is_eof() {
             return Ok(0); /* real end of stream */
         }
-        /* Out of cached bytes: the gate keeps the decoder away until the window
-         * is back above `decode_margin`, so asking again is the honest answer. */
+        /* 缓存空了：Gate 会在窗口回到 `decode_margin` 之上前挡住解码器，
+         * 所以"请稍后再来"才是诚实的回答。 */
         Err(SourceError::WouldBlock)
     }
 

@@ -1,8 +1,7 @@
-//! Local file source — the only source the shipping player uses today.
+//! 本地文件源 —— 正式播放路径目前唯一用到的源。
 //!
-//! This is the reference implementation of the seam: the five library decoders
-//! and `ym4a.c` all read through a path right now (§29), and Phase 1 swaps that
-//! path for a `yp_io` callback pair backed by exactly this object.
+//! 它也是这条接缝的参考实现：现在六个解码器都还是"传路径"读文件（§29），
+//! Phase 1 会把那条路径换成一对 `yp_io` 回调，底层正是这个对象。
 #![allow(dead_code)]
 
 use super::{AudioSource, SourceError, SourceKind};
@@ -47,8 +46,7 @@ impl AudioSource for LocalFileSource {
         if self.pos >= self.size {
             return Ok(0); /* real EOF */
         }
-        /* Never ask the card for more than is left: a short read here would be
-         * indistinguishable from EOF to some decoders. */
+        /* 绝不多要：请求超过剩余字节时，有些解码器会把"短读"当成 EOF。 */
         let want = buf.len().min((self.size - self.pos) as usize);
         match self.file.read(&mut buf[..want]) {
             Ok(0) => Ok(0),

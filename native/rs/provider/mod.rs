@@ -1,12 +1,10 @@
-//! Providers and the format question (task book §41/§42).
+//! Provider 与"格式判定"（任务书 §41/§42）。
 //!
-//! A provider answers one question — "given a song id, where are the bytes and
-//! what are they?" — and returns an `AudioInfo`.  It never returns a socket, and
-//! the decoder never sees the provider's objects (§15).
+//! Provider 只回答一个问题："给我一个歌曲 ID，字节在哪、是什么？" —— 然后返回
+//! `AudioInfo`。它永远不返回 socket，解码器也永远看不到 Provider 的对象（§15）。
 //!
-//! `AudioFormat::sniff` also lives here, because §38/§39 are explicit that the
-//! format must come from the bytes, never from the URL suffix: a NetEase CDN URL
-//! has no useful extension at all.
+//! `AudioFormat::sniff` 也放在这里：§38/§39 明确要求格式**只能由字节判断**，
+//! 不能靠 URL 后缀 —— 网易云 CDN 链接根本没有什么有用的后缀。
 #![allow(dead_code)]
 
 pub mod netease;
@@ -14,10 +12,10 @@ pub mod netease;
 use alloc::format;
 use alloc::string::String;
 
-/// Quality request, mapped by each provider onto its own ladder (§47).
+/// 音质请求；各 Provider 自己映射到自家的档位（§47）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quality {
-    /// Best the account is allowed to have.
+    /// 账号权限允许的最好音质。
     Auto,
     Low,
     Medium,
@@ -25,10 +23,10 @@ pub enum Quality {
     Lossless,
 }
 
-/// Container/codec we can actually decode.
+/// 我们**确实能解**的容器/编码。
 ///
-/// Six families today: the five library decoders plus M4A (AAC), which is
-/// demuxed by `ym4a.c` and decoded by the hardware block through `yaac.c`.
+/// 目前六大类：五个库解码器，加上 M4A(AAC) —— 由 `ym4a.c` 解复用、
+/// `yaac.c` 交给硬件解码块。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioFormat {
     Mp3,
@@ -41,8 +39,7 @@ pub enum AudioFormat {
 }
 
 impl AudioFormat {
-    /// What we hand to `yplayer.c` so it picks the right decoder without being
-    /// asked to re-sniff a network stream.
+    /// 传给 `yplayer.c` 的格式名：让它直接挑对解码器，不必对网络流再嗅一次。
     pub fn name(&self) -> &'static str {
         match self {
             AudioFormat::Mp3 => "mp3",
@@ -55,23 +52,22 @@ impl AudioFormat {
         }
     }
 
-    /// True when the shipping player can decode it today.
+    /// 当前播放器能不能解这个格式。
     pub fn is_playable(&self) -> bool {
         !matches!(self, AudioFormat::Unknown)
     }
 
-    /// Identify a container from its first bytes (§39).
+    /// 用开头几个字节判断容器类型（§39）。
     ///
-    /// Ordered so that the containers that can be confused with each other are
-    /// checked first: Ogg appears twice (Vorbis vs Opus) and MP4 hides `ftyp`
-    /// behind a 4-byte size field, not at offset 0.
+    /// 顺序是按"容易被搞混的排前面"定的：Ogg 要判两次（Vorbis / Opus），
+    /// MP4 的 `ftyp` 不在偏移 0，而在前面 4 字节的长度字段之后。
     pub fn sniff(head: &[u8]) -> Self {
         if head.len() >= 4 && &head[0..4] == b"fLaC" {
             return AudioFormat::Flac;
         }
         if head.len() >= 4 && &head[0..4] == b"OggS" {
-            /* Ogg carries both Vorbis and Opus; the codec name sits in the first
-             * page, near the start. */
+            /* Ogg 既能装 Vorbis 也能装 Opus；编码名就在第一个 Ogg 页里、
+             * 靠前的位置。 */
             let probe = &head[..head.len().min(64)];
             if contains(probe, b"OpusHead") {
                 return AudioFormat::Opus;
@@ -101,28 +97,27 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Everything the player needs to start playing a stream, and nothing else.
+/// 播放一条流所需要的**全部**信息，仅此而已。
 ///
-/// Extra fields (§41: `source`, `song_id`, `quality`, `expires_at`) are for the
-/// UI and for re-resolving an expired URL; a decoder must not read them.
+/// 多出来的字段（§41 的 `source`/`song_id`/`quality`/`expires_at`）是给界面和
+/// "URL 过期后重新解析"用的；**解码器不许读它们**。
 #[derive(Clone, Debug)]
 pub struct AudioInfo {
     pub url: String,
     pub format: AudioFormat,
-    /// Duration as claimed by the provider.  Zero when unknown — the player then
-    /// learns it from the decoder (§37).
+    /// Provider 声称的时长。未知时是 0 —— 那就以解码器报的为准（§37）。
     pub duration_ms: u32,
     pub bitrate: u32,
     pub size: Option<u64>,
     pub source: String,
     pub song_id: String,
     pub quality: Quality,
-    /// Absolute time (ms since epoch) after which `url` must be re-resolved.
+    /// 超过这个绝对时间（毫秒时间戳）后 `url` 必须重新解析。
     pub expires_at: u64,
 }
 
 impl AudioInfo {
-    /// A local file never expires and has no provider behind it.
+    /// 本地文件永不过期，背后也没有 Provider。
     pub fn local(path: &str, format: AudioFormat, size: Option<u64>) -> Self {
         Self {
             url: String::from(path),
@@ -152,21 +147,20 @@ impl AudioInfo {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderError {
-    /// No provider handles this id yet.
+    /// 还没有 Provider 能处理这个 ID。
     Unsupported,
     Network(String),
-    /// Cookie/session missing or rejected (§48).
+    /// 缺少或无效的 Cookie/会话（§48）。
     Auth(String),
-    /// The account is not allowed this quality (§47).
+    /// 账号权限不够，拿不到这个音质（§47）。
     VipRequired,
     NotFound,
-    /// The CDN URL went stale; re-resolve and retry (§52).
+    /// CDN URL 失效了，重新解析后再试（§52）。
     Expired,
     Cancelled,
 }
 
-/// The provider seam.  Adding QQ Music later means adding an implementation,
-/// not touching the player (§43).
+/// Provider 接缝。以后要加 QQ 音乐，只需新增一个实现，不用改播放器（§43）。
 pub trait MusicProvider {
     fn name(&self) -> &'static str;
     fn resolve(&self, song_id: &str, quality: Quality) -> Result<AudioInfo, ProviderError>;

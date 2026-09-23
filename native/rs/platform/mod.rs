@@ -1,9 +1,8 @@
-//! Platform services: the small pieces of the Vita that the player needs but
-//! that have nothing to do with audio.
+//! 平台服务：播放器需要、但和音频无关的那些零碎能力。
 //!
-//! Kept in one place so the media-engine modules (`bgm`, `decoder`, `source`,
-//! `provider`) never reach for a syscall directly, and so the "do not touch"
-//! list of the refactor plan (`power`, `ps_lock`) is obvious in the tree.
+//! 集中在一处，好处有两个：媒体引擎模块（`bgm`/`decoder`/`source`/`provider`）
+//! 不用直接摸系统调用；重构计划里"不可动清单"上的 `power`、`ps_lock`
+//! 在目录里一眼就能看见。
 #![allow(dead_code)]
 
 pub mod fs;

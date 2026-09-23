@@ -1,17 +1,13 @@
-//! `AudioSource` — the one seam between "where the bytes come from" and the
-//! decoders (task book §14/§15).
+//! `AudioSource` —— "字节从哪来"与"解码器"之间的**唯一接缝**（任务书 §14/§15）。
 //!
-//! Rules that keep the architecture honest:
-//!   - nothing above this trait may know about HTTP;
-//!   - nothing below it may know about a music provider;
-//!   - `read() == 0` means **real end of stream** and nothing else.  A source
-//!     that is temporarily out of bytes must not report EOF — see
-//!     `SourceError::WouldBlock` and the decoder gate described in §7/§8.
+//! 三条规矩，整个架构靠它们保持干净：
+//!   - 这个 trait 之上的东西不许认识 HTTP；
+//!   - 之下的东西不许认识"音乐平台"；
+//!   - `read() == 0` **只代表真正结束**，别的什么都不代表。暂时没数据的源
+//!     不允许报 EOF —— 用 `SourceError::WouldBlock`，配合 §7/§8 的 Gate 处理。
 //!
-//! Phase 0/1 status: the trait, the local implementation and the byte cache are
-//! real and host-testable.  The HTTP source is the documented stub that Phase 2
-//! fills in; nothing in the shipping player references these modules yet, which
-//! is why unused items are allowed here.
+//! 当前状态：trait、本地源、字节缓存都是真实现，且能在电脑上跑测试；HTTP 源是
+//! Phase 2 要填的桩。正式播放路径还没引用这些模块，所以这里允许出现"未被使用"的项。
 #![allow(dead_code)]
 
 pub mod cache;
@@ -20,66 +16,64 @@ pub mod local;
 
 use alloc::string::String;
 
-/// Why a source operation failed.
+/// 源操作失败的原因。
 ///
-/// `WouldBlock` is deliberately separate from `Eof`: the audio thread turns it
-/// into silence *without* consuming the decoder (§8), while `Eof` is permanent.
+/// `WouldBlock` 故意和 `Eof` 分开：音频线程遇到它只会**输出静音**、绝不消耗解码器
+/// （§8）；而 `Eof` 是永久结束。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceError {
-    /// No data right now, but the stream is still alive.
+    /// 现在没数据，但流还活着（等缓存补齐即可继续）。
     WouldBlock,
-    /// End of stream reached.
+    /// 真正的流结束。
     Eof,
-    /// The source cannot seek (network streams without ranges, live streams).
+    /// 这个源不能 seek（不支持 Range 的流、直播流）。
     NotSeekable,
-    /// Transport failure (socket, DNS, TLS, read error).
+    /// 传输层失败（socket / DNS / TLS / 读错误）。
     Network(String),
-    /// Server answered, but not with a usable response.
+    /// 服务器回了，但不是能用的响应。
     Http { status: u16 },
-    /// The resolved URL expired and must be fetched again (§52).
+    /// 解析出来的 URL 过期了，必须重新获取（§52）。
     Expired,
-    /// The operation was cancelled by a newer request (§56).
+    /// 被更新的请求取消了（切歌就是这条，§56）。
     Cancelled,
-    /// Backing store failure (file gone, card removed).
+    /// 底层存储出问题（文件没了、卡被拔了）。
     Io(String),
-    /// Feature not implemented yet (Phase 2+ placeholders).
+    /// 功能还没实现（Phase 2 及以后的占位）。
     Unsupported,
 }
 
-/// What kind of thing the bytes come from.  Used for logging/UI only — decoders
-/// must not branch on it.
+/// 字节来自哪一类源。只给日志和界面用 —— **解码器不许按它分支**。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceKind {
     LocalFile,
     HttpRange,
 }
 
-/// The seam itself: a seekable byte stream, decoders pull from it.
+/// 接缝本体：一条可 seek 的字节流，解码器从它拉数据。
 pub trait AudioSource {
-    /// Fill `buf`, returning how many bytes were written.
+    /// 填 `buf`，返回实际写入的字节数。
     ///
-    /// `Ok(0)` means end of stream.  `Err(WouldBlock)` means "call me again
-    /// later with the same position".
+    /// `Ok(0)` = 结束；`Err(WouldBlock)` = "位置不变，过会儿再来问我"。
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, SourceError>;
 
-    /// Absolute seek.  Sources that cannot seek return `NotSeekable`.
+    /// 绝对 seek；不能 seek 的源返回 `NotSeekable`。
     fn seek(&mut self, pos: u64) -> Result<(), SourceError>;
 
-    /// Current absolute read position.
+    /// 当前绝对读位置。
     fn tell(&self) -> u64;
 
-    /// Total size when known (HTTP without Content-Length: `None`).
+    /// 已知的总长度（HTTP 没给 Content-Length 时是 `None`）。
     fn size(&self) -> Option<u64>;
 
-    /// Bytes readable *without blocking* — this is what the decoder gate and the
-    /// cache watermarks look at (§13).
+    /// **不阻塞**就能读出的字节数 —— Gate 与缓存水位都看这个值（§13）。
     fn available(&self) -> usize;
 
-    /// True once the stream is finished; never a stand-in for "empty for now".
+    /// 流真正结束了才是 true；**不能**拿它表示"暂时空了"。
     fn is_eof(&self) -> bool;
 
-    /// Sticky error, if the source already failed.
+    /// 已经失败时返回粘性错误，否则 None。
     fn error(&self) -> Option<SourceError>;
 
+    /// 源的类型（本地文件 / HTTP Range）。
     fn kind(&self) -> SourceKind;
 }

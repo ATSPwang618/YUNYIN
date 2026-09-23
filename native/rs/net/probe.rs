@@ -1,24 +1,22 @@
-//! Phase 0 network smoke test (task book §25/§26/§27).
+//! Phase 0 网络冒烟测试（任务书 §25/§26/§27）。
 //!
-//! Runs `native/net/yhttp.c` on a background thread and writes every fact the
-//! acceptance list asks for to `ux0:data/yunyin-netprobe.log`:
+//! 在后台线程里跑 `native/net/yhttp.c`，把验收清单要求的每条事实都写进
+//! `ux0:data/yunyin-netprobe.log`：
 //!
 //! ```text
-//! DNS · TLS handshake · certificate validation · 302 · Cookie · Referer
-//! Range · 206 · Content-Length · Content-Range · abort timing · pool usage
+//! DNS · TLS 握手 · 证书校验 · 302 · Cookie · Referer
+//! Range · 206 · Content-Length · Content-Range · 取消耗时 · 内存池用量
 //! ```
 //!
-//! When it runs: only if the user asks.  Either
+//! 什么时候跑：只有你要求才跑。两种开关：
 //!
-//!   * `ux0:/data/yunyin/netprobe.url` exists — line 1 is the URL, line 2 is an
-//!     optional Referer — and the probe hits exactly that URL, or
-//!   * `ux0:/data/yunyin/debug` exists — the built-in target list is used.
+//!   * 存在 `ux0:/data/yunyin/netprobe.url`：第一行是 URL、第二行可选 Referer，
+//!     探针就只打这个 URL；或者
+//!   * 存在 `ux0:/data/yunyin/debug`：跑内置的目标列表。
 //!
-//! Nothing here runs at all in a normal launch, so the shipping app still makes
-//! no network calls (and Phase 0 can be repeated by just editing that file).
+//! 正常启动时这里什么都不做，所以正式版依旧不联网（Phase 0 想重跑，改那个文件就行）。
 //!
-//! The C side reports through `yunyin_net_log`; this module is the only place
-//! that writes the report, which keeps the evidence in one file.
+//! C 侧通过 `yunyin_net_log` 上报；只有这个模块写报告文件，保证证据集中在一处。
 #![allow(dead_code)]
 
 use crate::media::platform::log;
@@ -36,7 +34,7 @@ const DEBUG_FLAG: &str = "ux0:data/yunyin/debug";
 const TLS_DEFAULT: i32 = 0;
 const TLS_VERIFY: i32 = 1;
 
-/// Where a failure happened, matching `yhttp_result.err_at`.
+/// 失败发生在哪一步，与 `yhttp_result.err_at` 对应。
 fn stage_name(at: i32) -> &'static str {
     match at {
         0 => "init",
@@ -49,8 +47,8 @@ fn stage_name(at: i32) -> &'static str {
     }
 }
 
-/// Vita error codes the probe is likely to meet, so the log reads like a
-/// diagnosis instead of a hex dump.  Values are from the VitaSDK headers.
+/// 探针可能遇到的 Vita 错误码，让日志读起来像诊断而不是十六进制转储。
+/// 取值来自 VitaSDK 头文件。
 fn error_name(code: i32) -> &'static str {
     match code as u32 {
         0x80431022 => "OUT_OF_MEMORY",
@@ -222,10 +220,10 @@ fn cstr(s: &str) -> Option<CString> {
     CString::new(s).ok()
 }
 
-/// One request, formatted the way §26 wants to read it.
+/// 发一次请求，并按 §26 想要的格式写报告。
 ///
-/// `auto_redirect = false` is how a 302 becomes *visible*: with redirects
-/// enabled the library follows it internally and only the final 206 is seen.
+/// `auto_redirect = false` 是**看见** 302 的办法：开启自动重定向时，
+/// 库内部就把 302 消化掉了，只能看到最后的 206。
 fn attempt(note: &str, url: &str, referer: &str, cookie: &str, tls: i32,
            range: &str, read_cap: usize, auto_redirect: bool, judge: Judge) {
     let mut res = YhttpResult::default();
@@ -298,8 +296,8 @@ fn attempt(note: &str, url: &str, referer: &str, cookie: &str, tls: i32,
         res.headers_len,
         res.took_ms,
         res.ca_loaded,
-        /* sceHttpsEnableOption returns 0 on success, so print the outcome, not
-         * the raw zero, or the log reads like "nothing was enabled". */
+        /* sceHttpsEnableOption 成功时返回 0，所以这里打印"结论"而不是那个 0，
+         * 否则日志看起来像"什么都没打开"。 */
         if tls == TLS_VERIFY {
             if res.verify_flags >= 0 { "ok" } else { "FAILED" }
         } else {
@@ -345,13 +343,12 @@ fn attempt(note: &str, url: &str, referer: &str, cookie: &str, tls: i32,
     ));
 }
 
-/// What a target is evidence *for* — a 302 run must not be judged by 206.
+/// 这个目标是用来证明什么的 —— 302 那一轮不能用 206 去判。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Judge {
     Range206,
     Redirect302,
-    /// A host with a deliberately broken certificate: being *refused* is the
-    /// pass condition, and a 200 would prove nothing is verified at all.
+    /// 故意用坏证书的主机：**被拒绝**才算通过；返回 200 反而说明根本没在校验。
     CertReject,
     Anything,
 }
@@ -412,9 +409,8 @@ struct Target {
     range: &'static str,
 }
 
-/// Built-in list.  The outer/url chain was verified from a PC before this
-/// probe existed: 302 -> CDN, anonymous, and both hosts still accept TLS 1.0,
-/// which the console's older SSL stack can negotiate.
+/// 内置目标列表。outer/url 这条链在探针出现之前就已经在电脑上验证过：
+/// 302 → CDN，匿名可用；两个主机都还能协商上这台机器较老的 SSL 栈。
 fn builtin_targets() -> alloc::vec::Vec<Target> {
     vec![
         Target {
@@ -445,7 +441,7 @@ fn builtin_targets() -> alloc::vec::Vec<Target> {
     ]
 }
 
-/// `ux0:/data/yunyin/netprobe.url` — one URL, optional referer on line 2.
+/// `ux0:/data/yunyin/netprobe.url`：第一行 URL，第二行可选 Referer。
 fn url_file_target() -> Option<Target> {
     let text = std::fs::read_to_string(URL_FILE).ok()?;
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
@@ -464,7 +460,7 @@ fn probe_enabled() -> bool {
     std::fs::metadata(URL_FILE).is_ok() || std::fs::metadata(DEBUG_FLAG).is_ok()
 }
 
-/* ------------------------------------------------------------------ run -- */
+/* ------------------------------------------------------------------ 运行 -- */
 
 fn run() {
     report("=== yunyin Phase 0 network probe ===");
@@ -485,8 +481,8 @@ fn run() {
             attempt(t.note, &t.url, &t.referer, "", t.tls, t.range, 64 * 1024,
                     true, Judge::Range206);
         }
-        /* 302, seen rather than followed: redirects off, so the response
-         * itself must be a 302 carrying Location. */
+        /* 302 要"看见"而不是"跟随"：关掉自动重定向，
+         * 响应本身必须就是带 Location 的 302。 */
         attempt(
             "302 visible (auto-redirect off)",
             "https://music.163.com/song/media/outer/url?id=3346495279.mp3",
@@ -498,8 +494,8 @@ fn run() {
             false,
             Judge::Redirect302,
         );
-        /* Cookie: the API rejects a session-less request for most songs, so the
-         * probe proves the header reaches the server by echoing a marker. */
+        /* Cookie：无会话时多数歌曲会被拒，
+         * 所以探针用一个带标记的请求证明这个头确实发到了服务器。 */
         attempt(
             "cookie header reaches server",
             "https://music.163.com/favicon.ico",
@@ -512,13 +508,12 @@ fn run() {
             Judge::Range206,
         );
         /*
-         * Does this console verify certificates at all?
+         * 这台机器到底校不校验证书？
          *
-         * sceHttpsLoadCert() could not load the 47 system roots at any pool
-         * size (OUT_OF_MEMORY even with a 2 MiB SceHttp pool, which then sat
-         * 912 bytes used), so "verify" mode cannot be assumed to mean anything.
-         * A host with a self-signed certificate settles it: refused = something
-         * verifies; 200 = nothing does.
+         * sceHttpsLoadCert() 在任何池大小下都装不进那 47 张根证书
+         * （2 MiB 的 SceHttp 池也一样 OOM，而它实际只用了 912 字节），
+         * 所以"verify 模式"不能想当然地认为有意义。
+         * 拿一个自签名证书的主机一试便知：被拒绝 = 有东西在校验；返回 200 = 没校验。
          */
         attempt(
             "bad certificate (self-signed) — refusal = verification works",
@@ -555,8 +550,7 @@ fn run() {
     report("=== probe finished ===");
 }
 
-/// Run on its own thread: it must never delay the UI, and the requests can take
-/// seconds on a slow access point.
+/// 放在独立线程里跑：绝不能拖住界面，而且慢接入点上一次请求要好几秒。
 fn spawn_run() {
     if RUNNING.swap(true, Ordering::AcqRel) {
         return; /* already probing */
@@ -573,7 +567,7 @@ fn spawn_run() {
         });
 }
 
-/// Startup path: run once, and only when the card asked for it.
+/// 启动路径：只跑一次，而且只有卡里明确要求时才跑。
 pub fn start_once() {
     if STARTED.swap(true, Ordering::AcqRel) {
         return;
@@ -585,14 +579,13 @@ pub fn start_once() {
     spawn_run();
 }
 
-/// `vitaMedia.netProbe()` — run now regardless of the enable file, so Phase 0
-/// can be repeated without rebooting.  Repeated calls while a run is in flight
-/// are ignored.
+/// `vitaMedia.netProbe()`：不管开关文件，立刻跑一次，这样 Phase 0 不用重启也能重测。
+/// 上一次还没跑完时的重复调用会被忽略。
 pub fn run_now() {
     spawn_run();
 }
 
-/// Short status for the UI/`vitaMedia.netProbe()`; the detail is in the file.
+/// 给界面 / `vitaMedia.netProbe()` 看的简短状态；详细内容在报告文件里。
 pub fn state_json() -> String {
     format!(
         "{{\"enabled\":{},\"started\":{},\"running\":{},\"runs\":{},\"report\":\"{}\"}}",

@@ -6,25 +6,23 @@ extern "C" {
 #endif
 
 /*
- * M4A / MP4 audio demuxer.
+ * M4A / MP4 音频解复用器（"拆盒子"的那一层）。
  *
- * M4A is the box ("container"): AAC is the actual audio inside `mdat`.  This
- * module is only the mover — it walks ftyp/moov/trak/mdia/minf/stbl, picks the
- * `soun` track, reads the AAC parameters out of `esds` and rebuilds the sample
- * table (stts/stsc/stsz/stco) so the caller can pull one raw AAC access unit at
- * a time without ever loading `mdat` into memory.
+ * M4A 只是盒子（容器），里面 `mdat` 里装的才是真正的音频数据 AAC。本模块只负责
+ * 搬运：走 ftyp/moov/trak/mdia/minf/stbl，挑出 `soun` 音轨，从 `esds` 读出 AAC
+ * 参数，重建样本表（stts/stsc/stsz/stco），让调用方可以**一次取一帧裸 AAC**，
+ * 而不必把整个 `mdat` 读进内存。
  *
- * Deliberately knows nothing about decoding and nothing about the Vita: the
- * hardware decoder lives in `yaac.c`, so this file also compiles and runs on a
- * PC (plain gcc, no VitaSDK) for parser testing.
+ * 它刻意不碰解码、也不依赖 Vita：硬件解码在 `yaac.c` 里。因此本文件在电脑上也能
+ * 用普通 gcc（不需要 VitaSDK）编译并测试。
  *
- * Usage:
+ * 用法：
  *   if (ym4a_open(path) != 0) fail;
  *   while ((n = ym4a_next_sample(au, sizeof au)) > 0) decode(au, n);
  *   ym4a_close();
  */
 
-/* ym4a_open result codes. */
+/* ym4a_open 的返回码。 */
 #define YM4A_OK            0
 #define YM4A_ERR_IO       -1  /* missing / unreadable / truncated */
 #define YM4A_ERR_FORMAT   -2  /* not an MP4 container (no moov / no stbl) */
@@ -46,23 +44,23 @@ long long ym4a_total_frames(void);       /* PCM frames per channel, whole track 
 int  ym4a_sample_count(void);            /* AAC access units in `mdat` */
 int  ym4a_cur_sample(void);              /* index of the last sample read, -1 before */
 
-/* PCM frame index where access unit `idx` starts. */
+/* 第 idx 帧 AAC 对应的 PCM 起始帧号（按容器声明的时间轴算）。 */
 long long ym4a_sample_start_frame(int idx);
-/* PCM frames an access unit is declared to contain (media timescale). */
+/* 容器声明这一帧 AAC 含多少 PCM 帧（媒体时间刻度）。 */
 int  ym4a_sample_frames(int idx);
 
 /*
- * Read the next access unit (raw AAC, no ADTS header) into `dst`.
- * Returns the byte count, 0 at end of stream, negative on error.
+ * 读下一帧 AAC（裸数据，没有 ADTS 头）到 `dst`。
+ * 返回字节数；0 表示读完；负数是错误（读失败 / 超过 cap）。
  */
 int  ym4a_next_sample(unsigned char *dst, int cap);
 
-/* Move the read cursor to the access unit that contains PCM frame `frame`. */
+/* 把读游标移到"包含 PCM 帧号 frame"的那一帧 AAC 上。 */
 int  ym4a_seek_frame(long long frame);
 
 /*
- * AudioSpecificConfig (the decoder needs its rate/channels/SBR, which are NOT
- * in the raw access units).  Copies up to `cap` bytes; returns the length.
+ * AudioSpecificConfig：解码器要知道采样率/声道/SBR，而这些**不在**裸帧里。
+ * 最多拷 `cap` 字节，返回长度。
  */
 int  ym4a_asc(unsigned char *dst, int cap);
 const char *ym4a_codec_name(void);

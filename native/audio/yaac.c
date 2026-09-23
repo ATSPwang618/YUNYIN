@@ -1,21 +1,17 @@
 /*
- * Hardware AAC decoding for YUNYIN (SceAudiodec).
+ * YUNYIN 的硬件 AAC 解码（SceAudiodec）。
  *
- * Contract notes that cost real debugging time upstream (see the reference
- * implementations — wiliwili's `vitadec_audio.c` and
- * `vita-hw-decoder/src/internal/vita_aac_decoder.c`):
+ * 下面几条是别人（wiliwili 的 `vitadec_audio.c`、`vita-hw-decoder` 的
+ * `src/internal/vita_aac_decoder.c`）用真机调试换来的经验，照抄不解释：
  *
- *  - MP4/M4A hands us *raw* AAC access units, so `isAdts = 0`; the decoder
- *    does NOT read a header, it needs channels + rate from the container
- *    (that is what `ym4a.c` parses out of `esds`).
- *  - The ES and PCM buffers must be 0x100-aligned *and* come from a 4 KiB
- *    aligned block, otherwise sceAudiodecCreateDecoder fails with a bare
- *    error.  Uncached memory is used, as the hardware block DMAs into them.
- *  - `isSbr` cannot be derived from the access unit; the public references
- *    always pass 1.  With plain AAC-LC the decoder still emits 1024 frames
- *    per unit, so the value is a capability hint, not a forced upsample.
- *  - Output size is whatever the decoder reports (outputPcmSize); we never
- *    assume 1024 samples per frame.
+ *  - MP4/M4A 给的是**裸** AAC 帧，所以 `isAdts = 0`：解码器不会去读帧头，
+ *    声道数和采样率必须由容器提供（也就是 `ym4a.c` 从 `esds` 解析出来的那些）。
+ *  - ES 与 PCM 缓冲区既要 0x100 对齐，又必须来自 4 KiB 对齐的内存块，
+ *    否则 sceAudiodecCreateDecoder 只会返回一个没头没脑的错误。
+ *    这里用 uncached 内存，因为硬件块是直接 DMA 进去的。
+ *  - `isSbr` 无法从帧里推出来；公开参考实现一律传 1。对普通 AAC-LC，
+ *    解码器每帧仍然吐 1024 个采样，所以它只是"能力提示"，不是强制上采样。
+ *  - 输出长度以解码器回报的 `outputPcmSize` 为准，绝不假设每帧 1024。
  */
 
 #include "yaac.h"

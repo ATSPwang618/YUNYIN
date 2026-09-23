@@ -1,14 +1,12 @@
 /*
- * M4A / MP4 audio demuxer — the "mover" part of the M4A chain.
+ * M4A / MP4 音频解复用器 —— M4A 链路里"搬运工"的那一半。
  *
- * M4A is a box (MP4 family); the music inside `mdat` is AAC.  This file finds
- * the boxes, picks the `soun` track, reads the AAC parameters from `esds`, and
- * rebuilds the sample table so the player can pull one raw AAC access unit at a
- * time.  Nothing here decodes: `yaac.c` owns the hardware decoder.
+ * M4A 是盒子（MP4 家族），`mdat` 里装的音乐才是 AAC。本文件找到各个盒子、挑出
+ * `soun` 音轨、从 `esds` 读出 AAC 参数、重建样本表，让播放器可以**一次取一帧裸 AAC**。
+ * 这里不做任何解码：硬件解码在 `yaac.c`。
  *
- * No FFmpeg, no container library, no Vita dependency — the same source
- * compiles on a PC so the parsing can be tested against real files without a
- * console.
+ * 不用 FFmpeg、不用容器库、不依赖 Vita —— 同一份源码在电脑上也能编译，
+ * 所以没有主机也能拿真实文件测解析。
  */
 
 #include "ym4a.h"
@@ -18,8 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Caps: roomy enough for hour-long tracks, tight enough that a corrupt file
- * fails loudly instead of eating the Vita's memory. */
+/* 上限：够放一小时的曲子，又足够紧，坏文件会当场报错而不是把 Vita 内存吃光。 */
 #define YM4A_MAX_TABLE_BYTES (4 * 1024 * 1024)
 #define YM4A_MAX_SAMPLES     4000000
 #define YM4A_MAX_CHUNKS      4000000
@@ -50,31 +47,31 @@ typedef struct {
   unsigned char asc[YM4A_MAX_ASC];
   int asc_len;
 
-  /* stts: run-length (count, duration) pairs */
+  /* stts：游程编码的（个数, 时长）对 */
   unsigned int *stts_count;
   unsigned int *stts_dur;
   int stts_n;
 
-  /* stsc: chunk runs. first_chunk is 1-based, exactly as in the box. */
+  /* stsc：chunk 游程。first_chunk 从 1 开始，和盒子里一样。 */
   unsigned int *stsc_first;
   unsigned int *stsc_spc;
   int stsc_n;
 
-  /* stsz */
+  /* stsz：每帧大小 */
   unsigned int *sizes;
   int sample_n;
 
-  /* stco / co64 */
+  /* stco / co64：每个 chunk 的文件偏移 */
   long long *chunk_off;
   int chunk_n;
 
   int *chunk_first; /* chunk_first[c] = first sample index of chunk c */
 
-  /* read cursor */
+  /* 读游标 */
   int cur;  /* next sample index to read */
   int last; /* index returned by the previous read, -1 if none */
 
-  /* sequential offset cache: (cc, ci, co) = chunk, next sample, its offset */
+  /* 顺序读的偏移缓存：(cc, ci, co) = chunk、下一个样本号、它的偏移 */
   int cc;
   int ci;
   long long co;
@@ -82,7 +79,7 @@ typedef struct {
 
 static ym4a_t g;
 
-/* ------------------------------------------------------------------ bytes -- */
+/* ------------------------------------------------------------------ 字节 -- */
 
 static unsigned int be32(const unsigned char *p) {
   return ((unsigned int)p[0] << 24) | ((unsigned int)p[1] << 16) |
@@ -118,9 +115,9 @@ static unsigned char *slurp(FILE *f, long long off, long long n) {
   return p;
 }
 
-/* ------------------------------------------------------------------ boxes -- */
+/* ------------------------------------------------------------------ 盒子 -- */
 
-/* 0 = ok, -1 = malformed. */
+/* 0 = 正常，-1 = 盒子结构坏了。 */
 static int box_header(FILE *f, long long off, long long end, char type[4],
                       long long *hdr, long long *total) {
   unsigned char b[16];
@@ -145,8 +142,8 @@ static int box_header(FILE *f, long long off, long long end, char type[4],
   return 0;
 }
 
-/* Scan [from,end) for the next box of `type`.
- * 0 = found, 1 = not found, -1 = malformed. */
+/* 在 [from,end) 里往后找第一个 `type` 类型的盒子。
+ * 0 = 找到，1 = 没找到，-1 = 结构坏了。 */
 static int box_find(FILE *f, long long from, long long end, const char type[4],
                     ym4a_box *out) {
   long long off = from;
@@ -169,7 +166,7 @@ static long long box_payload(const ym4a_box *b) {
   return b->total - (b->body - b->start);
 }
 
-/* ----------------------------------------------------------- audio config -- */
+/* ------------------------------------------------------------ 音频参数 -- */
 
 typedef struct {
   const unsigned char *p;
@@ -201,13 +198,11 @@ static int aac_rate_from_index(int idx) {
 }
 
 /*
- * AudioSpecificConfig -> object type, rate, channels, SBR.
+ * AudioSpecificConfig → 编码类型(AOT)、采样率、声道、SBR。
  *
- * Plain AAC-LC carries everything in the first two bytes (the NetEase sample
- * this was built against is `12 10` = LC / 44100 / stereo).  Explicit SBR
- * (AOT 5 / 29) puts the output rate in extensionSamplingFrequencyIndex;
- * implicit SBR hides it behind the 0x2B7 sync extension after the
- * GASpecificConfig, which is why this walks the config bit by bit.
+ * 普通 AAC-LC 前两个字节就够了（当初对着的网易云样本是 `12 10` = LC / 44100 / 立体声）。
+ * 显式 SBR（AOT 5 / 29）把输出采样率放在 extensionSamplingFrequencyIndex；
+ * 隐式 SBR 则藏在 GASpecificConfig 之后的 0x2B7 同步扩展里 —— 所以这里必须逐位解析。
  */
 static void parse_asc(const unsigned char *asc, int len, int *aot, int *rate,
                       int *ch, int *sbr) {
@@ -240,7 +235,7 @@ static void parse_asc(const unsigned char *asc, int len, int *aot, int *rate,
       sbr_flag = 1;
     }
   } else if (a == 2 || a == 1 || a == 3 || a == 4) {
-    /* GASpecificConfig: frameLengthFlag, dependsOnCoreCoder(+14), extensionFlag */
+    /* GASpecificConfig：frameLengthFlag、dependsOnCoreCoder（可能再跟 14 位）、extensionFlag */
     int depends = br_read(&b, 1);
     int sync_pos;
     (void)br_read(&b, 1); /* frameLengthFlag: not needed here */
@@ -267,7 +262,7 @@ static void parse_asc(const unsigned char *asc, int len, int *aot, int *rate,
   if (sbr_flag) *sbr = 1;
 }
 
-/* esds -> AudioSpecificConfig. Descriptor walk: 0x03 (ES) -> 0x04 -> 0x05. */
+/* esds → AudioSpecificConfig。描述符按 0x03(ES) → 0x04 → 0x05 逐层进。 */
 static int parse_esds(const unsigned char *p, int n, unsigned char *asc,
                       int *asc_len) {
   int i = 4; /* version + flags */
@@ -313,11 +308,11 @@ static int parse_esds(const unsigned char *p, int n, unsigned char *asc,
   return -1;
 }
 
-/* ---------------------------------------------------------- sample tables -- */
+/* ---------------------------------------------------------- 样本表解析 -- */
 
 /*
- * Sample-table payload layout is version/flags (4) then the entry count (4)
- * then the entries — the count is at +4, not at +8.
+ * 样本表的载荷布局是：version/flags(4) → 表项个数(4) → 表项。
+ * 注意个数在 +4 而不是 +8（这里踩过一次坑）。
  */
 
 static int read_stts(FILE *f, const ym4a_box *box) {
@@ -441,8 +436,8 @@ static int read_stco(FILE *f, const ym4a_box *box, int wide) {
   return 0;
 }
 
-/* stsc -> first sample index of every chunk.  Samples per chunk from the last
- * run apply to any remaining chunks, as the spec requires. */
+/* stsc → 每个 chunk 的首个样本号。按规范，最后一段游程的"每 chunk 样本数"
+ * 会继续适用于剩余的 chunk。 */
 static int build_chunk_index(void) {
   int c, e = 0;
   if (!g.chunk_n || !g.stsc_n) return -1;
@@ -457,12 +452,12 @@ static int build_chunk_index(void) {
     yunyin_log("ym4a: chunk runs cover fewer samples than stsz\n");
     return -1;
   }
-  /* A longer stsc run than the sample count is normal for the final chunk. */
+  /* 最后一个 chunk 出现"游程比样本数还长"是正常的。 */
   g.chunk_first[g.chunk_n] = g.sample_n;
   return 0;
 }
 
-/* ----------------------------------------------------------------- mapping -- */
+/* ------------------------------------------------------------ 编号换算 -- */
 
 static int chunk_of_sample(int idx) {
   int lo = 0, hi = g.chunk_n;
@@ -476,8 +471,8 @@ static int chunk_of_sample(int idx) {
   return lo;
 }
 
-/* Byte offset of sample `idx`; sequential reads advance a cached cursor so the
- * whole track costs one pass, not one pass per sample. */
+/* 第 idx 帧的文件偏移。顺序读时游标会往前走，所以整首歌只走一遍，
+ * 而不是每取一帧就从头数一遍。 */
 static long long offset_of(int idx) {
   int c;
   if (idx < 0 || idx >= g.sample_n) return -1;
@@ -494,9 +489,8 @@ static long long offset_of(int idx) {
   return g.co;
 }
 
-/* stts counts ticks of the media timescale; the player counts PCM frames at
- * `rate`.  For AAC they are normally the same number; the ratio only differs
- * when a track's timescale is the SBR *core* rate. */
+/* stts 数的是"媒体时间刻度"，播放器数的是 `rate` 下的 PCM 帧。
+ * AAC 通常两者相同；只有当年轨道的 timescale 用的是 SBR 的**核心**采样率时才会差比例。 */
 static long long ticks_to_frames(unsigned long long ticks) {
   if (g.timescale <= 0 || g.rate <= 0) return (long long)ticks;
   if (g.timescale == g.rate) return (long long)ticks;
@@ -543,7 +537,7 @@ static int sample_of_frame(long long frame) {
   return g.sample_n > 0 ? g.sample_n - 1 : 0;
 }
 
-/* -------------------------------------------------------------------- open -- */
+/* ------------------------------------------------------------------ 打开 -- */
 
 static void reset_state(void) {
   free(g.stts_count);
@@ -563,8 +557,8 @@ void ym4a_close(void) { reset_state(); }
 
 int ym4a_ready(void) { return g.ready; }
 
-/* Read the mp4a sample entry (+ esds) and the audio-track tables.
- * 0 = audio track parsed, 1 = not an audio track we support. */
+/* 读 mp4a 样本描述（含 esds）与音轨的各个表。
+ * 0 = 音轨解析成功，1 = 这不是我们能处理的音轨。 */
 static int parse_audio_trak(FILE *f, const ym4a_box *trak) {
   ym4a_box mdia, minf, stbl, hdlr, mdhd, stsd, box;
   long long end = trak->start + trak->total;
@@ -736,7 +730,7 @@ int ym4a_open(const char *path) {
   return had_audio ? YM4A_ERR_CODEC : YM4A_ERR_NO_AUDIO;
 }
 
-/* --------------------------------------------------------------- accessors -- */
+/* -------------------------------------------------------------- 取值接口 -- */
 
 int ym4a_rate(void) { return g.ready ? g.rate : 0; }
 int ym4a_channels(void) { return g.ready ? g.ch : 0; }

@@ -1,46 +1,41 @@
-//! NetEase API surface (task book §45–§47).
+//! 网易云 API 的接口面（任务书 §45–§47）。
 //!
-//! The endpoints below are the ones the plan needs; the parameter sets and the
-//! request encryption are ported from `music-lib` (§46), which is the reference
-//! implementation for this provider.
+//! 下面这些端点就是计划要用到的；参数组合与请求加密照 `music-lib`（§46）搬 ——
 //!
-//! Phase 3 status: constants + shape only.  `call()` returns `Unsupported` until
-//! `net::http` exists, and it must stay the single place that talks to the API —
-//! no endpoint string may appear anywhere else in the tree.
+//! 当前状态：只有常量与形状。在 `net::http` 能用之前 `call()` 一律返回
+//! `Unsupported`；而且**只允许这一个地方**写端点字符串，别处不许出现。
 #![allow(dead_code)]
 
 use crate::media::provider::{MusicProvider, ProviderError, Quality};
 
 pub const HOST: &str = "https://music.163.com";
 
-/// Song detail: name/artist/album/duration — needed to show a remote track in
-/// the library before its URL is resolved.
+/// 歌曲详情：歌名/歌手/专辑/时长 —— 在线曲目在解析出 URL 之前就要能显示在曲库里。
 pub const PATH_SONG_DETAIL: &str = "/api/v3/song/detail";
-/// Play URL: the `GetDownloadURL` equivalent (§45).
+/// 播放地址：相当于参考实现里的 `GetDownloadURL`（§45）。
 pub const PATH_SONG_URL_V1: &str = "/api/song/enhance/player/url/v1";
-/// Lyric lookup, matching what the local tag reader provides for files (§43).
+/// 歌词查询，和本地标签读取给文件提供的歌词对应（§43）。
 pub const PATH_LYRIC: &str = "/api/song/lyric";
-/// Playlist contents, for the streaming library view.
+/// 歌单内容，给在线曲库界面用。
 pub const PATH_PLAYLIST_DETAIL: &str = "/api/v6/playlist/detail";
 
-/// Which request flavour an endpoint needs.  NetEase accepts several; the
-/// reference implementation uses the web API for these four (§46).
+/// 这个端点要用哪种请求形式。网易云能接好几种，参考实现里这四个都用 web API（§46）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flavour {
-    /// Plain query string, no encryption.
+    /// 明文 query string，不加密。
     Plain,
-    /// `weapi`: AES-128-CBC + RSA-wrapped key (§46).
+    /// `weapi`：AES-128-CBC + RSA 包裹密钥（§46）。
     WeApi,
-    /// `eapi`: AES-128-ECB with a fixed key, used by the app clients.
+    /// `eapi`：固定密钥的 AES-128-ECB，客户端 App 用的那种。
     EApi,
 }
 
-/// One API call, described.
+/// 一次 API 调用的**描述**。
 #[derive(Clone, Debug)]
 pub struct Call {
     pub path: &'static str,
     pub flavour: Flavour,
-    /// Raw parameters; encryption happens in `crypto` just before sending.
+    /// 明文参数；加密在发送前由 `crypto` 完成。
     pub params: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>,
 }
 
@@ -65,13 +60,13 @@ fn quality_id(q: Quality) -> &'static str {
     super::quality_id(q)
 }
 
-/// Perform a call.  Phase 3 fills this in through `net::http`; the provider never
-/// calls it directly, `resolve` does.
+/// 真正发一次调用。Phase 3 用 `net::http` 补上；Provider 不直接调它，由
+/// `resolve` 调。
 pub fn call(_c: &Call) -> Result<alloc::string::String, ProviderError> {
     Err(ProviderError::Unsupported)
 }
 
-/// Kept so a future provider can assert it implements the seam.
+/// 留着给以后的 Provider 自证实现了那条接缝。
 pub fn provider_name<P: MusicProvider>(p: &P) -> &'static str {
     p.name()
 }

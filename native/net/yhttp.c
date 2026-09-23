@@ -1,11 +1,10 @@
 /*
- * Phase 0 network probe — see yhttp.h for the contract.
+ * Phase 0 网络探针 —— 接口约定见 yhttp.h。
  *
- * Written against the VitaSDK headers only (psp2/net/{net,netctl,http}.h,
- * psp2/libssl.h, psp2/sysmodule.h); no other platform's API appears here, as
- * §23 requires.  Every error path records both the calling stage and the raw
- * Vita error code, because on hardware the difference between "DNS failed",
- * "TLS failed" and "aborted" is the whole point of the exercise.
+ * 只按 VitaSDK 头文件写（psp2/net/{net,netctl,http}.h、psp2/libssl.h、
+ * psp2/sysmodule.h），不出现任何别的平台的 API（§23 的要求）。每个失败路径都
+ * 同时记录"卡在哪一步"和"原始 Vita 错误码" —— 真机上区分 DNS 失败 / TLS 失败 /
+ * 被取消，正是这件事的意义所在。
  */
 
 #include "yhttp.h"
@@ -30,8 +29,8 @@
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-/* Timeouts in microseconds; Phase 0 wants failures to be *legible*, so these
- * are short enough to fit several attempts in one boot. */
+/* 超时单位是微秒。Phase 0 希望"失败得快且看得懂"，所以取值偏短，
+ * 一次启动内能跑完多轮尝试。 */
 #define YHTTP_RESOLVE_TIMEOUT_US (5 * 1000 * 1000)
 #define YHTTP_CONNECT_TIMEOUT_US (10 * 1000 * 1000)
 #define YHTTP_RECV_TIMEOUT_US    (10 * 1000 * 1000)
@@ -47,7 +46,7 @@ static unsigned int g_ssl_pool = YHTTP_SSL_POOL;
 static unsigned int g_http_pool = YHTTP_HTTP_POOL;
 static int g_verify_flags;
 
-/* ------------------------------------------------------------------ log -- */
+/* ------------------------------------------------------------------ 日志 -- */
 
 static void yh_logf(const char *fmt, ...) {
     char line[256];
@@ -64,7 +63,7 @@ static void yh_logf(const char *fmt, ...) {
 
 void yhttp_set_log(yhttp_log_fn fn) { g_log = fn; }
 
-/* ----------------------------------------------------------- lifecycle -- */
+/* ------------------------------------------------------------ 生命周期 -- */
 
 int yhttp_init(void) {
     SceNetInitParam param;
@@ -75,8 +74,8 @@ int yhttp_init(void) {
     ret = sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
     yh_logf("yhttp: sysmodule NET -> 0x%08X\n", (unsigned)ret);
 
-    /* SceNetInit keeps this block for its whole lifetime, so it must outlive
-     * every request (and cannot be a stack buffer). */
+    /* SceNetInit 会把这块内存留到整个生命周期结束，所以它必须活得比所有请求久
+     * （不能用栈上的缓冲区）。 */
     g_net_pool = malloc(YHTTP_NET_POOL);
     if (!g_net_pool) {
         yh_logf("yhttp: net pool malloc(%d) failed\n", YHTTP_NET_POOL);
@@ -150,8 +149,7 @@ int yhttp_memory(unsigned int *pool, unsigned int *in_use, unsigned int *peak) {
     if (pool) *pool = st.poolSize;
     if (in_use) *in_use = st.currentInuseSize;
     if (peak) *peak = st.maxInuseSize;
-    /* §27: the console libraries keep their own pools, so the honest memory
-     * figure is "what did we hand out, and how much did they actually use". */
+    /* §27：系统库有自己的内存池，所以诚实的口径是"我们给了多少、它们实际用了多少"。 */
     yh_logf("yhttp: http pool %u used=%u peak=%u\n", st.poolSize,
             st.currentInuseSize, st.maxInuseSize);
     memset(&ssl, 0, sizeof ssl);
@@ -163,11 +161,10 @@ int yhttp_memory(unsigned int *pool, unsigned int *in_use, unsigned int *peak) {
 }
 
 /*
- * Certificate validation against the console's own CA store (§23).
+ * 与证书校验相关（§23）。
  *
- * A 256 KiB SceHttp pool is not enough for the 47 root certificates (measured
- * on hardware: sceHttpsLoadCert -> 0x80431022 OUT_OF_MEMORY), so the pool pair
- * is grown until the store fits.  The result is reported and remembered.
+ * 实测：256 KiB 的 SceHttp 池装不下那 47 张根证书（sceHttpsLoadCert 返回
+ * 0x80431022 OUT_OF_MEMORY），所以逐档放大池子重试，并把结果记下来。
  */
 static int yh_try_load_ca(unsigned int ssl_pool, unsigned int http_pool) {
     SceHttpsCaList list;
@@ -234,19 +231,16 @@ unsigned int yhttp_ca_http_pool(void) { return g_http_pool; }
 unsigned int yhttp_ca_ssl_pool(void) { return g_ssl_pool; }
 
 /*
- * Turning verification on.
+ * 把"校验"打开。
  *
- * Two mechanisms exist and they are not the same thing:
+ * 有两个机制，它们**不是一回事**：
  *
- *   sceHttpsEnableOption(SCE_HTTPS_FLAG_*)  switches the *checks* on
- *       (server verify, CN, validity window, known-CA).  No id argument: it is
- *       a process-wide setting.
- *   sceHttpsLoadCert()                      registers *additional* roots.
+ *   sceHttpsEnableOption(SCE_HTTPS_FLAG_*)  打开各项检查
+ *       （服务器校验、CN、有效期、已知 CA）；没有 id 参数，是进程级设置。
+ *   sceHttpsLoadCert()                      只是"额外注册根证书"。
  *
- * The CA store could not be loaded on hardware (OUT_OF_MEMORY at every pool
- * size), which does not by itself mean verification is off — the firmware may
- * verify against its own store once the flags are enabled.  So: enable the
- * flags first and let the self-signed-certificate target decide the truth.
+ * 根证书装载在真机上失败（任何池大小都 OOM），但这**不代表校验是关的**：
+ * 固件本身用自带根证书库在验。所以先打开开关，真假交给"自签名证书"那个目标来判。
  */
 static int yh_enable_verify_flags(void) {
     unsigned int flags = SCE_HTTPS_FLAG_SERVER_VERIFY |
@@ -261,28 +255,26 @@ static int yh_enable_verify_flags(void) {
 }
 
 static int yh_load_system_ca(void) {
-    /* Flags are what actually switch verification on; the CA load is a bonus
-     * that this firmware refuses, so its failure must not abort verify mode. */
+    /* 真正打开校验的是这些 flag；加载根证书只是"额外加分项"，
+     * 这台固件拒绝它，不能因此让 verify 模式失败。 */
     g_verify_flags = yh_enable_verify_flags();
     (void)yhttp_load_ca();
     return 0;
 }
 
-/* -------------------------------------------------------------- headers -- */
+/* -------------------------------------------------------------- 响应头 -- */
 
 /*
- * Header block handling.
+ * 响应头的处理。
  *
- * `sceHttpGetAllResponseHeaders` hands back a pointer into the library's own
- * pool plus a byte count — it is NOT a caller-owned C string:
+ * `sceHttpGetAllResponseHeaders` 返回的是"库自己池里的指针 + 字节数"，
+ * **不是调用方拥有的 C 字符串**：
  *
- *   - it must never be free()d (that corrupts the SceHttp pool; doing so is what
- *     crashed the first on-device probe run, inside _svfprintf_r), and
- *   - it is not safe to treat as NUL-terminated: printing "%.150s" from a value
- *     inside it walks past the end of the block.
+ *   - 绝对不能用 free() 释放（那会破坏 SceHttp 的堆 —— 第一次真机探针就是因为
+ *     这个崩在 newlib 的 _svfprintf_r 里）；
+ *   - 也不能当成 NUL 结尾的字符串：用 "%.150s" 打印会读过量，越过这个块的尾巴。
  *
- * So every access here is bounded by `size`, and values are returned as
- * pointer+length pairs rather than strings.
+ * 所以这里所有访问都以 `size` 为界，取值一律用"指针 + 长度"返回，而不是字符串。
  */
 typedef struct {
     const char *ptr;
@@ -320,7 +312,7 @@ static yh_hdr yh_header_find(const char *headers, unsigned int size,
 }
 
 static void yh_parse_content_range(const yh_hdr *h, yhttp_result *res) {
-    /* Content-Range: bytes 0-65535/12345678   (or "/" "*" for unknown) */
+    /* Content-Range: bytes 0-65535/12345678   （长度未知时是 "/" 加 "*"） */
     unsigned long long start = 0, end = 0, total = 0;
     char tmp[64];
     int n;
@@ -337,7 +329,7 @@ static void yh_parse_content_range(const yh_hdr *h, yhttp_result *res) {
     }
 }
 
-/* ---------------------------------------------------------------- probe -- */
+/* ---------------------------------------------------------------- 请求 -- */
 
 int yhttp_probe(const char *url, const char *range, const char *referer,
                 const char *cookie, int tls_mode, int auto_redirect,
@@ -359,8 +351,8 @@ int yhttp_probe(const char *url, const char *range, const char *referer,
         return -1;
     }
     if (tls_mode == YHTTP_TLS_VERIFY) yh_load_system_ca();
-    /* Read the verification state *after* the attempt to arm it: reporting it
-     * before was why the log showed flags=0x0 next to a success code. */
+    /* 校验状态要在"打开校验"之后再读一次才上报（之前先读，日志里就出现
+     * 成功码旁边写着 flags=0x0 的怪现象）。 */
     res->ca_loaded = g_ca_loaded;
     res->verify_flags = g_verify_flags;
     res->http_pool = g_http_pool;
@@ -374,7 +366,7 @@ int yhttp_probe(const char *url, const char *range, const char *referer,
     req = sceHttpCreateRequestWithURL(conn, SCE_HTTP_METHOD_GET, url, 0);
     if (req < 0) { res->err_code = req; res->err_at = 1; goto done; }
 
-    /* §22: redirects, timeouts and header budget are all part of the contract. */
+    /* §22：重定向、超时、响应头上限都属于契约的一部分。 */
     sceHttpSetAutoRedirect(req, auto_redirect ? 1 : 0);
     sceHttpSetResolveTimeOut(req, YHTTP_RESOLVE_TIMEOUT_US);
     sceHttpSetConnectTimeOut(req, YHTTP_CONNECT_TIMEOUT_US);
@@ -408,7 +400,7 @@ int yhttp_probe(const char *url, const char *range, const char *referer,
         yh_parse_content_range(&cr, res);
         if (ct.ptr && ct.len >= 6 && strncasecmp(ct.ptr, "audio/", 6) == 0)
             res->content_type_audio = 1;
-        /* %.*s with an explicit length: never reads past the block. */
+        /* 用带长度的 %.*s：永远不会读过头块。 */
         if (cr.ptr) yh_logf("yhttp: Content-Range: %.*s\n", cr.len, cr.ptr);
         if (ct.ptr) yh_logf("yhttp: Content-Type: %.*s\n", ct.len, ct.ptr);
         if (loc.ptr) {
@@ -442,14 +434,14 @@ int yhttp_probe(const char *url, const char *range, const char *referer,
     }
 
 done:
-    /* `headers` belongs to SceHttp's pool: freeing it corrupts that pool. */
+    /* `headers` 属于 SceHttp 的内存池：释放它会破坏那个池。 */
     if (req >= 0) sceHttpDeleteRequest(req);
     if (conn >= 0) sceHttpDeleteConnection(conn);
     if (tmpl >= 0) sceHttpDeleteTemplate(tmpl);
     return res->err_code;
 }
 
-/* ---------------------------------------------------------------- abort -- */
+/* ---------------------------------------------------------------- 取消 -- */
 
 typedef struct {
     int req;
@@ -461,17 +453,15 @@ typedef struct {
 } yh_abort_ctx;
 
 /*
- * Static on purpose: sceKernelStartThread() *copies* its argument bytes onto
- * the new thread's stack, so passing the address of a stack struct gave the
- * worker a private copy while this thread watched the original (all zeroes —
- * why the first two abort runs always reported bytes_in_flight=0).
+ * 故意用静态变量：sceKernelStartThread() 会把参数**拷贝**到新线程的栈上，
+ * 以前传栈上结构体的地址，等于给 worker 发了一份副本，而主线程盯的是原件
+ * （永远全是 0 —— 这就是前两次取消测试一直报 bytes_in_flight=0 的原因）。
  */
 static yh_abort_ctx g_abort;
 
 static int yh_abort_worker(unsigned int args, void *argp) {
-    /* sceKernelStartThread() copies its argument bytes onto the new thread's
-     * stack, so we deliberately start with no argument and share the one
-     * static context instead — reading `argp` here is what wrote to NULL. */
+    /* sceKernelStartThread() 会把参数拷贝到新线程栈上，所以这里故意不传参数、
+     * 共用一个静态结构体；以前在这里解引用 `argp` 就是往 NULL 写。 */
     yh_abort_ctx *ctx = &g_abort;
     unsigned char scratch[4096];
     (void)args;
@@ -479,8 +469,7 @@ static int yh_abort_worker(unsigned int args, void *argp) {
     ctx->send_rc = sceHttpSendRequest(ctx->req, NULL, 0);
     if (ctx->send_rc >= 0) {
         ctx->started = 1;
-        /* Chase the body in small chunks: the abort has to land inside a
-         * transfer that is genuinely in flight, not between requests. */
+        /* 用小片持续读：取消必须落在"真的在传数据"的过程中，而不是两次请求之间。 */
         for (;;) {
             int n = sceHttpReadData(ctx->req, scratch, sizeof scratch);
             if (n <= 0) {
@@ -543,10 +532,9 @@ int yhttp_abort_probe(const char *url, const char *referer, int tls_mode,
     }
 
     /*
-     * Wait until a transfer is really in flight (SendRequest done *and* some
-     * bytes received), then abort and measure how long the blocked read takes
-     * to give up.  Waiting a fixed time instead — as the first version did —
-     * only measured whether the worker's whole loop had finished (§24).
+     * 先等到"真的在传数据"（SendRequest 已返回**并且**已收到一些字节），再取消，
+     * 然后量被阻塞的读多久放弃。第一版只是等固定时间，那测的其实是 worker 整个
+     * 循环有没有跑完（§24 要的不是这个）。
      */
     {
         unsigned int spin = 0;
@@ -561,13 +549,13 @@ int yhttp_abort_probe(const char *url, const char *referer, int tls_mode,
         }
     }
     res->bytes_read = g_abort.bytes;   /* how much was in flight at abort time */
-    (void)wait_ms;                  /* kept for API compatibility */
+    (void)wait_ms;                  /* 保留参数只为接口兼容 */
 
     t0 = sceKernelGetSystemTimeWide();
     ret = sceHttpAbortRequest(req);
     {
         unsigned int spin = 0;
-        while (!g_abort.stopped && spin < 5000) {   /* up to 5 s */
+        while (!g_abort.stopped && spin < 5000) {   /* 最多等 5 秒 */
             sceKernelDelayThread(1000);
             spin++;
         }
@@ -577,7 +565,7 @@ int yhttp_abort_probe(const char *url, const char *referer, int tls_mode,
     res->abort_took_ms = (unsigned int)((t1 - t0) / 1000);
     res->aborted = g_abort.stopped ? 1 : 0;
     if (ret < 0) { res->err_code = ret; res->err_at = 5; }
-    else res->err_code = g_abort.read_rc;   /* expect SCE_HTTP_ERROR_ABORTED */
+    else res->err_code = g_abort.read_rc;   /* 预期是取消相关的错误码 */
     yh_logf("yhttp: abort -> rc=0x%08X, stopped=%d, bytes_in_flight=%d, "
             "send=0x%08X read=0x%08X, stopped in %u ms\n",
             (unsigned)ret, g_abort.stopped, g_abort.bytes,
@@ -588,9 +576,8 @@ int yhttp_abort_probe(const char *url, const char *referer, int tls_mode,
 
 done:
     if (!g_abort.stopped) {
-        /* The worker is still inside a read on this request; deleting it would
-         * pull the rug out from under that thread.  Leaking one request beats
-         * crashing the app, and the next probe run re-creates everything. */
+        /* worker 还在读这个请求，删掉它等于抽掉对方脚下的地板。
+         * 泄漏一个请求好过把整个应用带崩，下次探针会重新建。 */
         yh_logf("yhttp: abort worker never stopped; leaving request %d alive\n",
                 req);
         return res->err_code;
@@ -601,7 +588,7 @@ done:
     return res->err_code;
 }
 
-#else /* host build: the probe is Vita-only, keep the sources linkable */
+#else /* 电脑上的构建：探针只在 Vita 上有效，这里留桩让源码可链接 */
 
 void yhttp_set_log(yhttp_log_fn fn) { (void)fn; }
 int yhttp_init(void) { return -1; }

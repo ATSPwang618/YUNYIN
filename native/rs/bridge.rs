@@ -1,4 +1,4 @@
-//! `globalThis.vitaMedia` QuickJS bindings. Method names are a frozen contract.
+//! `globalThis.vitaMedia` 的 QuickJS 绑定。**方法名是冻结的契约**，不能改。
 
 use crate::media::platform::{fs, log, store};
 use crate::media::{bgm, tags};
@@ -34,14 +34,13 @@ unsafe fn js_str(ctx: *mut JSContext, s: &str) -> JSValue {
     JS_NewStringLen(ctx, s.as_ptr(), s.len())
 }
 
-/// Run `body` with panics contained.
+/// 把 `body` 包起来跑，panic 不外泄。
 ///
-/// A Rust panic must never unwind out of an `extern "C"` callback: QuickJS's
-/// frames carry no unwind tables, so the unwinder walks off into whatever
-/// memory follows.  That is not theoretical — a `&str` slice panic while
-/// reading an OGG tag landed the program counter inside the app's own JS
-/// bundle string on real hardware ("undefined instruction exception").
-/// Anything the native side can trip over now degrades to `fallback` instead.
+/// Rust 的 panic 绝不能从 `extern "C"` 回调里往外展开：QuickJS 的栈帧没有 unwind
+/// 表，展开器会一路走进后面的随机内存。这不是理论 —— 真机上读 OGG 标签时一个
+/// `&str` 切片 panic，就把程序计数器带进了应用自己的 JS 打包字符串里
+/// （dump 里显示为 "undefined instruction exception"）。
+/// 现在原生侧能踩到的任何问题，都会退化成 `fallback`。
 fn guarded<T>(what: &str, fallback: T, body: impl FnOnce() -> T) -> T {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         Ok(v) => v,

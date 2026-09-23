@@ -4,13 +4,13 @@
 //! port (ElevenMPVScrobbling path). Sound belongs to this process, so tearing
 //! the LiveArea bubble stops playback without a QUIT watchdog.
 //!
-//! Layout:
+//! 目录分工：
 //!
 //! ```text
-//! bgm.rs decoder.rs bridge.rs tags.rs   the player (audio thread, FFI, JS, tags)
-//! source/ net/ provider/                the audio engine seam (see docs/ARCHITECTURE.md)
-//! platform/                             power, PS-key lock, fs, log, settings
-//! ui/                                   CJK streaming, font atlas, frame skip
+//! bgm.rs decoder.rs bridge.rs tags.rs  播放器本体（音频线程 / FFI / JS 绑定 / 标签）
+//! source/ net/ provider/               引擎接缝（见 docs/架构设计.md）
+//! platform/                            电源、PS 键锁、文件、日志、设置
+//! ui/                                  流式 CJK、字体图集、跳帧
 //! ```
 
 use alloc::string::String;

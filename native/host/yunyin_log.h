@@ -2,14 +2,12 @@
 #define YUNYIN_LOG_H
 
 /*
- * Opt-in native log.  Nothing is written unless an empty file named `debug`
- * exists in ux0:/data/yunyin — the shipped build stays silent, and a card with
- * that file gets a readable ux0:/data/yunyin.log.
+ * 可选开启的原生日志：卡里 `ux0:/data/yunyin/` 下存在空文件 `debug` 时才写，
+ * 正式版默认完全静默；有那个文件的卡会得到可读的 ux0:/data/yunyin.log。
  *
- * Shared by the whole C side (host/yunyin_listdir.c, host/yunyin_image.c,
- * audio/ym4a.c, audio/yaac.c) — there is exactly one implementation.  Outside
- * the Vita toolchain (`__vita__`) the helpers compile to no-ops so the same
- * sources can be built and exercised on a PC.
+ * 整个 C 侧共用这一份实现（host/yunyin_listdir.c、host/yunyin_image.c、
+ * audio/ym4a.c、audio/yaac.c）。不在 Vita 工具链里（未定义 `__vita__`）时，
+ * 这两个函数编译成空操作，好让同样的源码在电脑上也能编、能跑。
  */
 
 #if defined(__GNUC__)

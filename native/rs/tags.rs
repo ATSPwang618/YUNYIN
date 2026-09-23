@@ -1,5 +1,5 @@
-//! Tags + embedded cover. Moved out of the old media.rs monolith.
-//! Playback does not live here.
+//! 标签与内嵌封面（从旧的 media.rs 里拆出来的）。
+//! 播放逻辑不在这里。
 
 use crate::media::{COVER_PX, MAX_ART, PREFIX_CAP};
 use pocketjs_core::spec::psm;
@@ -442,11 +442,10 @@ fn extract_ogg_picture(bytes: &[u8]) -> Option<Vec<u8>> {
                 let comment = core::str::from_utf8(&body[p..p + n]).unwrap_or("");
                 p += n;
                 if let Some((_, rest)) = comment.split_once('=') {
-                    /* Byte comparison, not `comment[..24]`: the slice would
-                     * panic when byte 24 lands inside a multi-byte character,
-                     * which is the normal case for a CJK-tagged comment
-                     * ("TITLE=宇多田…").  A panic there unwinds into the C
-                     * frames of the JS engine and takes the whole app down. */
+                    /* 这里用字节比较，而不是 `comment[..24]`：后者在第 24 个字节
+                     * 正好落在多字节字符中间时会 panic，而这对中文/日文标签
+                     * （"TITLE=宇多田…"）是常态。那里的 panic 会一路展开进
+                     * JS 引擎的 C 栈帧，直接把整个应用带崩。 */
                     if comment.as_bytes().len() >= 24
                         && comment.as_bytes()[..24]
                             .eq_ignore_ascii_case(b"METADATA_BLOCK_PICTURE=")
@@ -570,27 +569,25 @@ fn extract_cover_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /* ------------------------------------------------------------------ M4A ---- */
 /*
- * M4A is a container: the metadata lives in moov/udta/meta/ilst, the audio is
- * AAC inside mdat.  Two things make this different from the other formats:
+ * M4A 是容器：元数据在 moov/udta/meta/ilst 里，音频是 mdat 里的 AAC。
+ * 它和别的格式有两个不同点：
  *
- *   - moov can sit at the *start* (NetEase-style "fast start") or at the very
- *     end of the file, so tags cannot be read from a fixed prefix — the box
- *     chain has to be walked with seeks.
- *   - Text and artwork are typed `data` atoms (1 = UTF-8), not key/value pairs.
+ *   - moov 可能在文件**开头**（网易云那种"fast start"），也可能在文件最末尾，
+ *     所以标签不能从固定的前缀里读 —— 必须带 seek 走一遍盒子链。
+ *   - 文字和封面是**带类型**的 `data` 原子（1 = UTF-8），不是键值对。
  */
 
-/// A moov with a big cover can be a few MB; this bounds the read.
+/// 带大封面的 moov 可能有几 MB；这里给读取设个上限。
 const MP4_MOOV_CAP: usize = 8 * 1024 * 1024;
 
 fn is_mp4(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && &bytes[4..8] == b"ftyp"
 }
 
-/// Walk the top-level box chain and return the whole `moov` box (header
-/// included) — empty when the file has none or it is unreasonably large.
+/// 走一遍顶层盒子链，返回整个 `moov` 盒子（含头部）；没有、或者大得不合理时返回空。
 ///
-/// Only `moov` is size-capped: `mdat` is legitimately bigger than any sensible
-/// cap, and refusing it here is what will hide a trailing moov.
+/// **只对 `moov` 限长**：`mdat` 本来就可能比任何上限都大，
+/// 当初就是因为把上限也套在 mdat 上，才导致"moov 在文件尾"的文件读不到标签。
 fn mp4_moov(path: &str) -> Vec<u8> {
     let Ok(mut f) = std::fs::File::open(path) else {
         return Vec::new();
@@ -669,10 +666,10 @@ fn mp4_box(buf: &[u8], start: usize, end: usize, typ: &[u8; 4]) -> Option<(usize
     None
 }
 
-/// The `ilst` payload inside a moov box (handles moov/meta and moov/udta/meta).
+/// moov 盒子里的 `ilst` 载荷（同时支持 moov/meta 与 moov/udta/meta 两种放法）。
 fn mp4_ilst(moov: &[u8]) -> Option<(usize, usize)> {
-    /* mp4_moov hands back the whole box, header included: skip those 8 bytes
-     * and walk its payload (mvhd / trak / udta). */
+    /* mp4_moov 返回的是"整个盒子含头部"：跳过那 8 字节，再走它的载荷
+     * （mvhd / trak / udta）。 */
     if moov.len() < 8 || &moov[4..8] != b"moov" {
         return None;
     }
@@ -680,7 +677,7 @@ fn mp4_ilst(moov: &[u8]) -> Option<(usize, usize)> {
     let moov_end = moov.len();
     if let Some((mb, ml)) = mp4_box(moov, body, moov_end, b"udta") {
         if let Some((meta, mlen)) = mp4_box(moov, mb, mb + ml, b"meta") {
-            // `meta` is a full box: version+flags come before its children.
+            // `meta` 是 full box：它的子盒子前面还有 version+flags 4 字节。
             if let Some(ilst) = mp4_box(moov, meta + 4, meta + mlen, b"ilst") {
                 return Some(ilst);
             }
@@ -694,7 +691,7 @@ fn mp4_ilst(moov: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-/// Iterate the atom (`©nam`, `covr`, `----`, …) with the given fourcc.
+/// 按 fourcc 找 ilst 里的原子（`©nam`、`covr`、`----`……）。
 fn mp4_atom(moov: &[u8], key: &[u8; 4]) -> Option<(usize, usize)> {
     let (ilst, len) = mp4_ilst(moov)?;
     mp4_box(moov, ilst, ilst + len, key)
@@ -746,7 +743,7 @@ fn mp4_text(moov: &[u8], key: &[u8; 4]) -> String {
     }
 }
 
-/// Freeform tag (`----:com.apple.iTunes:LYRICS`), keyed by its `name`.
+/// 自由格式标签（`----:com.apple.iTunes:LYRICS`），按它的 `name` 匹配。
 fn mp4_freeform(moov: &[u8], name: &[u8]) -> String {
     let (body, len) = mp4_ilst(moov).unwrap_or((0, 0));
     let end = (body + len).min(moov.len());
@@ -784,8 +781,7 @@ fn mp4_freeform(moov: &[u8], name: &[u8]) -> String {
     String::new()
 }
 
-/// Embedded artwork (`covr`): JPEG/PNG bytes, the same shape as the other
-/// formats hand to decode_cover_rgba.
+/// 内嵌封面（`covr`）：JPEG/PNG 字节，交给 decode_cover_rgba 的形态与别的格式一致。
 fn mp4_cover(moov: &[u8]) -> Option<Vec<u8>> {
     let atom = mp4_atom(moov, b"covr")?;
     let (_, payload) = mp4_atom_data(moov, atom)?;
@@ -826,8 +822,8 @@ fn decode_cover_rgba(art: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Read only a bounded prefix of the file (ID3v2 header-aware). Tags + embedded
-/// artwork live near the start, so this avoids fs::read of the whole audio file.
+/// 只读文件的一段有上限的前缀（会看 ID3v2 头来定长度）。
+/// 标签与内嵌封面都靠前，所以这样就不用把整个音频文件读进来。
 fn read_prefix(path: &str) -> Vec<u8> {
     if let Ok(mut f) = std::fs::File::open(path) {
         let mut head = [0u8; 10];
@@ -839,7 +835,7 @@ fn read_prefix(path: &str) -> Vec<u8> {
                 | (head[9] as usize);
             10usize + tag
         } else if head_len >= 8 {
-            // FLAC metadata blocks / OGG comment live near the start too.
+            // FLAC 的元数据块 / OGG 的 comment 也靠前。
             PREFIX_CAP / 2
         } else {
             head_len as usize
@@ -854,7 +850,7 @@ fn read_prefix(path: &str) -> Vec<u8> {
     }
 }
 
-/// FNV-1a — stable, dependency-free hash for the cache filename.
+/// FNV-1a —— 稳定、不依赖外部库的哈希，用来当缓存文件名。
 fn fnv64(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in data {
@@ -864,9 +860,8 @@ fn fnv64(data: &[u8]) -> u64 {
     h
 }
 
-/// Embedded artwork for any supported format.  M4A keeps its tags inside moov,
-/// which may sit at the end of the file, so that format is read through the box
-/// chain instead of the fixed prefix the other formats use.
+/// 任意受支持格式的内嵌封面。M4A 的标签在 moov 里，而 moov 可能在文件末尾，
+/// 所以这种格式走盒子链，而不是别的格式用的"固定前缀"。
 fn cover_bytes(path: &str) -> Option<Vec<u8>> {
     let prefix = read_prefix(path);
     if is_mp4(&prefix) {
@@ -890,9 +885,8 @@ fn ensure_cache_dir() {
     let _ = std::fs::create_dir_all("ux0:/data/yunyin/covers");
 }
 
-/// Load cached, decoded 256x256 RGBA if the source file is unchanged (its size
-/// matches what we stored). Returns None on any failure — callers fall back to
-/// a real decode, so the cache is never a correctness risk.
+/// 源文件没变（大小与我们记录的一致）时，直接读缓存的 256×256 RGBA。
+/// 任何失败都返回 None —— 调用方会退回真正解码，所以缓存永远不会变成正确性风险。
 fn cover_cache_rgba(path: &str, size: u64) -> Option<Vec<u8>> {
     if size == 0 {
         return None;
@@ -910,8 +904,8 @@ fn cover_cache_rgba(path: &str, size: u64) -> Option<Vec<u8>> {
     Some(data[8..].to_vec())
 }
 
-/// Persist the decoded RGBA keyed by file size. Best-effort; errors are ignored
-/// so a read-only / full card simply keeps using the in-memory decode path.
+/// 把解码好的 RGBA 按文件大小做键存起来。尽力而为；错误一律忽略，
+/// 这样只读卡或写满的卡就继续走内存里那条解码路径。
 fn write_cover_cache(path: &str, size: u64, rgba: &[u8]) {
     if size == 0 || rgba.len() != (COVER_PX as usize) * (COVER_PX as usize) * 4 {
         return;
@@ -935,9 +929,8 @@ pub(crate) fn upload_cover(path: &str) -> i32 {
             return h;
         }
     }
-    // fingerprint: source file size (cheap stat, no whole-file read).  The
-    // persistent cache stores the decoded 256x256 RGBA so a later launch reuses
-    // it without re-extracting / re-decoding the embedded JPEG.
+    // 指纹就用源文件大小（一次便宜 stat，不读整个文件）。持久缓存里存的是解好的
+    // 256×256 RGBA，下次启动可以直接复用，不必再抽一次内嵌 JPEG、再解一次。
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let cached = if size > 0 { cover_cache_rgba(path, size) } else { None };
     let rgba = match cached {
@@ -977,7 +970,7 @@ pub(crate) fn tags_json(path: &str) -> String {
     if bytes.is_empty() {
         return "{\"title\":\"\",\"artist\":\"\",\"album\":\"\",\"cover\":false}".into();
     }
-    /* M4A: the fourcc-keyed ilst atoms, read from moov wherever it lives. */
+    /* M4A：按 fourcc 索引的 ilst 原子，moov 在哪读哪。 */
     if is_mp4(&bytes) {
         let moov = mp4_moov(path);
         let (title, artist, album, cover, lyrics) = if moov.is_empty() {

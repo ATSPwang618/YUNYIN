@@ -1,16 +1,15 @@
-//! NetEase Cloud Music provider (Phase 3, task book §44–§52).
+//! 网易云音乐 Provider（Phase 3，任务书 §44–§52）。
 //!
-//! Phase 0 status: structure and duties documented, `resolve()` reports
-//! `Unsupported` so nothing pretends to work before the network layer exists.
+//! 当前状态：结构与职责已经写清楚，`resolve()` 返回 `Unsupported` ——
+//! 在网络层接上之前不假装能播。
 //!
-//! Duties (and only these):
-//!   1. take a song id + quality, and ask the API for a playable URL;
-//!   2. attach the session cookie, referer and a desktop user agent (§48);
-//!   3. report `AudioInfo` — URL, size, bitrate, format hint, expiry;
-//!   4. cache the URL *in memory* and re-resolve when it expires (§50/§51/§52).
+//! 职责（只有这些）：
+//!   1. 拿歌曲 ID + 音质，向 API 要一个可播放的 URL；
+//!   2. 带上会话 Cookie、Referer 和桌面浏览器 User-Agent（§48）；
+//!   3. 汇报 `AudioInfo`：URL、大小、码率、格式提示、过期时间；
+//!   4. 在**内存里**缓存 URL，过期后重新解析（§50/§51/§52）。
 //!
-//! It must never: open sockets itself, decode anything, or write the cookie to
-//! disk without an explicit opt-in.
+//! 它绝对不能：自己开 socket、解码任何东西、或在没有明确开关的情况下把 Cookie 写进磁盘。
 #![allow(dead_code)]
 
 pub mod account;
@@ -49,20 +48,20 @@ impl MusicProvider for NetEaseProvider {
     }
 
     fn resolve(&self, _song_id: &str, _quality: Quality) -> Result<AudioInfo, ProviderError> {
-        /* Phase 3: api::song_url() -> resolve::to_audio_info() -> URL cache. */
+        /* Phase 3：api::song_url() → resolve::to_audio_info() → URL 缓存。 */
         Err(ProviderError::Unsupported)
     }
 }
 
-/// Referer the CDN expects; kept next to the provider because it is a provider
-/// fact, not a transport fact.
+/// CDN 期望的 Referer。放在 Provider 旁边，因为这是"平台的事实"，
+/// 不是"传输层的事实"。
 pub const REFERER: &str = "https://music.163.com/";
 pub const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
      Chrome/120.0.0.0 Safari/537.36";
 
-/// Quality ids as the API names them (§47).  The provider maps our `Quality`
-/// onto these; the rest of the player never sees the numbers.
+/// API 里音质档位的名字（§47）。Provider 负责把我们内部的 `Quality` 映射过去，
+/// 播放器其他地方永远看不到这些字符串。
 pub fn quality_id(q: Quality) -> &'static str {
     match q {
         Quality::Auto | Quality::High => "exhigh",

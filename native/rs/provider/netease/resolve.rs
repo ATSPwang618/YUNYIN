@@ -1,19 +1,16 @@
-//! songId -> AudioInfo, with the URL cache and expiry policy (task book
-//! §50-§52).
+//! songId → AudioInfo，以及 URL 缓存与过期策略（任务书 §50–§52）。
 //!
-//! The cache policy is the useful part to settle early, because it decides how
-//! the player behaves when a CDN URL dies mid-album:
+//! 缓存策略值得先定下来，因为它决定"专辑放到一半 CDN 链接失效"时播放器的行为：
 //!
 //! ```text
 //! resolve(song, quality)
-//!     cached and not near expiry  -> reuse
-//!     otherwise                   -> ask the API, remember the expiry
-//! play fails with 403/404/410     -> mark stale, re-resolve once, retry
+//!     有缓存且未接近过期   → 直接复用
+//!     否则                → 问 API，并记下过期时间
+//!     播放遇到 403/404/410 → 标记失效，重新解析一次，再试
 //! ```
 //!
-//! Rules: entries are keyed by `(song_id, quality)`; nothing is written to disk
-//! (§51); a URL counts as stale a few minutes before its stated expiry so a long
-//! queue never walks off the end of it.
+//! 规矩：条目按 `(song_id, quality)` 索引；不落盘（§51）；URL 在过期前几分钟就算
+//! "该换新的"，这样长队列不会走到最后一首才发现链接死了。
 #![allow(dead_code)]
 
 use super::api;
@@ -21,7 +18,7 @@ use crate::media::provider::{AudioFormat, AudioInfo, ProviderError, Quality};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// Re-resolve this long before the URL actually expires.
+/// 比"真的过期"提前这么多就重新解析。
 pub const EXPIRY_MARGIN_MS: u64 = 3 * 60 * 1000;
 
 #[derive(Clone, Debug)]
@@ -40,8 +37,7 @@ impl CachedUrl {
     }
 }
 
-/// Small in-memory map; a queue of 50 songs is far below the size where a
-/// smarter structure would matter (§51).
+/// 内存里的小表：50 首的队列离"需要更聪明的结构"还差得远（§51）。
 #[derive(Default)]
 pub struct UrlCache {
     entries: Vec<CachedUrl>,
@@ -60,7 +56,7 @@ impl UrlCache {
         self.entries.push(entry);
     }
 
-    /// Called when a transfer answered 403/404/410 (§52).
+    /// 传输层收到 403/404/410 时调用（§52）。
     pub fn invalidate(&mut self, song_id: &str) {
         self.entries.retain(|e| e.song_id != song_id);
     }
@@ -70,8 +66,8 @@ impl UrlCache {
     }
 }
 
-/// Turn an API answer into what the player needs.  `format_hint` is what the API
-/// claims; the decoder still sniffs the real bytes (§40).
+/// 把 API 的回答变成播放器需要的东西。`format_hint` 只是 API 的说法，
+/// 解码器照样要按真实字节嗅一遍（§40）。
 pub fn to_audio_info(
     song_id: &str,
     quality: Quality,
@@ -95,8 +91,7 @@ pub fn to_audio_info(
     }
 }
 
-/// Phase 3: call the API and build the entry.  Single entry point so the retry
-/// policy of §52 lives in exactly one place.
+/// Phase 3：调 API 并组装条目。作为唯一入口，让 §52 的"重试策略"只存在一处。
 pub fn resolve(
     song_id: &str,
     quality: Quality,

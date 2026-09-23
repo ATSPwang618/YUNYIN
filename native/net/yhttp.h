@@ -2,105 +2,100 @@
 #define YUNYIN_YHTTP_H
 
 /*
- * Phase 0 network probe — a very thin HTTP transport for the Vita.
+ * Phase 0 网络探针 —— Vita 上的极薄 HTTP 传输层。
  *
- * Responsibilities (task book §21): init, connection, request, headers, Range,
- * read, status, content length, abort, redirect, timeout, close.
- * Explicitly not here: NetEase, song ids, providers, decoders, cache, PCM.
+ * 职责（任务书 §21）：初始化、建连、请求、请求头、Range、读取、状态码、
+ * Content-Length、取消、重定向、超时、关闭。
+ * 明确不属于这里：网易云、歌曲 ID、Provider、Decoder、Cache、PCM。
  *
- * Everything is built on the console's own stack — SceNet + SceSsl + SceHttp —
- * with no third-party HTTP library (§20).  Phase 0 exists to prove on real
- * hardware that this stack can do: DNS, TLS handshake, certificate validation,
- * 302, Cookie, Referer, Range, 206 + Content-Range, and abort (§26).
+ * 全部走机器自带的网络栈 —— SceNet + SceSsl + SceHttp，不引入第三方 HTTP 库（§20）。
+ * Phase 0 的目的就是在真机上证明这套栈能做：DNS、TLS 握手、证书校验、302、
+ * Cookie、Referer、Range、206 + Content-Range，以及取消（§26）。
  *
- * The C side never writes files: it reports through a log sink the Rust host
- * installs, which keeps the evidence in one place (ux0:data/yunyin-netprobe.log).
+ * C 侧不写文件：它通过 Rust 宿主安装的日志出口上报，这样证据只落在一个地方
+ * （ux0:data/yunyin-netprobe.log）。
  */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* TLS policy.  `DEFAULT` is what a media CDN usually needs; `VERIFY` loads the
- * console's own CA store first, and is the mode a shipping build must use. */
+/* TLS 策略。DEFAULT = 媒体 CDN 通常够用；VERIFY = 先打开校验开关（并尝试加载
+ * 机器自带根证书），正式版应当用这个模式。 */
 #define YHTTP_TLS_DEFAULT 0
 #define YHTTP_TLS_VERIFY  1
 
-/* Pool sizes handed to the console libraries.  Deliberately small and reported
- * in the log: Phase 0 measures, Phase 2 tunes (§68). */
+/* 交给系统库的内存池大小。故意取小并写进日志：Phase 0 先测量，Phase 2 再调（§68）。 */
 #define YHTTP_NET_POOL   (128 * 1024)
 #define YHTTP_SSL_POOL   (256 * 1024)
 #define YHTTP_HTTP_POOL  (256 * 1024)
 
 typedef struct {
-    /* --- request outcome --- */
-    int  status;          /* HTTP status code, 0 when no response was seen */
-    int  tls_mode;        /* YHTTP_TLS_* used for this attempt */
-    int  err_code;        /* first negative Vita error, 0 when none */
-    int  err_at;          /* 0=init 1=create 2=send 3=status 4=read 5=abort */
-    int  ssl_error;       /* sceHttpsGetSslError: errNum */
+    /* --- 请求结果 --- */
+    int  status;          /* HTTP 状态码；没拿到响应时为 0 */
+    int  tls_mode;        /* 本次使用的 YHTTP_TLS_* */
+    int  err_code;        /* 第一个负的 Vita 错误码；没有错误时为 0 */
+    int  err_at;          /* 出错阶段：0=init 1=create 2=send 3=status 4=read 5=abort */
+    int  ssl_error;       /* sceHttpsGetSslError 的 errNum */
     unsigned int ssl_detail;
 
-    /* --- response shape --- */
-    long long content_length;      /* Content-Length, -1 when absent */
-    unsigned long long range_total; /* Content-Range "/total", 0 when absent */
-    long long range_start;         /* Content-Range "bytes X-Y/Z" -> X, -1 none */
-    long long range_end;           /* ... -> Y */
-    int  redirected;               /* 1 when at least one redirect was followed */
-    int  ca_loaded;                /* 1 when the console CA store was loaded */
-    int  verify_flags;             /* sceHttpsEnableOption() result for verify mode */
-    unsigned int http_pool;        /* SceHttp pool that worked (bytes) */
-    unsigned int ssl_pool;         /* SceSsl pool in use (bytes) */
+    /* --- 响应形态 --- */
+    long long content_length;       /* Content-Length；没有则为 -1 */
+    unsigned long long range_total; /* Content-Range 里的总长度；没有则为 0 */
+    long long range_start;          /* Content-Range "bytes X-Y/Z" 的 X；没有则 -1 */
+    long long range_end;            /* 同上，Y */
+    int  redirected;                /* 是否跟随过重定向（1 = 是） */
+    int  ca_loaded;                 /* 机器自带根证书是否加载成功（1 = 成功） */
+    int  verify_flags;              /* verify 模式下 sceHttpsEnableOption() 的返回值 */
+    unsigned int http_pool;         /* 实际生效的 SceHttp 池大小（字节） */
+    unsigned int ssl_pool;          /* 实际生效的 SceSsl 池大小（字节） */
     int  headers_len;
-    int  content_type_audio;       /* 1 when Content-Type is an audio type */
+    int  content_type_audio;        /* Content-Type 是音频类型时为 1 */
 
-    /* --- transfer --- */
+    /* --- 传输 --- */
     int  bytes_read;
-    unsigned int took_ms;          /* from SendRequest to last read */
-    unsigned int abort_took_ms;    /* §24: how fast abort actually returned */
-    int  aborted;                  /* 1 when the abort test cancelled in flight */
+    unsigned int took_ms;           /* 从 SendRequest 到读完的耗时 */
+    unsigned int abort_took_ms;     /* §24：取消后多久真正停下 */
+    int  aborted;                   /* 取消测试是否成功打断进行中的传输 */
 } yhttp_result;
 
-/* Log sink installed by the Rust host (`yunyin_net_log`). */
+/* 日志出口，由 Rust 宿主安装（`yunyin_net_log`）。 */
 typedef void (*yhttp_log_fn)(const char *line, unsigned int len);
 void yhttp_set_log(yhttp_log_fn fn);
 
-/* Loads SceNet/SceSsl/SceHttp and their sysmodules.  0 on success. */
+/* 加载 SceNet/SceSsl/SceHttp 及其系统模块；成功返回 0。 */
 int  yhttp_init(void);
 void yhttp_term(void);
 
-/* 1 when netctl reports CONNECTED.  Prints the console's IP in the log. */
+/* netctl 报告已连接时返回 1，并把主机 IP 写进日志。 */
 int  yhttp_online(void);
 
-/* sceHttpGetMemoryPoolStats -> pool size / in use / peak.  0 on success. */
+/* 取内存池用量：总大小 / 当前 / 峰值；成功返回 0。 */
 int  yhttp_memory(unsigned int *pool, unsigned int *in_use, unsigned int *peak);
 
 /*
- * One GET, optionally with a Range/Referer/Cookie header.
+ * 发一次 GET，可选带 Range / Referer / Cookie 头。
  *
- * Reads up to `out_cap` bytes into `out` (may be NULL) and fills `*res`.
- * Returns 0 when a response was received (even an error status), or the first
- * negative Vita error code.
+ * 最多读 `out_cap` 字节到 `out`（可为 NULL），并填充 `*res`。
+ * 拿到响应（哪怕是错误状态码）返回 0，否则返回第一个负的 Vita 错误码。
  */
 int yhttp_probe(const char *url, const char *range, const char *referer,
                 const char *cookie, int tls_mode, int auto_redirect,
                 unsigned char *out, int out_cap, yhttp_result *res);
 
 /*
- * Cancellation test (§24): start the request on a worker thread, call
- * sceHttpAbortRequest() after `wait_ms`, and report how quickly the blocked
- * transfer actually stopped.
+ * 取消测试（§24）：在工作线程里发起请求，主线程等它真的在传数据之后调用
+ * sceHttpAbortRequest()，并报告被阻塞的传输究竟多快停下。
  */
 int yhttp_abort_probe(const char *url, const char *referer, int tls_mode,
                       unsigned int wait_ms, yhttp_result *res);
 
 /*
- * Certificate store bring-up (§23/§27).
+ * 根证书库的装载（§23/§27）。
  *
- * Loading the console's 47 root certificates needs more room than the default
- * pool: on hardware `sceHttpsLoadCert` answered OUT_OF_MEMORY with a 256 KiB
- * pool.  This walks a small ladder of pool sizes, reports each attempt, and
- * remembers the pair that worked so Phase 2 can init that way from the start.
+ * 这台机器上 `sceHttpsLoadCert`（注册 47 张额外根证书）在任何池大小下都返回
+ * OUT_OF_MEMORY，实测与默认证书校验无关（默认校验本来就是开着的）。这个函数
+ * 逐档放大池子重试并记录结果，方便 Phase 2 一次性把参数定好。
  */
 int yhttp_load_ca(void);
 unsigned int yhttp_ca_http_pool(void);

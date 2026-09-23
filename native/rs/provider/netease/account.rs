@@ -1,23 +1,21 @@
-//! NetEase session / cookie handling (task book §48/§49).
+//! 网易云会话 / Cookie 处理（任务书 §48/§49）。
 //!
-//! Anti-scraping measures on this platform mean most accounts get *no* audio URL
-//! without a valid session cookie, so this module exists from day one even
-//! though Phase 0 does not use it yet.
+//! 这个平台的反爬很严：没有有效的会话 Cookie，多数账号根本拿不到音频 URL。
+//! 所以这个模块从现在就有（虽然 Phase 0 还用不到）。
 //!
-//! Storage rule: nothing is persisted unless the user explicitly opts in — the
-//! cookie lives in memory for the session, and an optional file mirror is a
-//! separate, explicit decision (§48).  Login flows (QR code, §49) are later
-//! phases and are listed here so the seam does not have to be invented twice.
+//! 存储规则：用户没明确开启就不落盘 —— Cookie 只活在本次会话的内存里，
+//! "额外存一份文件"是另一个独立的、明确的决定（§48）。扫码登录（§49）属于后面的
+//! 阶段，先在这里列出来，免得以后重新发明一遍接缝。
 #![allow(dead_code)]
 
 use alloc::string::String;
 
 #[derive(Clone, Debug, Default)]
 pub struct Session {
-    /// `MUSIC_U=...; __csrf=...; ...` — empty for an anonymous session.
+    /// `MUSIC_U=...; __csrf=...; ...` —— 匿名会话时为空。
     cookie: String,
     logged_in: bool,
-    /// Whether the account may use the higher quality tiers (§47).
+    /// 账号是否有权使用更高音质档（§47）。
     vip: bool,
 }
 
@@ -50,7 +48,7 @@ impl Session {
         self.vip
     }
 
-    /// Phase 4: load a cookie the user typed in or produced with a QR login.
+    /// Phase 4：载入用户手填的、或扫码登录得到的 Cookie。
     pub fn load(&mut self, cookie: &str) {
         *self = Self::from_cookie(cookie);
     }

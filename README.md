@@ -141,11 +141,13 @@ native/rs/           Rust 宿主
   platform/         电源、PS 键锁、文件、日志、设置
   ui/               流式 CJK、字体图集、跳帧
 scripts/             构建、字体烘焙、标签体检工具
-docs/                架构说明与重构计划
+docs/                三份中文文档：架构设计 / 重构计划 / 网络探针实测
 ```
 
-流媒体方向的架构与第一阶段计划见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-和 [docs/REFACTOR_PLAN.md](docs/REFACTOR_PLAN.md)：核心是一条
+流媒体方向看 [docs/架构设计.md](docs/架构设计.md)（最终形态与接缝）、
+[docs/重构计划.md](docs/重构计划.md)（现状审计、文件级计划、六个阶段、
+不可动清单与风险矩阵）、[docs/网络探针实测.md](docs/网络探针实测.md)
+（真机网络能力实测：HTTPS 默认校验证书、Range 206、取消 1ms）。核心是一条
 `AudioSource → Decoder → 现有 BGM 输出` 的接缝，上层不认识 HTTP，
 下层不认识网易云；本地六个格式保持现状不动。
 

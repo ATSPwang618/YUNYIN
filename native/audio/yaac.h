@@ -6,15 +6,14 @@ extern "C" {
 #endif
 
 /*
- * AAC decoding on the Vita's own hardware decoder (SceAudiodec).
+ * 用 Vita 自带的硬件解码块解码 AAC（SceAudiodec）。
  *
- * The container work lives in `ym4a.c`; this is the part that actually turns
- * the raw AAC access units inside `mdat` into PCM.  Public API only —
- * sceAudiodecInitLibrary / CreateDecoder / Decode / DeleteDecoder — no private
- * `*Internal` imports, no FFmpeg.
+ * 拆盒子的活在 `ym4a.c`；这里负责把 `mdat` 里的裸 AAC 帧真正变成 PCM。
+ * 只用公开 API —— sceAudiodecInitLibrary / CreateDecoder / Decode / DeleteDecoder，
+ * 不碰任何 `*Internal` 私有导入，也没有 FFmpeg。
  *
- * Off the Vita (`__vita__` undefined) every function degrades to a stub, so the
- * sources still compile in a host test build.
+ * 不在 Vita 上时（未定义 `__vita__`）所有函数退化为桩，
+ * 好让同一份源码在电脑上也能编译。
  */
 
 #define YAAC_ERR_INIT     -1
@@ -23,22 +22,21 @@ extern "C" {
 #define YAAC_ERR_TOO_BIG  -4
 #define YAAC_ERR_STATE    -5
 
-/* Largest raw access unit accepted (the hardware's documented AAC limit is
- * 1536 bytes; the extra room just avoids tripping on a fat frame). */
+/* 能接受的单帧最大字节数。硬件公开的 AAC 上限是 1536 字节，
+ * 这里留出余量，免得遇到偏大的帧就被判失败。 */
 #define YAAC_ES_CAP 4096
 
 /*
- * Start a decoder for one track.
- *   channels 1..2, rate in Hz, is_adts 0 for M4A/MP4 (raw frames),
- *   is_sbr hints that the stream may be SBR (the header cannot tell us).
- * Returns 0 on success, negative on failure.
+ * 为一条音轨启动解码器。
+ *   channels 取 1~2；rate 是 Hz；M4A/MP4 用裸帧，所以 is_adts = 0；
+ *   is_sbr 是"这条流可能有 SBR"的提示（帧头本身看不出来）。
+ * 成功返回 0，失败返回负值。
  */
 int yaac_open(int channels, int rate, int is_adts, int is_sbr);
 
 /*
- * Decode one access unit.  Writes interleaved 16-bit PCM into `out` and returns
- * the number of frames per channel, 0 when the decoder produced nothing, or a
- * negative YAAC_ERR_* code.  `out_cap_frames` is the capacity of `out`.
+ * 解码一帧 AAC。把交错排列的 16 位 PCM 写进 `out`，返回**每声道帧数**；
+ * 解码器没产出时返回 0，出错返回负的 YAAC_ERR_*。`out_cap_frames` 是 `out` 的容量。
  */
 int yaac_decode(const unsigned char *au, int len, short *out, int out_cap_frames);
 
@@ -46,7 +44,7 @@ void yaac_close(void);
 int yaac_ready(void);
 int yaac_channels(void);
 int yaac_rate(void);
-/* Last sceAudiodec return value, or 0 — surfaced in the debug log. */
+/* 最近一次 sceAudiodec 的返回值（0 表示没有），用于写调试日志。 */
 int yaac_last_status(void);
 
 #ifdef __cplusplus
