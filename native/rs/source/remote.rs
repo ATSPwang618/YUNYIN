@@ -17,7 +17,9 @@ use crate::media::platform::log;
 use crate::media::net::http::Stream;
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicU32, Ordering};
 use std::ffi::CString;
 use std::sync::Mutex;
 
@@ -44,10 +46,29 @@ extern "C" {
         format_hint: i32,
         duration_hint_ms: i64,
     ) -> *mut c_void;
+    /* 打开完成后才发现这次请求已经作废时，用它把刚建好的播放器丢掉。 */
+    fn yp_close(player: *mut c_void);
 }
 
 /* 当前在线源（同一时刻只有一个，和播放器一致）。 */
 static REMOTE: Mutex<Option<alloc::boxed::Box<RemoteSource>>> = Mutex::new(None);
+
+/*
+ * 打开序号。在线打开要花几秒（DNS + TLS + 第一个窗口），必须放到后台线程去做，
+ * 界面线程不能等它。既然是后台的，用户完全可能还没打开完就点了别的歌 ——
+ * 每来一个新的播放请求就换一个序号，旧任务在每一步前后比对序号，发现过期就收手。
+ */
+static OPEN_TOKEN: AtomicU32 = AtomicU32::new(0);
+
+/// 声明"现在开始的是新一次播放"，返回本次的序号。
+pub fn new_token() -> u32 {
+    OPEN_TOKEN.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+/// 这个序号还是当前有效的吗（false = 已被新的播放请求取代）。
+pub fn token_current(token: u32) -> bool {
+    OPEN_TOKEN.load(Ordering::Acquire) == token
+}
 
 /* ------------------------------------------------------------ yp_io 回调 -- */
 
@@ -61,7 +82,11 @@ unsafe extern "C" fn io_read(ctx: *mut c_void, dst: *mut c_void, n: u64) -> i64 
         Ok(got) => got as i64,
         Err(SourceError::WouldBlock) => -1, /* Gate 会静音，不会把它当 EOF */
         Err(e) => {
-            log::append(&format!("remote: read 失败 {:?}", e));
+            /*
+             * 别把"网络暂时没数据"和"这条流真的坏了"混在一起说。
+             * 这里只负责如实记录；重试与判死都在 HttpRangeSource 里。
+             */
+            log::append(&format!("remote: 解码器读在线字节失败 {:?}", e));
             -1
         }
     }
@@ -115,7 +140,15 @@ unsafe extern "C" fn io_close(_ctx: *mut c_void) -> i32 {
 /* ---------------------------------------------------------------- 对外 -- */
 
 /// 打开一个在线 URL 交给解码器。`duration_ms` 是可选的时长提示（§37）。
-pub fn open_remote(url: &str, referer: &str, duration_ms: i64) -> Result<(), SourceError> {
+///
+/// `token` 是本次播放的序号（见 `new_token`）：整个打开过程可能持续几秒，
+/// 中途用户换了歌就作废，绝不把已经作废的源塞给解码器。
+pub fn open_remote(
+    url: &str,
+    referer: &str,
+    duration_ms: i64,
+    token: u32,
+) -> Result<(), SourceError> {
     /* 每一步都单独记日志：真机上"在线打开失败"必须能分辨是取数没打开、
      * 还是解码器不认识这份流。 */
     let transport = match Stream::open(url, referer, 0) {
@@ -127,6 +160,10 @@ pub fn open_remote(url: &str, referer: &str, duration_ms: i64) -> Result<(), Sou
     };
     let size = transport.size();
     log::append(&format!("remote: 流已打开 size={:?}", size));
+    if !token_current(token) {
+        log::append("remote: 打开途中被新的播放请求取代，放弃这条路");
+        return Err(SourceError::Cancelled);
+    }
     let source = HttpRangeSource::new(url, transport, Default::default());
     let mut slot = match REMOTE.lock() {
         Ok(g) => g,
@@ -163,16 +200,14 @@ pub fn open_remote(url: &str, referer: &str, duration_ms: i64) -> Result<(), Sou
         log::append("remote: 解码器打不开这份流（格式认不出或解码器失败）");
         return Err(SourceError::Unsupported);
     }
+    if !token_current(token) {
+        unsafe { yp_close(player) };
+        drop(slot.take());
+        log::append("remote: 打开完成后已被新的播放请求取代，已丢弃");
+        return Err(SourceError::Cancelled);
+    }
     log::append("remote: 解码器已接上在线源");
     crate::media::decoder::adopt_remote(player, ctx);
-    /*
-     * 应用平时是"进来自动暂停、按 ○ 才开声"，测试开关也照这个规矩来：
-     * 这里先摆好并暂停。之后按 ○（界面上的播放）会走 vm.resume(path)，
-     * 而 resume 只在"已经就绪且暂停"时解除暂停、**不换曲目**，
-     * 于是按一下就是这首在线歌；按 L / R 换本地曲目则正常切走。
-     */
-    crate::media::bgm::pause();
-    log::append("remote: 已就绪并暂停 —— 按 ○ 开始播放这首在线歌曲");
     Ok(())
 }
 
@@ -248,17 +283,108 @@ pub fn url() -> String {
 
 const NETPLAY_FILE: &str = "ux0:data/yunyin/netplay.url";
 
-/// 卡里放 `ux0:/data/yunyin/netplay.url`（第一行 URL，第二行可选 Referer）时，
-/// 启动就试着播放它 —— Phase 2 的真机验收开关，正式版没有这个文件就不起作用。
-pub fn maybe_autoplay() {
+/*
+ * 在线曲目清单。
+ *
+ * 卡里放 `ux0:/data/yunyin/netplay.url` 时，里面的歌会作为**曲库里的独立条目**
+ * 交给界面显示 —— 单独成一组（专辑「在线歌曲」），不占任何本地歌曲的位置。
+ * 界面点它、按 ○，才会真的走网络播放。
+ *
+ * 文件格式（一段一首歌，段之间用空行分开；三行都可省略后面的）：
+ *
+ *     # 第 1 行：URL
+ *     https://music.163.com/song/media/outer/url?id=3346495279.mp3
+ *     # 第 2 行（可选）：Referer，CDN 会查这个头
+ *     https://music.163.com/
+ *     # 第 3 行（可选）：界面上显示的名字
+ *     [在线] 测试曲目
+ *
+ * 没有这个文件时返回空列表，正式版完全不受影响。
+ */
+#[derive(Clone)]
+pub struct NetplayTrack {
+    pub url: String,
+    pub referer: String,
+    pub title: String,
+}
+
+/// 把 `id=123456` 里的数字挑出来，用作没写显示名时的默认名字。
+fn url_id_hint(url: &str) -> String {
+    let after = url.split("id=").nth(1).unwrap_or("");
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits
+}
+
+/// 读 `netplay.url` 并把每首歌整理成一条记录（文件不存在 = 空）。
+pub fn netplay_tracks() -> Vec<NetplayTrack> {
     let Ok(text) = std::fs::read_to_string(NETPLAY_FILE) else {
-        return;
+        return Vec::new();
     };
-    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
-    let Some(url) = lines.next().map(|s| s.trim()) else {
-        return;
+    let mut out: Vec<NetplayTrack> = Vec::new();
+    let mut block: Vec<String> = Vec::new();
+    let flush = |block: &mut Vec<String>, out: &mut Vec<NetplayTrack>| {
+        if block.is_empty() {
+            return;
+        }
+        let url = block[0].clone();
+        let referer = block.get(1).cloned().unwrap_or_default();
+        let title = block.get(2).cloned().unwrap_or_default();
+        let title = if title.trim().is_empty() {
+            let id = url_id_hint(&url);
+            if id.is_empty() {
+                String::from("[在线] 网络歌曲")
+            } else {
+                format!("[在线] {}", id)
+            }
+        } else {
+            title
+        };
+        if url.starts_with("http://") || url.starts_with("https://") {
+            out.push(NetplayTrack { url, referer, title });
+        }
+        block.clear();
     };
-    let referer = lines.next().unwrap_or("").trim();
-    log::append(&format!("remote: netplay.url -> {}", url));
-    crate::media::bgm::play_url(url, referer, -1);
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            flush(&mut block, &mut out); /* 空行 = 一首歌结束 */
+            continue;
+        }
+        if line.starts_with('#') {
+            continue; /* 注释行 */
+        }
+        block.push(String::from(line));
+        if block.len() == 3 {
+            flush(&mut block, &mut out);
+        }
+    }
+    flush(&mut block, &mut out);
+    out
+}
+
+/// 这首歌要用哪个 Referer（按 URL 查；没有就返回空串）。
+pub fn referer_for(url: &str) -> String {
+    netplay_tracks()
+        .into_iter()
+        .find(|t| t.url == url)
+        .map(|t| t.referer)
+        .unwrap_or_default()
+}
+
+/// 给界面用的 JSON 清单：`[{"url":...,"title":...,"referer":...}]`。
+pub fn netplay_json() -> String {
+    let mut s = String::from("[");
+    for (i, t) in netplay_tracks().into_iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            "{{\"url\":\"{}\",\"title\":\"{}\",\"referer\":\"{}\"}}",
+            crate::media::json_escape(&t.url),
+            crate::media::json_escape(&t.title),
+            crate::media::json_escape(&t.referer)
+        ));
+    }
+    s.push(']');
+    s
 }

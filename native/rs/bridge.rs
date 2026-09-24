@@ -176,6 +176,23 @@ unsafe extern "C" fn js_net_probe(
     js_str(ctx, &guarded("net_probe", String::new(), crate::media::net::probe::state_json))
 }
 
+/// 卡里 `ux0:/data/yunyin/netplay.url` 描述的在线曲目清单。
+///
+/// 界面拿它把在线歌**当成曲库里的独立条目**显示（自己的专辑「在线歌曲」），
+/// 这样在线歌不会顶掉任何本地歌曲的位置；点它、按 ○ 才会真的走网络播放。
+/// 没有这个文件就返回 `[]`，正式版不受影响。
+unsafe extern "C" fn js_netplay(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    _argc: i32,
+    _argv: *mut JSValue,
+) -> JSValue {
+    js_str(
+        ctx,
+        &guarded("netplay", String::from("[]"), crate::media::source::remote::netplay_json),
+    )
+}
+
 /// 播放期间锁 PS 键：`setPsLock(true)` 锁、`false` 解锁（见 ps_lock.rs）。
 unsafe extern "C" fn js_set_ps_lock(
     ctx: *mut JSContext,
@@ -246,6 +263,7 @@ pub unsafe fn install(ctx: *mut JSContext, global: JSValue) {
     add_fn(ctx, obj, b"logEnabled\0", js_log_enabled, 0);
     add_fn(ctx, obj, b"setPsLock\0", js_set_ps_lock, 1);
     add_fn(ctx, obj, b"netProbe\0", js_net_probe, 0);
+    add_fn(ctx, obj, b"netplay\0", js_netplay, 0);
     add_fn(ctx, obj, b"store_get\0", js_store_get, 1);
     add_fn(ctx, obj, b"store_set\0", js_store_set, 2);
     JS_SetPropertyStr(ctx, global, c"vitaMedia".as_ptr(), obj);

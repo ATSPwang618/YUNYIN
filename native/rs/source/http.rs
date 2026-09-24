@@ -287,6 +287,15 @@ impl<T: ByteTransport + 'static> AudioSource for HttpRangeSource<T> {
     }
 
     fn is_eof(&self) -> bool {
+        /*
+         * 长度已知时，"结束"只由**当前位置**决定。
+         * 之前用"抓取线程报过 eof"来判断，结果解码器一探测（mpg123 打开流
+         * 时会 seek 到很远处问长度，我就把那次越界当成整条流结束）之后，
+         * 所有读都变成 0 = EOF，解码器直接放弃打开。
+         */
+        if let Some(sz) = self.size {
+            return self.pos >= sz;
+        }
         let (lock, _cv) = &*self.shared;
         let Ok(w) = lock.lock() else { return false };
         w.eof && self.pos >= w.start + w.buf.len() as u64

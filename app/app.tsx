@@ -50,6 +50,9 @@ type VitaMedia = {
   state?: () => string;
   cover?: (path: string) => number;
   tags?: (path: string) => string;
+  /* 在线曲目清单（卡里 ux0:/data/yunyin/netplay.url 描述的歌），
+   * 返回 [{"url":..,"title":..,"referer":..}]；没有这个文件时是 "[]"。 */
+  netplay?: () => string;
   setPsLock?: (on: boolean) => number;
   logEnabled?: () => number;
   store_get?: (key: string) => string;
@@ -164,6 +167,13 @@ interface Track {
 
   /* 原始 LRC / USLT 文本。没有则歌词页只显示歌名 */
   lyrics?: string;
+
+  /*
+   * 在线曲目标记。true 表示 audioPath 是 URL（不是卡里的文件）：
+   * 封面/标签都不去读它（读网络地址没意义还慢），播放时原生侧认 http(s) 前缀。
+   * 这类歌单独归到「在线歌曲」专辑，绝不占用本地歌曲的位置。
+   */
+  online?: boolean;
 }
 
 interface Album {
@@ -1101,7 +1111,76 @@ function scanLibrary(): Track[] {
       `  SAMPLE [${t.artist}] "${t.title}" album="${t.album}" lyrics=${t.lyrics ? t.lyrics.length : 0} path=${t.audioPath}`,
     );
   log(`unique tracks: ${tracks.length}`);
-  return tracks;
+
+  /*
+   * 在线曲目接在本地曲库**后面**，单独成一组（专辑「在线歌曲」）。
+   *
+   * 以前在线歌是"藏在本地第一首底下偷偷加载"的 —— 界面显示第一首本地歌、
+   * 按播放却是另一首，这就是分不清的原因。现在它就是一个正常的条目：
+   * 选中它、按 ○，才走网络播放；本地歌的位置一个都没被动过。
+   */
+  const online = scanOnlineTracks();
+  if (online.length) {
+    log(`online tracks: ${online.length}`);
+    for (const t of online) log(`  ONLINE "${t.title}" url=${t.audioPath}`);
+  }
+  return tracks.concat(online);
+}
+
+/* 在线歌统一归到这一组，界面上和本地专辑明显分开 */
+const ONLINE_ALBUM = "在线歌曲";
+const ONLINE_ARTIST = "在线";
+
+/* 从 URL 里挑出 song id（没有就用序号），只为了让默认名字有点辨识度。 */
+function onlineIdHint(url: string): string {
+  const m = /[?&]id=(\d+)/.exec(url);
+  return m ? m[1] : "";
+}
+
+function buildOnlineTrack(
+  url: string,
+  title: string,
+  index: number,
+): Track {
+  const name =
+    (title || "").trim() ||
+    `[在线] ${onlineIdHint(url) || String(index + 1)}`;
+  const artist = ONLINE_ARTIST;
+  const album = ONLINE_ALBUM;
+  return {
+    id: makeTrackId({ artist, album, title: name, durationMs: 0 }),
+    title: name,
+    artist,
+    album,
+    wav: "",
+    /* 在线曲目的 audioPath 就是 URL：原生侧按 http(s) 前缀分流，
+     * 界面这一层不需要知道"本地 / 在线"的区别。 */
+    audioPath: url,
+    audioRef: url,
+    coverId: slug(album) + "-" + slug(artist),
+    coverCls: DEFAULT_COVER_CLS,
+    cover: undefined,
+    durationMs: 0,
+    albumId: makeAlbumId(album, artist),
+    lyrics: "",
+    online: true,
+  };
+}
+
+/* 读一遍在线曲目清单。宿主没有 netplay（旧版/电脑模拟）时返回空数组。 */
+function scanOnlineTracks(): Track[] {
+  const api = media();
+  if (!api || !api.netplay) return [];
+  let list: { url?: string; title?: string }[] = [];
+  try {
+    const parsed = JSON.parse(api.netplay() || "[]");
+    list = Array.isArray(parsed) ? parsed : [];
+  } catch {
+    list = [];
+  }
+  return list
+    .filter((e) => e && typeof e.url === "string" && e.url.length > 0)
+    .map((e, i) => buildOnlineTrack(e.url as string, e.title || "", i));
 }
 
 /* =========================================================
@@ -1504,7 +1583,8 @@ export default function Music() {
   /* 当前曲目内嵌封面：只在切到该曲目时懒加载，避免扫描时把整库封面都传进显存。 */
   createEffect(() => {
     const cur = track();
-    if (!cur || cur.cover || !cur.audioPath) return;
+    /* 在线曲目的 audioPath 是 URL：封面要真的下载才拿得到，先不做（也不该在这里做）。 */
+    if (!cur || cur.cover || !cur.audioPath || cur.online) return;
     const api = media();
     if (!api || !api.cover) return;
     let handle = -1;
@@ -1539,7 +1619,7 @@ export default function Music() {
     for (const a of visible) {
       if (albumCovers()[a.id]) continue;
       const first = a.trackIds[0] ? trackById()[a.trackIds[0]] : undefined;
-      if (!first || !first.audioPath) {
+      if (!first || !first.audioPath || first.online) {
         log(`  ac ${a.id} -> no first/audioPath`);
         continue;
       }
@@ -1685,8 +1765,14 @@ export default function Music() {
     const realTracks = scanLibrary();
     if (realTracks.length) {
       setTracks(realTracks);
-      setCurrentTrackId(realTracks[0].id);
       setQueueIds(realTracks.map((song) => song.id));
+      /*
+       * 有在线曲目时，进来就停在第一首在线歌上：界面显示的是它，按 ○ 放的
+       * 也是它 —— 不会再出现"播放页写着第一首本地歌、按下去却是另一首"。
+       * 没有在线曲目时照旧停在第一首本地歌。
+       */
+      const firstOnline = realTracks.find((song) => song.online);
+      setCurrentTrackId((firstOnline ?? realTracks[0]).id);
     }
 
     focusNav();

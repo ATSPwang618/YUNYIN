@@ -151,14 +151,44 @@ impl super::super::source::http::ByteTransport for Stream {
             )
         };
         if n < 0 {
-            /* 取消（切歌）会走到这里：用 Cancelled 让上层别当成"断网"。 */
-            return Err(SourceError::Cancelled);
+            /*
+             * 以前这里把所有负返回值都写成 Cancelled，"真机上到底为什么读失败"
+             * 就永远看不见了。现在按 C 侧记下的错误码如实区分：
+             *   0 / EINTR(0x80410104) / ABORTED(0x80431080) → 取消（切歌、退出）
+             *   其余 → 真错误，带上原始 Vita 错误码
+             */
+            let code = unsafe { yhttp_stream_error(self.p) };
+            let u = code as u32;
+            if code == 0 || u == 0x80410104 || u == 0x80431080 {
+                return Err(SourceError::Cancelled);
+            }
+            return Err(SourceError::Network(alloc::format!(
+                "HTTP 流读取失败 0x{:08X}{}",
+                u,
+                vita_error_hint(u)
+            )));
         }
         Ok(n as usize)
     }
 
     fn size(&self) -> Option<u64> {
         self.size
+    }
+}
+
+/// 常见失败码的中文解释，让真机日志能直接读（取值来自 VitaSDK 头文件）。
+fn vita_error_hint(code: u32) -> &'static str {
+    match code {
+        0x80431022 => "（内存池不足）",
+        0x80431068 => "（超时）",
+        0x80431075 => "（TLS 握手/证书被拒）",
+        0x80431080 => "（被中止）",
+        0x80410104 => "（被取消）",
+        0x80435022 => "（SSL 内存不足）",
+        0x80435060 => "（证书被拒）",
+        0x80436002 => "（DNS 解析不到主机）",
+        0x80436003 => "（DNS 超时）",
+        _ => "",
     }
 }
 

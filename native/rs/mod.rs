@@ -67,8 +67,16 @@ pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_s
     /* Phase 0 network probe: inert unless the card asks for it
      * (ux0:/data/yunyin/netprobe.url or the debug flag). */
     net::probe::start_once();
-    /* Phase 2：卡里放 ux0:/data/yunyin/netplay.url 时，启动就试播这个在线 URL
-     *（第一行 URL，第二行可选 Referer）。没有这个文件就什么都不做。 */
     net::install_log(); /* 先接上 C 侧网络日志，在线播放也能看见 */
-    source::remote::maybe_autoplay();
+    /*
+     * Phase 2：卡里放 ux0:/data/yunyin/netplay.url 时，里面的歌会作为
+     * **曲库里的独立条目**交给界面（vitaMedia.netplay()），不再偷偷占用
+     * 本地第一首的位置。启动时这里只记一条日志，实际播放由用户点选触发。
+     */
+    let online = source::remote::netplay_tracks().len();
+    if online > 0 {
+        log::append(&format!(
+            "remote: netplay.url 里有 {online} 首在线曲目，已交给界面显示（独立成组）"
+        ));
+    }
 }

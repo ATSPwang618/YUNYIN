@@ -45,6 +45,16 @@ static RATE_HZ: AtomicU32 = AtomicU32::new(44100);
 static PATH_LEN: AtomicUsize = AtomicUsize::new(0);
 static PATH_BUF: Mutex<String> = Mutex::new(String::new());
 static WORKER: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+/*
+ * 换歌锁：所有会动"当前播放会话"的操作（本地播放、在线打开、停止）都排队走这里。
+ * 在线打开要花几秒，必须扔到后台线程做，界面才不会卡住；这把锁保证后台那一步
+ * 和"用户又点了别的歌"不会同时改同一份状态。
+ */
+static SESSION: Mutex<()> = Mutex::new(());
+
+fn lock_session() -> std::sync::MutexGuard<'static, ()> {
+    SESSION.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 pub fn acquire_on_start() {
     if BGM_HELD.swap(true, Ordering::AcqRel) {
@@ -140,7 +150,10 @@ fn audio_channel_thread() {
     }
 }
 
-fn vita_audio_end() {
+/// 结束当前会话：停音频线程 → 放掉 BGM 口 → 关在线源 → 关解码器。
+///
+/// **调用方必须持有 `SESSION` 锁**：音频线程被 join 掉之前，解码器句柄不能被换掉。
+fn session_end() {
     let had_session = AUDIO_READY.load(Ordering::Acquire) || PORT.load(Ordering::Acquire) >= 0;
     AUDIO_READY.store(false, Ordering::Release);
     AUDIO_TERMINATE.store(true, Ordering::Release);
@@ -209,10 +222,22 @@ fn vita_audio_init(freq: i32) -> bool {
 
 /// Audio_Init: close previous session, open decoder, open BGM port at native rate.
 pub fn play(path: &str) {
+    /*
+     * 在线曲目在界面里就是一个普通条目：它的 audioPath 直接是 URL。
+     * 这里按前缀分流，界面完全不用知道"本地 / 在线"的区别。
+     */
+    if path.starts_with("http://") || path.starts_with("https://") {
+        let referer = crate::media::source::remote::referer_for(path);
+        play_url(path, &referer, -1);
+        return;
+    }
+    let _guard = lock_session();
+    /* 有正在后台打开的在线流的话，这次请求就是新的，让它作废。 */
+    let _ = crate::media::source::remote::new_token();
     if path.is_empty() {
         return;
     }
-    vita_audio_end();
+    session_end();
     if !decoder::open(path) {
         log::append(&format!("bgm: yp_open failed {path}"));
         PLAYING.store(false, Ordering::Release);
@@ -243,15 +268,45 @@ pub fn pause() {
  * 与 play(path) 的差别只有"谁提供字节"：路径换成 URL + Referer，
  * 其余（BGM 口、960 帧、状态上报）完全一样。
  *   duration_ms: 调用方给的时长提示（§37），-1 表示没有
+ *
+ * 关键一点：网络打开（DNS + TLS + 抓第一个窗口）可能要好几秒，**绝不能占着
+ * 界面线程**。所以这里立刻返回，真正的打开放到后台线程；期间用户换歌、按停止
+ * 都会让这次打开作废（序号变了就收手）。
  */
 pub fn play_url(url: &str, referer: &str, duration_ms: i64) {
     if url.is_empty() {
         return;
     }
-    vita_audio_end();
-    if let Err(e) = crate::media::source::remote::open_remote(url, referer, duration_ms) {
+    let token = crate::media::source::remote::new_token();
+    /* 立刻标成"还没在放"：界面上的进度条不会拿着上一首的数字发呆。 */
+    PLAYING.store(false, Ordering::Release);
+    PAUSED.store(false, Ordering::Release);
+
+    let url_owned = String::from(url);
+    let referer_owned = String::from(referer);
+    let spawned = std::thread::Builder::new()
+        .name("yunyin-net-open".into())
+        .stack_size(64 * 1024)
+        .spawn(move || open_online(url_owned, referer_owned, duration_ms, token));
+    if spawned.is_err() {
+        log::append("bgm: 在线打开线程创建失败");
+    }
+}
+
+/// 后台线程里的那一步：先收掉上一首，再打开在线源，最后起 BGM 口。
+fn open_online(url: String, referer: String, duration_ms: i64, token: u32) {
+    let _guard = lock_session();
+    if !crate::media::source::remote::token_current(token) {
+        return; /* 还没轮到我，就已经被新的播放请求取代了 */
+    }
+    session_end();
+    if !crate::media::source::remote::token_current(token) {
+        return;
+    }
+    if let Err(e) =
+        crate::media::source::remote::open_remote(&url, &referer, duration_ms, token)
+    {
         log::append(&format!("bgm: 在线打开失败 {:?} {url}", e));
-        PLAYING.store(false, Ordering::Release);
         return;
     }
     let rate = decoder::rate();
@@ -260,8 +315,8 @@ pub fn play_url(url: &str, referer: &str, duration_ms: i64) {
     DUR_MS.store(dur, Ordering::Release);
     POS_MS.store(0, Ordering::Release);
     PLAYING.store(true, Ordering::Release);
-    PAUSED.store(false, Ordering::Release);
-    set_path(url);
+    /* PAUSED 不动：用户在打开过程中按了暂停，就保持暂停。 */
+    set_path(&url);
     if !vita_audio_init(rate) {
         PLAYING.store(false, Ordering::Release);
         crate::media::source::remote::close_remote();
@@ -282,9 +337,12 @@ pub fn resume(path: &str) {
 }
 
 pub fn stop() {
+    let _guard = lock_session();
+    /* 正在后台打开的在线流也要作废，否则它会在这之后偷偷接上来。 */
+    let _ = crate::media::source::remote::new_token();
     PLAYING.store(false, Ordering::Release);
     PAUSED.store(false, Ordering::Release);
-    vita_audio_end();
+    session_end();
     POS_MS.store(0, Ordering::Release);
 }
 

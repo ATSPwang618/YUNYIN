@@ -45,6 +45,12 @@ static volatile int g_init_lock;
 static int g_ssl_inited;
 static int g_http_inited;
 static int g_ca_loaded;
+/* 根证书只值得试一次：这台机器上任何池大小都装不进去，反复重试只会反复
+ * 重建网络栈（见 yhttp_load_ca 的说明）。 */
+static int g_ca_tried;
+/* 正在使用的在线流数量。装载根证书要先 sceHttpTerm/sceSslTerm 再 Init ——
+ * 只要还有流在用这套栈，那就等于把音频线程脚下的地板抽掉。 */
+static volatile int g_streams_open;
 static void *g_net_pool;
 static unsigned int g_ssl_pool = YHTTP_SSL_POOL;
 static unsigned int g_http_pool = YHTTP_HTTP_POOL;
@@ -240,6 +246,23 @@ int yhttp_load_ca(void) {
     };
     unsigned int i;
     if (g_ca_loaded) return 0;
+    if (g_ca_tried) return -1; /* 试过了：这台机器装不进去，别再来一遍 */
+    /*
+     * 装根证书要先把 SceHttp/SceSsl 关掉、调大池子、再打开。
+     *
+     * 真机上"在线播放刚开个头就解码失败"就是这么来的：探针线程跑 verify 目标
+     * 时调用这里，把整个网络栈重建了一遍，而音频线程手里正拿着同一个栈在
+     * 读 AAC/MP3 字节 —— 请求当场全部作废，解码器只能报"打不开"。
+     *
+     * 所以：只要有在线流在用这套栈，就推迟（不置 g_ca_tried，等空闲时再说）。
+     * 证书校验本来就不靠这一步（固件自带根证书库一直在验），跳过不会让校验失效。
+     */
+    if (g_streams_open > 0) {
+        yh_logf("yhttp: 根证书装载推迟（有 %d 个在线流正在用网络栈）\n",
+                g_streams_open);
+        return -1;
+    }
+    g_ca_tried = 1;
     for (i = 0; i < sizeof ladder / sizeof ladder[0]; i++) {
         if (yh_try_load_ca(ladder[i][0], ladder[i][1]) == 0) {
             g_ca_loaded = 1;
@@ -479,8 +502,15 @@ struct yhttp_stream {
     int win_len;         /* 窗口里有效字节数 */
     int eof;             /* 已经到流末尾 */
     int err;             /* 最近一次错误码（0 = 没有） */
+    int opened;          /* 是否已计入 g_streams_open（成功取到第一个窗口后为 1） */
+    int last_status;     /* 最近一次 HTTP 状态码（诊断用） */
     volatile int cancelled;
 };
+
+/* 一个窗口最多重试几次。网络抖动/连接被回收是常态，一次失败就判定"这条流坏了"
+ * 会把整首歌判死（旧版本的 s->err 是永久粘住的）。 */
+#define YHTTP_FETCH_TRIES 3
+#define YHTTP_RETRY_DELAY_US (200 * 1000)
 
 /*
  * 抓一个窗口到 s->win（覆盖 [off, off+want)）。
@@ -528,9 +558,22 @@ static int yh_stream_fetch(yhttp_stream *s, long long off, int want) {
     if (ret < 0) { s->err = ret; goto done; }
     ret = sceHttpGetStatusCode(req, &total);
     if (ret < 0) { s->err = ret; goto done; }
+    s->last_status = total;
+    /*
+     * 416 = 请求的区间落在文件末尾之外。这不是错误，是"到尾了"：
+     * 解码器（mpg123 打开时会 seek 到很远问长度）完全可能问到一个合法的
+     * 越界偏移，旧版本把它当成硬错误写进 s->err，之后每一次读都失败，
+     * 整首歌就再也放不出来了。
+     */
+    if (total == 416) {
+        s->eof = 1;
+        s->win_start = off;
+        s->win_len = 0;
+        return 0;
+    }
     if (total != 200 && total != 206) {
         s->err = -1;
-        yh_logf("yhttp: stream status=%d (需要 206/200)\n", total);
+        yh_logf("yhttp: stream status=%d (需要 206/200) off=%lld\n", total, off);
         goto done;
     }
     if (sceHttpGetResponseContentLength(req, &clen) < 0) clen = 0;
@@ -613,6 +656,9 @@ yhttp_stream *yhttp_stream_open(const char *url, const char *referer,
         yhttp_stream_close(s);
         return NULL;
     }
+    /* 到这里这条流才开始"占着网络栈"（yhttp_load_ca 靠这个计数决定能不能重建栈）。 */
+    s->opened = 1;
+    g_streams_open++;
     if (size_out) *size_out = s->size;
     if (err_out) *err_out = 0;
     return s;
@@ -624,15 +670,30 @@ long long yhttp_stream_read(yhttp_stream *s, long long off, void *dst,
     unsigned char *out = (unsigned char *)dst;
     if (!s || !dst || n <= 0) return -1;
     if (s->cancelled) return -1;
-    if (s->err) return s->err;
     if (s->size > 0 && off >= s->size) return 0; /* 真正结束 */
 
     while (done < n) {
         long long want = off + done;
         /* 命中窗口就直接拷，不命中就把窗口挪过去（一次 Range 请求）。 */
         if (want < s->win_start || want >= s->win_start + s->win_len) {
+            int attempt;
             if (s->eof && s->win_len == 0) break;
-            if (yh_stream_fetch(s, want, s->win_cap) < 0) {
+            /*
+             * 取窗口允许重试：一次连接抖动不该让整首歌判死。
+             * s->err 只表示"最近一次失败"，成功后立刻清掉，不再是永久粘住的状态。
+             */
+            for (attempt = 0; attempt < YHTTP_FETCH_TRIES; attempt++) {
+                s->err = 0;
+                if (yh_stream_fetch(s, want, s->win_cap) >= 0) break;
+                if (s->cancelled) break;
+                yh_logf("yhttp: stream 取窗口失败 0x%08X（%d/%d），稍后重试\n",
+                        (unsigned)s->err, attempt + 1, YHTTP_FETCH_TRIES);
+                sceKernelDelayThread(YHTTP_RETRY_DELAY_US);
+            }
+            if (s->cancelled) return -1;
+            if (s->err) {
+                yh_logf("yhttp: stream 放弃 off=%lld 错误 0x%08X\n", want,
+                        (unsigned)s->err);
                 return done > 0 ? done : s->err;
             }
             if (s->win_len == 0) break;
@@ -661,6 +722,10 @@ void yhttp_stream_cancel(yhttp_stream *s) {
 void yhttp_stream_close(yhttp_stream *s) {
     if (!s) return;
     yhttp_stream_cancel(s);
+    if (s->opened) {
+        s->opened = 0;
+        if (g_streams_open > 0) g_streams_open--;
+    }
     free(s->win);
     free(s->url);
     free(s->referer);
