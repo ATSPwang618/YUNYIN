@@ -79,6 +79,15 @@ fn audio_decode(buf: &mut [i16], frames: i32) {
         buf.fill(0);
         return;
     }
+    /*
+     * Phase 2 的 Gate（任务书 §8/§65）：在线源缓存不够时只输出静音，
+     * **不调解码器**。这样"网络暂时没数据"永远不会被解码器当成流结束，
+     * 断网时表现是"卡住缓冲"，而不是"这首歌放完了"。
+     */
+    if !crate::media::source::remote::gate_ok() {
+        buf.fill(0);
+        return;
+    }
     let got = decoder::decode(buf, frames);
     if got <= 0 {
         PLAYING.store(false, Ordering::Release);
@@ -149,6 +158,8 @@ fn vita_audio_end() {
         log::append("bgm: sceAudioOutReleasePort");
     }
     PORT_RATE.store(0, Ordering::Release);
+    /* 在线源要先关播放器、再放源（见 source::remote 的说明）。 */
+    crate::media::source::remote::close_remote();
     decoder::close();
 }
 
@@ -225,6 +236,38 @@ pub fn play(path: &str) {
 
 pub fn pause() {
     PAUSED.store(true, Ordering::Release);
+}
+
+/*
+ * Phase 2：播放在线 URL。
+ * 与 play(path) 的差别只有"谁提供字节"：路径换成 URL + Referer，
+ * 其余（BGM 口、960 帧、状态上报）完全一样。
+ *   duration_ms: 调用方给的时长提示（§37），-1 表示没有
+ */
+pub fn play_url(url: &str, referer: &str, duration_ms: i64) {
+    if url.is_empty() {
+        return;
+    }
+    vita_audio_end();
+    if crate::media::source::remote::open_remote(url, referer, duration_ms).is_err() {
+        log::append(&format!("bgm: 在线打开失败 {url}"));
+        PLAYING.store(false, Ordering::Release);
+        return;
+    }
+    let rate = decoder::rate();
+    let dur = decoder::duration_ms();
+    RATE_HZ.store(rate as u32, Ordering::Release);
+    DUR_MS.store(dur, Ordering::Release);
+    POS_MS.store(0, Ordering::Release);
+    PLAYING.store(true, Ordering::Release);
+    PAUSED.store(false, Ordering::Release);
+    set_path(url);
+    if !vita_audio_init(rate) {
+        PLAYING.store(false, Ordering::Release);
+        crate::media::source::remote::close_remote();
+        return;
+    }
+    log::append(&format!("bgm: play_url {url} rate={rate} dur={dur}ms"));
 }
 
 pub fn resume(path: &str) {

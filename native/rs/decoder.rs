@@ -53,6 +53,13 @@ pub fn close() {
     }
 }
 
+/// 在线源已经由 `source::remote` 建好播放器句柄，这里只接管它。
+pub fn adopt_remote(player: *mut c_void, _ctx: *mut c_void) {
+    if let Ok(mut g) = HANDLE.lock() {
+        *g = Some(player as usize);
+    }
+}
+
 pub fn rate() -> i32 {
     match handle() {
         Some(h) => unsafe { yp_rate(h) }.max(1),

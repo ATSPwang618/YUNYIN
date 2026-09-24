@@ -67,4 +67,7 @@ pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_s
     /* Phase 0 network probe: inert unless the card asks for it
      * (ux0:/data/yunyin/netprobe.url or the debug flag). */
     net::probe::start_once();
+    /* Phase 2：卡里放 ux0:/data/yunyin/netplay.url 时，启动就试播这个在线 URL
+     *（第一行 URL，第二行可选 Referer）。没有这个文件就什么都不做。 */
+    source::remote::maybe_autoplay();
 }

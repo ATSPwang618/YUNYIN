@@ -13,6 +13,7 @@
 pub mod cache;
 pub mod http;
 pub mod local;
+pub mod remote;
 
 use alloc::string::String;
 

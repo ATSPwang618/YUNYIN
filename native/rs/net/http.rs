@@ -63,3 +63,111 @@ pub fn redirect_allowed(from: &str, to: &str) -> bool {
     let scheme = |u: &str| u.split("://").next().unwrap_or("").as_bytes().to_vec();
     scheme(from) == scheme(to)
 }
+
+/* ------------------------------------------------------------- 流式传输 -- */
+/*
+ * `yhttp_stream_*`（native/net/yhttp.c）的安全包装：把 HTTP 变成"可随机读取的
+ * 字节流"，再由 `source::http::HttpRangeSource` 在它上面做窗口缓存与取数线程。
+ *
+ * 这里只做转发：一次 `read_at` 对应一次 C 侧调用，窗口策略全在 Rust 侧，
+ * 所以电脑上可以用假传输替换掉它来验证（见 source/http.rs 的测试）。
+ */
+
+use core::ffi::c_void;
+use std::ffi::CString;
+use crate::media::source::SourceError;
+
+extern "C" {
+    fn yhttp_stream_open(
+        url: *const i8,
+        referer: *const i8,
+        tls_mode: i32,
+        size_out: *mut i64,
+        err_out: *mut i32,
+    ) -> *mut c_void;
+    fn yhttp_stream_read(
+        s: *mut c_void,
+        off: i64,
+        dst: *mut c_void,
+        n: i64,
+    ) -> i64;
+    fn yhttp_stream_cancel(s: *mut c_void);
+    fn yhttp_stream_close(s: *mut c_void);
+    fn yhttp_stream_error(s: *mut c_void) -> i32;
+}
+
+/// 一条打开的 HTTP 流。只在取数线程里创建与使用（不跨线程共享）。
+pub struct Stream {
+    p: *mut c_void,
+    size: Option<u64>,
+}
+
+/* 只为能放进取数线程：Stream 从头到尾只被那一个线程碰；
+ * C 侧的流对象本身不做跨线程共享（每次请求各自建）。 */
+unsafe impl Send for Stream {}
+
+impl Stream {
+    /// `tls`: 0 = 默认，1 = 打开校验（两者都走 HTTPS；默认校验本来就是开的）。
+    pub fn open(url: &str, referer: &str, tls: i32) -> Result<Self, SourceError> {
+        let Ok(c_url) = CString::new(url) else {
+            return Err(SourceError::Unsupported);
+        };
+        let c_ref = CString::new(referer).unwrap_or_default();
+        let mut size: i64 = -1;
+        let mut err: i32 = 0;
+        let p = unsafe {
+            yhttp_stream_open(
+                c_url.as_ptr(),
+                c_ref.as_ptr(),
+                tls,
+                &mut size as *mut i64,
+                &mut err as *mut i32,
+            )
+        };
+        if p.is_null() {
+            return Err(SourceError::Network(alloc::format!(
+                "yhttp_stream_open 失败 (0x{:08X})",
+                err as u32
+            )));
+        }
+        Ok(Self {
+            p,
+            size: if size >= 0 { Some(size as u64) } else { None },
+        })
+    }
+}
+
+impl super::super::source::http::ByteTransport for Stream {
+    fn read_at(&mut self, off: u64, dst: &mut [u8]) -> Result<usize, SourceError> {
+        if self.p.is_null() || dst.is_empty() {
+            return Ok(0);
+        }
+        let n = unsafe {
+            yhttp_stream_read(
+                self.p,
+                off as i64,
+                dst.as_mut_ptr() as *mut c_void,
+                dst.len() as i64,
+            )
+        };
+        if n < 0 {
+            /* 取消（切歌）会走到这里：用 Cancelled 让上层别当成"断网"。 */
+            return Err(SourceError::Cancelled);
+        }
+        Ok(n as usize)
+    }
+
+    fn size(&self) -> Option<u64> {
+        self.size
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        if !self.p.is_null() {
+            unsafe { yhttp_stream_cancel(self.p) };
+            unsafe { yhttp_stream_close(self.p) };
+            self.p = core::ptr::null_mut();
+        }
+    }
+}
