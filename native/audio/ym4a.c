@@ -10,6 +10,7 @@
  */
 
 #include "ym4a.h"
+#include "yp_io.h"
 #include "host/yunyin_log.h"
 
 #include <stdio.h>
@@ -32,7 +33,8 @@ typedef struct {
 
 typedef struct {
   int ready;
-  FILE *f;
+  const yp_io *io;
+  int owns_io;   /* 1 = 这份 IO 由 ym4a_close() 关闭 */
   long long file_size;
   long long mdat_body;
   long long mdat_size;
@@ -90,17 +92,19 @@ static unsigned long long be64(const unsigned char *p) {
   return ((unsigned long long)be32(p) << 32) | (unsigned long long)be32(p + 4);
 }
 
-static int seek_to(FILE *f, long long off) {
-  if (off < 0) return -1;
-  return fseeko(f, (off_t)off, SEEK_SET) == 0 ? 0 : -1;
+/* 按绝对偏移读 n 字节：先 seek 再 read，两个回调都由调用方提供。 */
+static int seek_to(const yp_io *io, long long off) {
+  if (!io || !io->seek || off < 0) return -1;
+  return io->seek(io->ctx, off, SEEK_SET) < 0 ? -1 : 0;
 }
 
-static int rd(FILE *f, long long off, void *buf, long long n) {
-  if (n < 0 || seek_to(f, off) != 0) return -1;
-  return fread(buf, 1, (size_t)n, f) == (size_t)n ? 0 : -1;
+static int rd(const yp_io *io, long long off, void *buf, long long n) {
+  if (!io || !io->read) return -1;
+  if (n < 0 || seek_to(io, off) != 0) return -1;
+  return io->read(io->ctx, buf, (unsigned long long)n) == n ? 0 : -1;
 }
 
-static unsigned char *slurp(FILE *f, long long off, long long n) {
+static unsigned char *slurp(const yp_io *io, long long off, long long n) {
   unsigned char *p;
   if (n <= 0 || n > YM4A_MAX_TABLE_BYTES) {
     yunyin_log("ym4a: table too large\n");
@@ -108,7 +112,7 @@ static unsigned char *slurp(FILE *f, long long off, long long n) {
   }
   p = (unsigned char *)malloc((size_t)n);
   if (!p) return NULL;
-  if (rd(f, off, p, n) != 0) {
+  if (rd(io, off, p, n) != 0) {
     free(p);
     return NULL;
   }
@@ -118,13 +122,13 @@ static unsigned char *slurp(FILE *f, long long off, long long n) {
 /* ------------------------------------------------------------------ 盒子 -- */
 
 /* 0 = 正常，-1 = 盒子结构坏了。 */
-static int box_header(FILE *f, long long off, long long end, char type[4],
+static int box_header(const yp_io *io, long long off, long long end, char type[4],
                       long long *hdr, long long *total) {
   unsigned char b[16];
   unsigned int size;
   long long want = (end - off) < 16 ? (end - off) : 16;
   if (want < 8) return -1;
-  if (rd(f, off, b, want) != 0) return -1;
+  if (rd(io, off, b, want) != 0) return -1;
   size = be32(b);
   memcpy(type, b + 4, 4);
   if (size == 1) {
@@ -144,13 +148,13 @@ static int box_header(FILE *f, long long off, long long end, char type[4],
 
 /* 在 [from,end) 里往后找第一个 `type` 类型的盒子。
  * 0 = 找到，1 = 没找到，-1 = 结构坏了。 */
-static int box_find(FILE *f, long long from, long long end, const char type[4],
+static int box_find(const yp_io *io, long long from, long long end, const char type[4],
                     ym4a_box *out) {
   long long off = from;
   while (off + 8 <= end) {
     char t[4];
     long long hdr, total;
-    if (box_header(f, off, end, t, &hdr, &total) != 0) return -1;
+    if (box_header(io, off, end, t, &hdr, &total) != 0) return -1;
     if (memcmp(t, type, 4) == 0) {
       out->start = off;
       out->body = off + hdr;
@@ -315,13 +319,13 @@ static int parse_esds(const unsigned char *p, int n, unsigned char *asc,
  * 注意个数在 +4 而不是 +8（这里踩过一次坑）。
  */
 
-static int read_stts(FILE *f, const ym4a_box *box) {
+static int read_stts(const yp_io *io, const ym4a_box *box) {
   unsigned char *p;
   long long size = box_payload(box);
   unsigned int count, i;
   long long seen = 0;
   if (size < 8) return -1;
-  p = slurp(f, box->body, size);
+  p = slurp(io, box->body, size);
   if (!p) return -1;
   count = be32(p + 4);
   if (count == 0 || count > YM4A_MAX_STTS || 8 + (long long)count * 8 > size) {
@@ -348,12 +352,12 @@ static int read_stts(FILE *f, const ym4a_box *box) {
   return 0;
 }
 
-static int read_stsc(FILE *f, const ym4a_box *box) {
+static int read_stsc(const yp_io *io, const ym4a_box *box) {
   unsigned char *p;
   long long size = box_payload(box);
   unsigned int count, i;
   if (size < 8) return -1;
-  p = slurp(f, box->body, size);
+  p = slurp(io, box->body, size);
   if (!p) return -1;
   count = be32(p + 4);
   if (count == 0 || count > YM4A_MAX_STSC ||
@@ -376,12 +380,12 @@ static int read_stsc(FILE *f, const ym4a_box *box) {
   return 0;
 }
 
-static int read_stsz(FILE *f, const ym4a_box *box) {
+static int read_stsz(const yp_io *io, const ym4a_box *box) {
   unsigned char *p;
   long long size = box_payload(box);
   unsigned int sample_size, count, i;
   if (size < 12) return -1;
-  p = slurp(f, box->body, size);
+  p = slurp(io, box->body, size);
   if (!p) return -1;
   sample_size = be32(p + 4);
   count = be32(p + 8);
@@ -408,13 +412,13 @@ static int read_stsz(FILE *f, const ym4a_box *box) {
   return 0;
 }
 
-static int read_stco(FILE *f, const ym4a_box *box, int wide) {
+static int read_stco(const yp_io *io, const ym4a_box *box, int wide) {
   unsigned char *p;
   long long size = box_payload(box);
   long long need;
   unsigned int count, i;
   if (size < 8) return -1;
-  p = slurp(f, box->body, size);
+  p = slurp(io, box->body, size);
   if (!p) return -1;
   count = be32(p + 4);
   need = 8 + (long long)count * (wide ? 8 : 4);
@@ -547,7 +551,8 @@ static void reset_state(void) {
   free(g.sizes);
   free(g.chunk_off);
   free(g.chunk_first);
-  if (g.f) fclose(g.f);
+  /* 只有"由我们打开"的 IO 才由我们关闭（见 ym4a_open_io 的 owns_io）。 */
+  if (g.owns_io && g.io && g.io->close) g.io->close(g.io->ctx);
   memset(&g, 0, sizeof(g));
   g.last = -1;
   g.cc = -1;
@@ -559,7 +564,7 @@ int ym4a_ready(void) { return g.ready; }
 
 /* 读 mp4a 样本描述（含 esds）与音轨的各个表。
  * 0 = 音轨解析成功，1 = 这不是我们能处理的音轨。 */
-static int parse_audio_trak(FILE *f, const ym4a_box *trak) {
+static int parse_audio_trak(const yp_io *io, const ym4a_box *trak) {
   ym4a_box mdia, minf, stbl, hdlr, mdhd, stsd, box;
   long long end = trak->start + trak->total;
   long long mdia_end, stbl_end;
@@ -569,28 +574,28 @@ static int parse_audio_trak(FILE *f, const ym4a_box *trak) {
   int found_codec = 0;
   int seen_asc = 0;
 
-  if (box_find(f, trak->body, end, "mdia", &mdia) != 0) return 1;
+  if (box_find(io, trak->body, end, "mdia", &mdia) != 0) return 1;
   mdia_end = mdia.start + mdia.total;
-  if (box_find(f, mdia.body, mdia_end, "hdlr", &hdlr) != 0) return 1;
+  if (box_find(io, mdia.body, mdia_end, "hdlr", &hdlr) != 0) return 1;
   {
     unsigned char b[4];
-    if (rd(f, hdlr.body + 8, b, 4) != 0) return 1;
+    if (rd(io, hdlr.body + 8, b, 4) != 0) return 1;
     if (memcmp(b, "soun", 4) != 0) return 1; /* video / text track */
   }
-  if (box_find(f, mdia.body, mdia_end, "minf", &minf) != 0) return 1;
-  if (box_find(f, minf.body, minf.start + minf.total, "stbl", &stbl) != 0)
+  if (box_find(io, mdia.body, mdia_end, "minf", &minf) != 0) return 1;
+  if (box_find(io, minf.body, minf.start + minf.total, "stbl", &stbl) != 0)
     return 1;
   stbl_end = stbl.start + stbl.total;
 
-  if (box_find(f, mdia.body, mdia_end, "mdhd", &mdhd) == 0) {
+  if (box_find(io, mdia.body, mdia_end, "mdhd", &mdhd) == 0) {
     unsigned char b[24];
-    if (rd(f, mdhd.body, b, sizeof b) == 0) {
+    if (rd(io, mdhd.body, b, sizeof b) == 0) {
       g.timescale = (int)(b[0] == 1 ? be32(b + 20) : be32(b + 12));
     }
   }
 
-  if (box_find(f, stbl.body, stbl_end, "stsd", &stsd) != 0) return 1;
-  p = slurp(f, stsd.body, 8);
+  if (box_find(io, stbl.body, stbl_end, "stsd", &stsd) != 0) return 1;
+  p = slurp(io, stsd.body, 8);
   if (!p) return 1;
   entry_count = be32(p + 4);
   free(p);
@@ -600,7 +605,7 @@ static int parse_audio_trak(FILE *f, const ym4a_box *trak) {
   for (i = 0; i < entry_count && i < 8; i++) {
     unsigned char hdrb[8];
     long long esize, entry_end;
-    if (rd(f, entry_off, hdrb, 8) != 0) return 1;
+    if (rd(io, entry_off, hdrb, 8) != 0) return 1;
     esize = (long long)be32(hdrb);
     if (esize < 8 || entry_off + esize > stsd.start + stsd.total) return 1;
     entry_end = entry_off + esize;
@@ -610,17 +615,17 @@ static int parse_audio_trak(FILE *f, const ym4a_box *trak) {
       unsigned char v[2];
       unsigned char sb[12];
       int version = 0;
-      if (rd(f, entry_off + 16, v, 2) == 0) version = (v[0] << 8) | v[1];
-      if (rd(f, entry_off + 24, sb, 12) == 0) {
+      if (rd(io, entry_off + 16, v, 2) == 0) version = (v[0] << 8) | v[1];
+      if (rd(io, entry_off + 24, sb, 12) == 0) {
         int ch = (sb[0] << 8) | sb[1];
         int rate = (int)(be32(sb + 8) >> 16);
         if (ch > 0 && ch <= 2) g.ch = ch;
         if (rate > 0) g.rate = rate;
       }
-      if (box_find(f, entry_off + 36 + (version == 1 ? 16 : 0), entry_end,
+      if (box_find(io, entry_off + 36 + (version == 1 ? 16 : 0), entry_end,
                    "esds", &box) == 0) {
         long long n = box_payload(&box);
-        unsigned char *ed = slurp(f, box.body, n);
+        unsigned char *ed = slurp(io, box.body, n);
         if (ed) {
           int asc_len = 0;
           if (parse_esds(ed, (int)n, g.asc, &asc_len) == 0) {
@@ -653,62 +658,65 @@ static int parse_audio_trak(FILE *f, const ym4a_box *trak) {
   if (g.ch <= 0) g.ch = 2;
   if (g.timescale <= 0) g.timescale = g.rate;
 
-  if (box_find(f, stbl.body, stbl_end, "stts", &box) != 0) return 1;
-  if (read_stts(f, &box) != 0) return 1;
-  if (box_find(f, stbl.body, stbl_end, "stsc", &box) != 0) return 1;
-  if (read_stsc(f, &box) != 0) return 1;
-  if (box_find(f, stbl.body, stbl_end, "stsz", &box) != 0) return 1;
-  if (read_stsz(f, &box) != 0) return 1;
-  if (box_find(f, stbl.body, stbl_end, "stco", &box) == 0) {
-    if (read_stco(f, &box, 0) != 0) return 1;
-  } else if (box_find(f, stbl.body, stbl_end, "co64", &box) == 0) {
-    if (read_stco(f, &box, 1) != 0) return 1;
+  if (box_find(io, stbl.body, stbl_end, "stts", &box) != 0) return 1;
+  if (read_stts(io, &box) != 0) return 1;
+  if (box_find(io, stbl.body, stbl_end, "stsc", &box) != 0) return 1;
+  if (read_stsc(io, &box) != 0) return 1;
+  if (box_find(io, stbl.body, stbl_end, "stsz", &box) != 0) return 1;
+  if (read_stsz(io, &box) != 0) return 1;
+  if (box_find(io, stbl.body, stbl_end, "stco", &box) == 0) {
+    if (read_stco(io, &box, 0) != 0) return 1;
+  } else if (box_find(io, stbl.body, stbl_end, "co64", &box) == 0) {
+    if (read_stco(io, &box, 1) != 0) return 1;
   } else {
     return 1;
   }
   return build_chunk_index() == 0 ? 0 : 1;
 }
 
-int ym4a_open(const char *path) {
-  FILE *f;
+/*
+ * 走 yp_io 打开（Phase 1 起的主入口）。
+ *   owns_io != 0 时，ym4a_close() 会调用 io->close() 释放它；
+ *   否则只借用（网络源由 Phase 2 自己持有）。
+ * size() 允许返回负数：长度未知时跳过所有"越界校验"，其余逻辑照旧。
+ */
+int ym4a_open_io(const yp_io *io, int owns_io) {
   long long end, off, cur;
   ym4a_box moov, box;
   int i;
   int had_audio = 0;
 
   ym4a_close();
-  if (!path || !*path) return YM4A_ERR_IO;
-  f = fopen(path, "rb");
-  if (!f) return YM4A_ERR_IO;
-  g.f = f;
-  if (fseeko(f, 0, SEEK_END) != 0) {
-    ym4a_close();
-    return YM4A_ERR_IO;
-  }
-  off = (long long)ftello(f);
-  if (off <= 0) {
-    ym4a_close();
-    return YM4A_ERR_IO;
-  }
-  g.file_size = off;
-  end = g.file_size;
+  if (!io || !io->read || !io->seek) return YM4A_ERR_IO;
+  g.io = io;
+  g.owns_io = owns_io ? 1 : 0;
 
-  if (box_find(f, 0, end, "moov", &moov) != 0) {
+  off = io->size ? io->size(io->ctx) : -1;
+  if (off <= 0) {
+    /* 长度未知（网络流）：用"能看到的最后位置"兜底，并放宽越界校验。 */
+    g.file_size = 0;
+    end = 0x7fffffffffffffffLL;
+  } else {
+    g.file_size = off;
+    end = off;
+  }
+
+  if (box_find(io, 0, end, "moov", &moov) != 0) {
     yunyin_log("ym4a: no moov box\n");
     ym4a_close();
     return YM4A_ERR_FORMAT;
   }
-  if (box_find(f, moov.start + moov.total, end, "mdat", &box) == 0 ||
-      box_find(f, 0, moov.start, "mdat", &box) == 0) {
+  if (box_find(io, moov.start + moov.total, end, "mdat", &box) == 0 ||
+      box_find(io, 0, moov.start, "mdat", &box) == 0) {
     g.mdat_body = box.body;
     g.mdat_size = box_payload(&box);
   }
 
   cur = moov.body;
   for (i = 0; i < 16; i++) {
-    int rc = box_find(f, cur, moov.start + moov.total, "trak", &box);
+    int rc = box_find(io, cur, moov.start + moov.total, "trak", &box);
     if (rc != 0) break;
-    if (parse_audio_trak(f, &box) == 0) {
+    if (parse_audio_trak(io, &box) == 0) {
       char msg[176];
       g.ready = 1;
       g.cur = 0;
@@ -728,6 +736,14 @@ int ym4a_open(const char *path) {
 
   ym4a_close();
   return had_audio ? YM4A_ERR_CODEC : YM4A_ERR_NO_AUDIO;
+}
+
+/* 本地文件：自己开一份文件 IO，并交给它负责关闭。 */
+int ym4a_open(const char *path) {
+  static yp_io file_io; /* 单例：同一时刻只开一个 M4A（与播放器一致） */
+  if (!path || !*path) return YM4A_ERR_IO;
+  if (yp_io_file_open(&file_io, path) != 0) return YM4A_ERR_IO;
+  return ym4a_open_io(&file_io, 1);
 }
 
 /* -------------------------------------------------------------- 取值接口 -- */
@@ -784,8 +800,10 @@ int ym4a_next_sample(unsigned char *dst, int cap) {
     return -1;
   }
   off = offset_of(idx);
-  if (off < 0 || off + (long long)n > g.file_size) return -1;
-  if (rd(g.f, off, dst, (long long)n) != 0) return -1;
+  /* 长度未知（网络流）时 file_size 为 0，此时只做最基本的下界校验。 */
+  if (off < 0) return -1;
+  if (g.file_size > 0 && off + (long long)n > g.file_size) return -1;
+  if (rd(g.io, off, dst, (long long)n) != 0) return -1;
   g.last = idx;
   g.cur = idx + 1;
   return (int)n;

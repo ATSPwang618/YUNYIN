@@ -404,6 +404,7 @@ def patch_host():
     needs_cc = (
         "host/yunyin_listdir.c" not in b
         or "audio/yplayer.c" not in b
+        or "audio/yp_io_file.c" not in b
         or "audio/ym4a.c" not in b
         or "audio/yaac.c" not in b
         or "net/yhttp.c" not in b
@@ -435,6 +436,10 @@ def patch_host():
             '\n      cc::Build::new().file(audio.join("yplayer.c"))'
             '.include(native).include(&audio).include(&host)'
             '.define("YPLAYER", None).compile("yplayer");'
+            # Phase 1：解码器的输入层（yp_io 的文件实现）
+            '\n      cc::Build::new().file(audio.join("yp_io_file.c"))'
+            '.include(native).include(&audio).include(&host)'
+            '.compile("yp_io_file");'
             '\n      cc::Build::new().file(audio.join("ym4a.c"))'
             '.include(native).include(&audio).include(&host)'
             '.compile("ym4a");'

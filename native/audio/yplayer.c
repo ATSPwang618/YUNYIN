@@ -14,6 +14,7 @@
 #include "vendor/opus/opusfile.h"
 #include "ym4a.h"
 #include "yaac.h"
+#include "yp_io.h"
 #include "host/yunyin_log.h"
 
 /* 一帧 AAC 解出来是 1024 个采样（带 SBR 时 2048）；硬件解码器单帧输出
@@ -24,10 +25,13 @@
  * 携带缓冲区就按这个尺寸开。 */
 #define YP_OPUS_CARRY_FRAMES 5760
 
-typedef struct {
+typedef struct yp_state {
   int fmt;   /* 0 none, 1 mp3, 2 ogg, 3 wav, 4 flac, 5 opus, 6 m4a */
   int rate;  /* native source rate */
   int ch;    /* native source channels (1 or 2) */
+  const yp_io *io;   /* 当前输入（Phase 1 起所有格式都从这里读） */
+  int owns_io;       /* 1 = yp_close() 负责关闭这份 io */
+  long long duration_hint_ms; /* 调用方给的时长提示（§37），为 0 表示没有 */
   mpg123_handle *mp3;
   OggVorbis_File vf;
   int vf_ok;
@@ -55,6 +59,112 @@ typedef struct {
 
 static yp_state g;
 
+/* ---------------------------------------------------------------- 输入层 -- */
+/*
+ * 五个库各有自己的回调签名，这里统一转发到同一个 yp_io（任务书 §34）。
+ * 只做转发，不做等待、不做重试 —— "数据够不够"由上层 Gate 决定（§15/§65）。
+ */
+
+static long long io_read_at(const yp_io *io, void *dst, unsigned long long n) {
+  if (!io || !io->read) return -1;
+  return io->read(io->ctx, dst, n);
+}
+
+static long long io_seek_to(const yp_io *io, long long off, int whence) {
+  if (!io || !io->seek) return -1;
+  return io->seek(io->ctx, off, whence);
+}
+
+/* mpg123：读回调返回实际字节数（0 = EOF），lseek 返回新位置 */
+static ssize_t mp3_io_read(void *ctx, void *buf, size_t n) {
+  return (ssize_t)io_read_at((const yp_io *)ctx, buf, (unsigned long long)n);
+}
+
+static off_t mp3_io_lseek(void *ctx, off_t off, int whence) {
+  return (off_t)io_seek_to((const yp_io *)ctx, (long long)off, whence);
+}
+
+/* vorbisfile */
+static size_t ogg_io_read(void *ptr, size_t size, size_t nmemb, void *ctx) {
+  unsigned long long want = (unsigned long long)size * nmemb;
+  long long got = io_read_at((const yp_io *)ctx, ptr, want);
+  if (got <= 0) return 0;
+  return (size_t)got / (size ? size : 1);
+}
+
+static int ogg_io_seek(void *ctx, ogg_int64_t off, int whence) {
+  return io_seek_to((const yp_io *)ctx, (long long)off, whence) < 0 ? -1 : 0;
+}
+
+static int ogg_io_close(void *ctx) { (void)ctx; return 0; /* io 由播放器关 */ }
+
+static long ogg_io_tell(void *ctx) {
+  const yp_io *io = (const yp_io *)ctx;
+  if (!io || !io->tell) return -1;
+  return (long)io->tell(io->ctx);
+}
+
+/* dr_wav / dr_flac：读回调签名相同，seek 回调各自有自己的枚举类型 */
+static size_t dr_io_read(void *user, void *dst, size_t n) {
+  long long got = io_read_at((const yp_io *)user, dst, (unsigned long long)n);
+  return got <= 0 ? 0 : (size_t)got;
+}
+
+/* dr_wav/dr_flac 只区分 start 与 current（"跳到结尾"用 current + 0x7FFFFFFF 表达） */
+static drwav_bool32 drwav_io_seek(void *user, int off, drwav_seek_origin origin) {
+  int whence = origin == drwav_seek_origin_current ? SEEK_CUR : SEEK_SET;
+  return io_seek_to((const yp_io *)user, (long long)off, whence) < 0 ? 0 : 1;
+}
+
+static drflac_bool32 drflac_io_seek(void *user, int off,
+                                    drflac_seek_origin origin) {
+  int whence = origin == drflac_seek_origin_current ? SEEK_CUR : SEEK_SET;
+  return io_seek_to((const yp_io *)user, (long long)off, whence) < 0 ? 0 : 1;
+}
+
+/* opusfile */
+static int opus_io_read(void *ctx, unsigned char *ptr, int nbytes) {
+  long long got = io_read_at((const yp_io *)ctx, ptr, (unsigned long long)nbytes);
+  return (int)got;
+}
+
+static int opus_io_seek(void *ctx, opus_int64 off, int whence) {
+  return io_seek_to((const yp_io *)ctx, (long long)off, whence) < 0 ? -1 : 0;
+}
+
+static opus_int64 opus_io_tell(void *ctx) {
+  const yp_io *io = (const yp_io *)ctx;
+  if (!io || !io->tell) return -1;
+  return (opus_int64)io->tell(io->ctx);
+}
+
+static int opus_io_close(void *ctx) { (void)ctx; return 0; /* io 由播放器关 */ }
+
+/* ------------------------------------------------------------------ 嗅探 -- */
+/*
+ * 按字节判断容器（任务书 §38/§39）：网络流没有可用后缀，本地文件也可能被改名。
+ * 返回本文件内部的 fmt 编号；0 = 认不出来（那时才退回按后缀判断）。
+ */
+static int yp_sniff(const unsigned char *b, int n) {
+  if (n >= 4 && b[0] == 'f' && b[1] == 'L' && b[2] == 'a' && b[3] == 'C')
+    return 4;  /* FLAC */
+  if (n >= 4 && b[0] == 'O' && b[1] == 'g' && b[2] == 'g' && b[3] == 'S') {
+    int i, limit = n < 64 ? n : 64;
+    for (i = 0; i + 8 <= limit; i++) {
+      if (memcmp(b + i, "OpusHead", 8) == 0) return 5;
+      if (memcmp(b + i, "vorbis", 6) == 0) return 2;
+    }
+    return 2; /* 认不出编码名时按 Ogg/Vorbis 处理 */
+  }
+  if (n >= 12 && b[4] == 'f' && b[5] == 't' && b[6] == 'y' && b[7] == 'p')
+    return 6;  /* MP4 家族：M4A */
+  if (n >= 12 && b[8] == 'W' && b[9] == 'A' && b[10] == 'V' && b[11] == 'E')
+    return 3;  /* RIFF/WAVE */
+  if (n >= 3 && b[0] == 'I' && b[1] == 'D' && b[2] == '3') return 1; /* MP3 */
+  if (n >= 2 && b[0] == 0xFF && (b[1] & 0xE0) == 0xE0) return 1;     /* MP3 帧同步 */
+  return 0;
+}
+
 static void yp_clear(void) {
   if (g.mp3) { mpg123_close(g.mp3); mpg123_delete(g.mp3); g.mp3 = NULL; }
   if (g.vf_ok) { ov_clear(&g.vf); g.vf_ok = 0; }
@@ -63,6 +173,11 @@ static void yp_clear(void) {
   if (g.of) { op_free(g.of); g.of = NULL; }
   yaac_close();
   ym4a_close();
+  /* 输入层：只有"由我们打开"的那份 IO 才由我们关闭（见 yp_open_io 的 owns_io）。 */
+  if (g.owns_io && g.io && g.io->close) g.io->close(g.io->ctx);
+  g.io = NULL;
+  g.owns_io = 0;
+  g.duration_hint_ms = 0;
   if (g.cover) { free(g.cover); g.cover = NULL; }
   g.cover_len = 0;
   g.rate = 0;
@@ -79,15 +194,31 @@ static void yp_clear(void) {
 }
 
 /* -------- MP3 (mpg123) -------- */
-static int mp3_open(const char *p) {
+static int mp3_open(void) {
   static int inited = 0;
+  long long size;
   if (!inited) { mpg123_init(); inited = 1; }
   int err = 0;
   g.mp3 = mpg123_new(NULL, &err);
   if (!g.mp3) return -1;
-  mpg123_param(g.mp3, MPG123_FLAGS,
-               MPG123_FORCE_SEEKABLE | MPG123_FUZZY | MPG123_GAPLESS | MPG123_PICTURE, 0.0);
-  if (mpg123_open(g.mp3, p) != MPG123_OK) return -1;
+  size = g.io->size ? g.io->size(g.io->ctx) : -1;
+  /*
+   * §36：本地文件（长度已知）保留 FORCE_SEEKABLE，seek 才是"真跳转"；
+   * 长度未知的流（以后的网络源）绝不能设它 —— 那会让 mpg123 扫完整条流求长度。
+   */
+  if (size > 0) {
+    mpg123_param(g.mp3, MPG123_FLAGS,
+                 MPG123_FORCE_SEEKABLE | MPG123_FUZZY | MPG123_GAPLESS |
+                     MPG123_PICTURE, 0.0);
+  } else {
+    mpg123_param(g.mp3, MPG123_FLAGS,
+                 MPG123_FUZZY | MPG123_GAPLESS | MPG123_PICTURE, 0.0);
+  }
+  if (mpg123_replace_reader_handle(g.mp3, mp3_io_read, mp3_io_lseek, NULL) !=
+      MPG123_OK)
+    return -1;
+  if (mpg123_open_handle(g.mp3, (void *)g.io) != MPG123_OK) return -1;
+  if (size > 0) mpg123_set_filesize(g.mp3, (off_t)size);
   long r = 0;
   int ch = 0, enc = 0;
   if (mpg123_getformat(g.mp3, &r, &ch, &enc) != MPG123_OK) return -1;
@@ -124,8 +255,13 @@ static int mp3_decode(short *buf, int max_frames) {
 }
 
 /* -------- OGG (vorbisfile) -------- */
-static int ogg_open(const char *p) {
-  if (ov_fopen(p, &g.vf) != 0) return -1;
+static int ogg_open(void) {
+  ov_callbacks cb;
+  cb.read_func = ogg_io_read;
+  cb.seek_func = ogg_io_seek;
+  cb.close_func = ogg_io_close;
+  cb.tell_func = ogg_io_tell;
+  if (ov_open_callbacks((void *)g.io, &g.vf, NULL, 0, cb) != 0) return -1;
   vorbis_info *vi = ov_info(&g.vf, -1);
   if (!vi) { ov_clear(&g.vf); return -1; }
   g.vf_ok = 1;
@@ -172,7 +308,8 @@ static int ogg_decode(short *buf, int max_frames) {
 
 /* -------- WAV (dr_wav) -------- */
 static int wav_open(const char *p) {
-  if (!drwav_init_file(&g.wav, p)) return -1;
+  (void)p;
+  if (!drwav_init(&g.wav, dr_io_read, drwav_io_seek, (void *)g.io)) return -1;
   g.wav_ok = 1;
   g.rate = (int)g.wav.sampleRate;
   g.ch = g.wav.channels >= 2 ? 2 : 1;
@@ -196,7 +333,8 @@ static int wav_decode(short *buf, int max_frames) {
 
 /* -------- FLAC (dr_flac) -------- */
 static int flac_open(const char *p) {
-  g.flac = drflac_open_file(p);
+  (void)p;
+  g.flac = drflac_open(dr_io_read, drflac_io_seek, (void *)g.io);
   if (!g.flac) return -1;
   g.rate = (int)g.flac->sampleRate;
   g.ch = g.flac->channels >= 2 ? 2 : 1;
@@ -221,7 +359,13 @@ static int flac_decode(short *buf, int max_frames) {
 /* -------- OPUS (opusfile) -------- */
 static int opus_open(const char *p) {
   int err = 0;
-  g.of = op_open_file(p, &err);
+  OpusFileCallbacks cb;
+  (void)p;
+  cb.read = opus_io_read;
+  cb.seek = opus_io_seek;
+  cb.tell = opus_io_tell;
+  cb.close = opus_io_close;
+  g.of = op_open_callbacks((void *)g.io, &cb, NULL, 0, &err);
   if (!g.of) return -1;
   g.rate = 48000; /* opus decodes at 48 kHz; BGM port opens at this native rate */
   /* 一律输出立体声：op_read_stereo 会把单声道/多声道下混成两声道，
@@ -276,7 +420,9 @@ static int yp_opus_decode(short *buf, int max_frames) {
 /* -------- M4A / AAC（ym4a 解复用 + SceAudiodec 硬件解码） -------- */
 
 static int m4a_open(const char *p) {
-  int rc = ym4a_open(p);
+  int rc;
+  (void)p;
+  rc = ym4a_open_io(g.io, 0); /* IO 归播放器持有，解复用器只借用 */
   if (rc != YM4A_OK) {
     char msg[64];
     snprintf(msg, sizeof msg, "yplayer: ym4a_open rc=%d\n", rc);
@@ -372,30 +518,96 @@ static int m4a_decode(short *buf, int max_frames) {
 }
 
 /* -------- public -------- */
-int yp_open(const char *path) {
-  yp_clear();
-  if (!path || !*path) return -1;
-  size_t L = strlen(path);
-  char lo[1024];
-  if (L >= sizeof lo) return -1;
-  for (size_t i = 0; i < L; i++) lo[i] = (char)tolower((unsigned char)path[i]);
-  lo[L] = 0;
 
-  if (strstr(lo, ".mp3")) return mp3_open(path);
-  if (strstr(lo, ".ogg")) return ogg_open(path);
-  if (strstr(lo, ".wav")) return wav_open(path);
-  if (strstr(lo, ".flac")) return flac_open(path);
-  if (strstr(lo, ".opus") || strstr(lo, ".oga")) return opus_open(path);
-  /* M4A 是容器，里面是 AAC。`.mp4`/`.m4b` 也接受 —— 解复用器总是挑 `soun` 音轨。 */
-  if (strstr(lo, ".m4a") || strstr(lo, ".m4b") || strstr(lo, ".mp4"))
-    return m4a_open(path);
-  return -1;
+/* 按后缀兜底识别（只在"嗅字节认不出来"时用，比如空文件或未知容器）。 */
+static int yp_format_from_path(const char *path) {
+  size_t L, i;
+  char lo[1024];
+  if (!path || !*path) return 0;
+  L = strlen(path);
+  if (L >= sizeof lo) return 0;
+  for (i = 0; i < L; i++) lo[i] = (char)tolower((unsigned char)path[i]);
+  lo[L] = 0;
+  if (strstr(lo, ".mp3")) return 1;
+  if (strstr(lo, ".ogg") || strstr(lo, ".oga")) return 2;
+  if (strstr(lo, ".wav")) return 3;
+  if (strstr(lo, ".flac")) return 4;
+  if (strstr(lo, ".opus")) return 5;
+  if (strstr(lo, ".m4a") || strstr(lo, ".m4b") || strstr(lo, ".mp4")) return 6;
+  return 0;
 }
 
-int yp_rate(void) { return g.rate; }
-int yp_channels(void) { return g.ch; }
+/* 读前 64 字节嗅探格式，然后把游标复位，让解码器从 0 开始。 */
+static int yp_sniff_head(void) {
+  unsigned char head[64];
+  long long got;
+  if (!g.io || !g.io->read || !g.io->seek) return 0;
+  if (io_seek_to(g.io, 0, SEEK_SET) < 0) return 0;
+  got = io_read_at(g.io, head, sizeof head);
+  io_seek_to(g.io, 0, SEEK_SET);
+  if (got <= 0) return 0;
+  return yp_sniff(head, (int)got);
+}
 
-int yp_decode(short *buf, int max_frames) {
+/* 按格式分派到对应的解码器（都从 g.io 读）。 */
+static int yp_open_decoder(int fmt, const char *path_hint) {
+  switch (fmt) {
+    case 1: return mp3_open();
+    case 2: return ogg_open();
+    case 3: return wav_open(path_hint);
+    case 4: return flac_open(path_hint);
+    case 5: return opus_open(path_hint);
+    case 6: return m4a_open(path_hint);
+    default: return -1;
+  }
+}
+
+/*
+ * 主入口：把一份 yp_io 交给正确的解码器。
+ *   owns_io != 0 时，yp_close() 会调用 io->close() 释放它；
+ *   path_hint / format_hint / duration_hint_ms 都是"提示"，可以为空或 -1/0。
+ *
+ * 目前内部实现是**单实例**（同一时刻只放一首歌，和播放器一致），
+ * 返回的 handle 就是那份状态；Phase 2 若要同时开两路源，这里才需要改成多实例。
+ */
+yp_player *yp_open_io(const yp_io *io, int owns_io, const char *path_hint,
+                      int format_hint, long long duration_hint_ms) {
+  int fmt;
+  if (!io || !io->read) return NULL;
+  yp_clear();
+  g.io = io;
+  g.owns_io = owns_io ? 1 : 0;
+  g.duration_hint_ms = duration_hint_ms > 0 ? duration_hint_ms : 0;
+
+  /* 格式判定顺序（§38/§39/§70）：调用方给的提示 → 嗅字节 → 后缀兜底。 */
+  fmt = (format_hint > 0 && format_hint <= 6) ? format_hint : 0;
+  if (fmt == 0) fmt = yp_sniff_head();
+  if (fmt == 0) fmt = yp_format_from_path(path_hint);
+  if (fmt == 0) {
+    yunyin_log("yplayer: 认不出格式（既嗅不出魔数，也没有可用后缀）\n");
+    yp_clear();
+    return NULL;
+  }
+  if (yp_open_decoder(fmt, path_hint) != 0) {
+    yp_clear();
+    return NULL;
+  }
+  return &g;
+}
+
+/* 本地文件便利入口：自己开一份文件 IO，并交给 yp_close() 负责关闭。 */
+yp_player *yp_open(const char *path) {
+  static yp_io file_io; /* 单实例：与 yp_open_io 的实现一致 */
+  if (!path || !*path) return NULL;
+  if (yp_io_file_open(&file_io, path) != 0) return NULL;
+  return yp_open_io(&file_io, 1, path, 0, -1);
+}
+
+int yp_rate(const yp_player *p) { (void)p; return g.rate; }
+int yp_channels(const yp_player *p) { (void)p; return g.ch; }
+
+int yp_decode(yp_player *p, short *buf, int max_frames) {
+  (void)p;
   switch (g.fmt) {
     case 1: return mp3_decode(buf, max_frames);
     case 2: return ogg_decode(buf, max_frames);
@@ -409,7 +621,8 @@ int yp_decode(short *buf, int max_frames) {
 
 /* 跳到某个绝对源帧。暂停时解码器停在当前帧不动（上层补静音）；
  * seek 只用于用户明确的跳转。 */
-int yp_seek(long long frame) {
+int yp_seek(yp_player *p, long long frame) {
+  (void)p;
   if (frame < 0) frame = 0;
   switch (g.fmt) {
     case 1:
@@ -445,7 +658,8 @@ int yp_seek(long long frame) {
   return -1;
 }
 
-long long yp_position(void) {
+long long yp_position(const yp_player *p) {
+  (void)p;
   if (g.fmt == 1 && g.mp3) return (long long)mpg123_tell(g.mp3);
   if (g.fmt == 2 && g.vf_ok) return (long long)ov_pcm_tell(&g.vf);
   if (g.fmt == 3 && g.wav_ok) return (long long)g.wav_frames;
@@ -456,19 +670,27 @@ long long yp_position(void) {
   return 0;
 }
 
-long long yp_length(void) {
+long long yp_length(const yp_player *p) {
+  (void)p;
   if (g.fmt == 1 && g.mp3) return (long long)mpg123_length(g.mp3);
   if (g.fmt == 2 && g.vf_ok) return (long long)ov_pcm_total(&g.vf, -1);
   if (g.fmt == 3 && g.wav_ok) return (long long)g.wav.totalPCMFrameCount;
   if (g.fmt == 4 && g.flac) return (long long)g.flac->totalPCMFrameCount;
   if (g.fmt == 5 && g.of) return (long long)op_pcm_total(g.of, -1);
   if (g.fmt == 6) return ym4a_total_frames();
+  /* 容器/解码器都报不出长度时（例如网络 MP3 还没扫完），用调用方给的时长提示。 */
+  if (g.duration_hint_ms > 0 && g.rate > 0)
+    return (long long)g.duration_hint_ms * g.rate / 1000;
   return 0;
 }
 
-const unsigned char *yp_cover(int *len) {
+const unsigned char *yp_cover(yp_player *p, int *len) {
+  (void)p;
   if (len) *len = (int)g.cover_len;
   return g.cover_len ? g.cover : NULL;
 }
 
-void yp_close(void) { yp_clear(); }
+void yp_close(yp_player *p) {
+  (void)p;
+  yp_clear();
+}

@@ -1,6 +1,8 @@
 #ifndef YUNYIN_YM4A_H
 #define YUNYIN_YM4A_H
 
+#include "yp_io.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -31,7 +33,11 @@ extern "C" {
 #define YM4A_ERR_MEMORY   -5  /* sample table did not fit */
 #define YM4A_ERR_TABLE    -6  /* sample table is inconsistent */
 
-int  ym4a_open(const char *path);        /* 0 (YM4A_OK) on success */
+/* 走 yp_io 打开（Phase 1 起的主入口）；owns_io != 0 表示由 ym4a_close() 负责关闭它。 */
+int  ym4a_open_io(const yp_io *io, int owns_io);
+
+/* 本地文件便利入口：自己开文件 IO。成功返回 0（YM4A_OK）。 */
+int  ym4a_open(const char *path);
 void ym4a_close(void);
 int  ym4a_ready(void);
 
