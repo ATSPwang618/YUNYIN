@@ -154,6 +154,16 @@ struct Window {
     buf: Vec<u8>,
     start: u64,
     /*
+     * 预先抓好的**下一窗**（读得比解码快一窗）。
+     *
+     * 为什么要有它：真机上一条新的 Range 请求要 1.8–2.7 秒（Phase 0 实测），
+     * 而"要到了才去抓"的策略会让网络一抖就断音。有了预取，解码器跨到下一窗时
+     * 数据已经在内存里，只是把 next 升格成当前窗口 —— 一首 5、6 分钟的歌
+     * 因此可以一直连着播下去（窗口只决定"一次预取多少"，不限制歌的长度）。
+     */
+    next: Vec<u8>,
+    next_start: u64,
+    /*
      * 「流到哪儿就没有数据了」——这是一个**位置**，不是一个布尔。
      *
      * 以前这里是个 bool `eof`，语义是"我们见过一次末尾"。问题是解码器探测完
@@ -184,6 +194,51 @@ struct Window {
     cancelled: bool,
 }
 
+impl Window {
+    /// 当前位置被当前窗口盖住了吗。
+    fn covers(&self, pos: u64) -> bool {
+        pos >= self.start && pos < self.start + self.buf.len() as u64
+    }
+
+    /// 当前窗口没盖住、但预取槽接得上时，把预取槽升格成当前窗口。
+    /// 返回"升格之后盖住了吗"。
+    fn promote_if_needed(&mut self, pos: u64) -> bool {
+        if self.covers(pos) {
+            return true;
+        }
+        let next_ok = !self.next.is_empty()
+            && pos >= self.next_start
+            && pos < self.next_start + self.next.len() as u64;
+        if !next_ok {
+            return false;
+        }
+        core::mem::swap(&mut self.buf, &mut self.next);
+        self.start = self.next_start;
+        self.next.clear();
+        true
+    }
+
+    /// 顺手把下一窗预取上（只在"没人干活、预取槽空着、还没到底"时登记）。
+    fn maybe_prefetch(w: &mut Self, cv: &Condvar) {
+        if w.cancelled || w.pending || w.inflight || w.err.is_some() {
+            return;
+        }
+        if !w.next.is_empty() || w.buf.is_empty() {
+            return;
+        }
+        let at = w.start + w.buf.len() as u64;
+        if let Some(end) = w.end_at {
+            if at >= end {
+                return; /* 已知到底 */
+            }
+        }
+        w.want_from = at;
+        w.generation = w.generation.wrapping_add(1);
+        w.pending = true;
+        cv.notify_all();
+    }
+}
+
 pub struct HttpRangeSource<T: ByteTransport + 'static> {
     shared: Arc<(Mutex<Window>, Condvar)>,
     pos: u64,
@@ -204,6 +259,8 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
             Mutex::new(Window {
                 buf: Vec::new(),
                 start: 0,
+                next: Vec::new(),
+                next_start: 0,
                 end_at: None,
                 err: None,
                 want_from: 0,
@@ -279,14 +336,25 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                             match got {
                                 Ok(0) => w.end_at = Some(from),
                                 Ok(n) => {
-                                    /* 抓到数据：整体替换窗口（只有这里会动 buf）。 */
-                                    w.buf.clear();
-                                    w.buf.extend_from_slice(&tmp[..n]);
-                                    w.start = from;
+                                    let contiguous = !w.buf.is_empty()
+                                        && from == w.start + w.buf.len() as u64;
+                                    if w.buf.is_empty() || !contiguous {
+                                        /* 第一窗 / 消费者跳到别处：这次结果就是新的当前窗口。 */
+                                        w.buf.clear();
+                                        w.buf.extend_from_slice(&tmp[..n]);
+                                        w.start = from;
+                                        w.next.clear();
+                                    } else {
+                                        /* 紧接当前窗口：放进预取槽等着被升格。 */
+                                        w.next.clear();
+                                        w.next.extend_from_slice(&tmp[..n]);
+                                        w.next_start = from;
+                                    }
                                 }
                                 Err(e) => w.err = Some(e),
                             }
                             w.pending = false;
+                            Window::maybe_prefetch(&mut w, cv);
                             gen_hint.store(w.generation, Ordering::Release);
                             cv.notify_all();
                         }
@@ -328,7 +396,8 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
         let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
         let Ok(mut w) = lock.lock() else { return false };
         loop {
-            let covered = pos >= w.start && pos < w.start + w.buf.len() as u64;
+            /* 先用预取槽兜一下：上一窗读尽时，下一窗往往已经在内存里了。 */
+            let covered = w.promote_if_needed(pos);
             /* 「到底」是一个位置：只有你要的位置已经过了那个点，才算是结束。 */
             let ended = w.end_at.map_or(false, |end| pos >= end);
             if covered || ended || w.err.is_some() || w.cancelled {
@@ -474,7 +543,8 @@ impl<T: ByteTransport + 'static> AudioSource for HttpRangeSource<T> {
             let Ok(w) = lock.lock() else {
                 return Err(SourceError::Io(String::from("window lock")));
             };
-            let c = pos >= w.start && pos < w.start + w.buf.len() as u64;
+            let mut w = w;
+            let c = w.promote_if_needed(pos);
             trace_f(|| format!(
                 "seek pos={pos} 命中窗口={c} 窗口=[{},{})",
                 w.start,
@@ -498,12 +568,20 @@ impl<T: ByteTransport + 'static> AudioSource for HttpRangeSource<T> {
 
     fn available(&self) -> usize {
         let (lock, _cv) = &*self.shared;
-        let Ok(w) = lock.lock() else { return 0 };
-        if self.pos < w.start {
+        let Ok(mut w) = lock.lock() else { return 0 };
+        /* 顺手升格预取槽：Gate 看的就是这个数，不能因为"还没升格"而误判缓存不够。 */
+        if !w.promote_if_needed(self.pos) {
             return 0;
         }
         let off = (self.pos - w.start) as usize;
-        w.buf.len().saturating_sub(off)
+        let in_window = w.buf.len().saturating_sub(off);
+        /* 预取槽里的字节也算"已经拿到的数据"（解码器马上能用）。 */
+        let ahead = if !w.next.is_empty() && self.pos + in_window as u64 >= w.next_start {
+            w.next.len()
+        } else {
+            0
+        };
+        in_window + ahead
     }
 
     fn is_eof(&self) -> bool {
