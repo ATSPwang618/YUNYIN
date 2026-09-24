@@ -612,8 +612,14 @@ static int yh_stream_fetch(yhttp_stream *s, long long off, int want) {
     }
     s->win_start = (long long)start;
     s->win_len = got;
-    if (got == 0) s->eof = 1;
-    else if (s->size > 0 && (long long)start + got >= s->size) s->eof = 1;
+    /*
+     * 注意：s->eof 只是**这一个窗口**的说明，不是"整条流结束了"。
+     * 解码器探测完文件尾巴以后一定会 seek 回开头，那时候当然还有数据。
+     * 以前 read() 用 `eof && win_len == 0` 当"整条流到底"的门，结果探测过一次
+     * 尾巴之后，连 off=0 的读都直接返回 0（假 EOF）—— 真机上"解码器打不开
+     * 在线流"就是这么来的。现在这个标志只用来记日志，不参与任何判断。
+     */
+    s->eof = (got == 0) || (s->size > 0 && (long long)start + got >= s->size);
     yh_logf("yhttp: stream 窗口 %lld..%lld（%d 字节，总长 %lld）\n",
             s->win_start, s->win_start + got, got, s->size);
 
@@ -677,8 +683,11 @@ long long yhttp_stream_read(yhttp_stream *s, long long off, void *dst,
         /* 命中窗口就直接拷，不命中就把窗口挪过去（一次 Range 请求）。 */
         if (want < s->win_start || want >= s->win_start + s->win_len) {
             int attempt;
-            if (s->eof && s->win_len == 0) break;
             /*
+             * 这里**不能**用"之前到过流末尾"来提前收工：解码器探测完尾巴一定会
+             * seek 回开头，那时候必须照常发新的 Range 请求。真正"到底了"的信号
+             * 只有一条 —— 这次取回来的窗口是空的（下面那个 win_len == 0）。
+             *
              * 取窗口允许重试：一次连接抖动不该让整首歌判死。
              * s->err 只表示"最近一次失败"，成功后立刻清掉，不再是永久粘住的状态。
              */

@@ -117,6 +117,7 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                             w.pending = false; /* 这一抓由我负责 */
                             w.buf.clear();
                             w.start = from;
+                            w.eof = false; /* 这一窗的结果等下重新判定 */
                         }
                         let got = st.read_at(from, &mut tmp);
                         {
@@ -171,6 +172,12 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
             w.generation = w.generation.wrapping_add(1);
             w.buf.clear();
             w.start = from;
+            /*
+             * "到过流末尾"是**上一个位置**的结论，不能跟着窗口一起搬过来：
+             * 解码器探测完文件尾巴一定会 seek 回开头，那时这里必须重新允许取数，
+             * 否则 wait_for 会因为陈旧的 eof 直接返回"没数据"，开门就是假 EOF。
+             */
+            w.eof = false;
             w.pending = true;
             cv.notify_all();
         }
@@ -193,6 +200,7 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                 w.generation = w.generation.wrapping_add(1);
                 w.buf.clear();
                 w.start = pos;
+                w.eof = false; /* 同上：换了位置，之前的"到底"结论作废 */
                 w.pending = true;
                 cv.notify_all();
             }
