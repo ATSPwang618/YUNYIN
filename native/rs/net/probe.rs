@@ -158,6 +158,8 @@ static RUNS: AtomicU32 = AtomicU32::new(0);
 /* --------------------------------------------------------------- report -- */
 
 fn report(line: &str) {
+    /* 和主日志共用一把锁：这份报告也可能被取数线程和探针线程同时写。 */
+    let _guard = log::lock();
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

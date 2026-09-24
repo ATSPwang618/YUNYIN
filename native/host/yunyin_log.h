@@ -22,7 +22,16 @@
 #include <string.h>
 
 #define YUNYIN_LOG_FLAG "ux0:data/yunyin/debug"
-#define YUNYIN_LOG_PATH "ux0:data/yunyin.log"
+
+/*
+ * 写日志统一走 Rust（platform/log.rs 的 yunyin_log_line）。
+ *
+ * 以前这里自己 sceIoOpen/sceIoWrite/sceIoClose，而 Rust 侧走 std::fs —— 两条路径
+ * 并发写同一个文件、没有任何互斥。在线播放会同时有音频线程 / 在线打开线程 /
+ * 取数线程在写日志，真机上出现过"两行日志黏在一起"，紧接着程序崩在字符串格式化
+ * （DFAR=0xc，trait 对象被踩成 0）。现在两边共用 Rust 里那把 LOG_LOCK。
+ */
+void yunyin_log_line(const unsigned char *text, unsigned int len);
 
 static YUNYIN_UNUSED int yunyin_log_enabled(void) {
   SceUID flag = sceIoOpen(YUNYIN_LOG_FLAG, SCE_O_RDONLY, 0);
@@ -37,12 +46,7 @@ static YUNYIN_UNUSED void yunyin_log(const char *msg) {
   if (!msg || !yunyin_log_enabled()) {
     return;
   }
-  SceUID f = sceIoOpen(YUNYIN_LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT, 0777);
-  if (f >= 0) {
-    sceIoLseek(f, 0, SCE_SEEK_END);
-    sceIoWrite(f, msg, strlen(msg));
-    sceIoClose(f);
-  }
+  yunyin_log_line((const unsigned char *)msg, (unsigned int)strlen(msg));
 }
 
 #else /* host build: no device, but keep the diagnostics on stderr */
