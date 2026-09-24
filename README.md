@@ -2,7 +2,8 @@
 
 <img src="screenshots/icon0.png" width="104" align="right" alt="YUNYIN">
 
-用 [PocketJS](https://pocketjs.dev)（Solid 前端 + Rust ）写的 PS Vita 本地音乐播放器。
+用 [PocketJS](https://pocketjs.dev)（Solid 前端 + Rust ）写的 PS Vita 音乐播放器：
+**本地曲库 + 网易云在线播放**。
 
 我受不了现有音乐播放器的古法 UI，一直想要一个现代化、能换主题、能看中文歌词的本地播放器，于是这个项目就诞生了！！
 
@@ -16,12 +17,15 @@
 - 中日两套字形，外加**流式 CJK**：常用字烘焙进包里，生僻字按需从后台加载。
 - **M4A 也能放**（网易云下载的那种 `.m4a`）。M4A 只是盒子，里面装的是 AAC：
   播放器自己拆盒子、把 AAC 交给 Vita 的硬件解码器，不需要 FFmpeg，也不用转码。
+- **在线播放**（Phase 2 已完成）：网易云的歌可以边下边播，**不用等整首下完**；
+  一首 4 分钟的歌实测能完整播完，中途断网会自动重试、恢复后接着放。
 
 |  |  |
 | --- | --- |
-| 当前版本 | **0.75** —— [下载 / 历史版本](https://github.com/ATSPwang618/YUNYIN/releases) |
+| 当前版本 | **0.88** —— [下载 / 历史版本](https://github.com/ATSPwang618/YUNYIN/releases) |
 | 曲库目录 | `ux0:/data/yunyin/music`（可以分子文件夹，最多 240 首） |
 | 音频格式 | MP3（最推荐） / M4A（AAC） / OGG / WAV / FLAC / OPUS |
+| 在线音源 | 网易云（匿名 `outer/url`）—— 见下面「在线播放」 |
 | 界面 | 首页播放器 · 全部曲目 · 专辑 · 收藏 · 设置 |
 | 主题 | LIGHT / DARK / PURE / ANIME 四套，**默认 DARK** |
 
@@ -121,6 +125,47 @@ Release 里有一个 **`YUNYIN-TagCheck.exe`**（Windows，免安装），把 mp
 2. 重新打开云音，日志会写进 `ux0:data/yunyin.log`。
 3. 抓完把 `debug` 删掉，下次启动就又不写了。
 
+**开了 `debug` 之后不用再手动拷日志**：应用会顺便开一个小服务，电脑上一条命令就能取
+（Vita 的 IP 在 VitaShell 首页能看到，也会写进日志）：
+
+```powershell
+curl.exe -s http://<Vita 的 IP>:1337/ -o "$env:USERPROFILE\Desktop\yunyin.log"
+```
+
+浏览器直接打开 `http://<Vita 的 IP>:1337/` 也能看。日志第一行是版本号，排障时先看它。
+
+## 在线播放（网易云）
+
+现已支持**匿名**的网易云播放链：只要歌曲 ID，不需要登录。两种写法，都放在卡里
+`ux0:/data/yunyin/`：
+
+```text
+# A. 只写歌曲 ID（推荐）：ux0:/data/yunyin/netease.ids
+#    一行一个，后面可以跟显示名
+3346495279
+186016 晴天
+
+# B. 自己写完整地址：ux0:/data/yunyin/netplay.url
+#    第一行 URL、第二行可选 Referer、第三行可选显示名；多首用空行隔开
+https://music.163.com/song/media/outer/url?id=3346495279.mp3
+https://music.163.com/
+[在线] 测试曲目
+```
+
+这些歌会作为**曲库里的独立条目**出现，归在自己的专辑 **「在线歌曲」** 下，不会占用
+任何本地歌曲的位置；选中它、按 **○** 才会走网络播放。
+
+已经能用的：
+
+- 边下边播（256 KiB 一窗，连续预取一窗，不用等整首下完）；
+- 一首放完自动下一首、L/R 切歌、暂停/继续；
+- 断网/请求失败会退避重试，恢复后接着放（连续 4 次失败才判定这条流坏了）。
+
+还没有做的（任务书 Phase 3–5）：
+
+- weapi/eapi 加密接口、账号登录、歌单、歌词 —— 现在只走"匿名 outer/url"这一条链；
+- 界面上的在线曲库/缓冲状态提示（现在这些信息在日志里）。
+
 ## 代码结构
 
 ```text
@@ -129,7 +174,8 @@ native/              C 侧
   audio/            yplayer.c（六个格式的解码循环）
                     ym4a.c + yaac.c（M4A 解复用 + SceAudiodec 硬件 AAC）
   host/             目录列举、图片解码、日志（单一实现，共用）
-  net/              网络传输层（Phase 0 探针：HTTPS / Range / Cookie / 取消 / 内存）
+  net/              网络传输层（HTTPS / Range / Cookie / 取消 / 内存池）：
+                    yhttp.c 探针 + 在线流的"窗口抓取" + 卡内日志服务（1337 端口）
   vendor/           第三方头文件（stb_image / dr_wav / dr_flac / opus）
   libs/             预编译静态库（mpg123 / vorbis / opus / ogg）
 native/rs/           Rust 宿主
@@ -137,7 +183,9 @@ native/rs/           Rust 宿主
   decoder.rs        yplayer.c 的 FFI
   bridge.rs         globalThis.vitaMedia 绑定（含 panic 防护）
   tags.rs           本地标签 / 封面（MP3·FLAC·OGG·OPUS·M4A）
-  source/ net/ provider/   ← 播放引擎模块化接缝（本地 + 流媒体同一入口）
+  source/           播放引擎接缝：local.rs（本地）/ http.rs（在线 Range 源：
+                    双窗口预取 + 自动重试 + Gate 提前量）/ cache.rs（字节缓存，暂未接入）
+  net/ provider/    HTTP 类型与接缝 / 网易云 Provider（匿名 outer/url 已通）
   platform/         电源、PS 键锁、文件、日志、设置
   ui/               流式 CJK、字体图集、跳帧
 scripts/             构建、字体烘焙、标签体检工具
@@ -164,13 +212,27 @@ wsl -d pocket-ubuntu -u root bash -lc 'cd /mnt/d/AI-PSVITA/yunyin && python3 scr
 wsl -d pocket-ubuntu -u root bash /mnt/d/AI-PSVITA/yunyin/scripts/build-variants.sh
 ```
 
-- 版本号（`param.sfo` 里的 `APP_VER`，VitaShell 里能看到）在 `scripts/build-vpk.py` 顶部，默认 `00.63`；
-  也可以用环境变量 `YUNYIN_APP_VER=00.63` 覆盖。
+- 版本号（`param.sfo` 里的 `APP_VER`，VitaShell 里能看到）在 `scripts/build-vpk.py` 顶部，默认 `00.88`；
+  也可以用环境变量覆盖：`YUNYIN_APP_VER=00.90`。**日志第一行也会写版本号**，方便确认机上跑的是哪一版。
 - PocketJS 装在别的地方：`POCKETJS_ROOT=/你的路径 python3 scripts/build-vpk.py`。
 - 流式字库 `fonts/chinese/cjk.pjfa` 由 `scripts/bake-cjk-archive.ts` 烘出来，构建时会直接用缓存；
   换了字体或改了 `fonts/chinese/cjk-stream.txt`，把这个文件删掉让它重烘。
 
 ## 最后
+
+### 重构进度（任务书的 6 个阶段）
+
+| 阶段 | 内容 | 状态 |
+| --- | --- | --- |
+| 0 | 网络冒烟测试（HTTPS / Range 206 / 证书校验 / 取消 / 内存池） | ✅ 完成（00.71 真机九项全过） |
+| 1 | 解码器 IO 抽象 `yp_io`（六个格式走同一组回调） | ✅ 完成（00.72 真机六格式全过） |
+| 2 | `HttpRangeSource` 在线播放（双窗口预取 / Gate / 重试） | ✅ **完成**（00.88 真机整曲播完） |
+| 3 | `NetEaseProvider`：`songId → 可播地址`（weapi/eapi 加密 + URL 缓存） | 🔄 匿名 `outer/url` 已通，加密接口待做 |
+| 4 | 账号 / 歌单 / 歌词 | 待开始 |
+| 5 | 在线 UI（在线曲库、缓冲状态、失败提示进界面） | 待开始 |
+
+排障全过程（6 个平台特有的坑：并发写日志、回调表生命周期、Gate 死锁……）
+记在 [docs/重构计划.md](docs/重构计划.md) 第八节，值得以后动网络/音频线程前先看一遍。
 
 - 特别感谢 [PocketJS](https://pocketjs.dev) 团队的努力付出！！
 - 播放后端对照 [ElevenMPVScrobbling](https://github.com/patchyfluffy/ElevenMPVScrobbling) 
