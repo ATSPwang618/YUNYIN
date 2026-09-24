@@ -573,6 +573,7 @@ static int yp_open_decoder(int fmt, const char *path_hint) {
 yp_player *yp_open_io(const yp_io *io, int owns_io, const char *path_hint,
                       int format_hint, long long duration_hint_ms) {
   int fmt;
+  int sniffed;
   if (!io || !io->read) return NULL;
   yp_clear();
   g.io = io;
@@ -581,16 +582,31 @@ yp_player *yp_open_io(const yp_io *io, int owns_io, const char *path_hint,
 
   /* 格式判定顺序（§38/§39/§70）：调用方给的提示 → 嗅字节 → 后缀兜底。 */
   fmt = (format_hint > 0 && format_hint <= 6) ? format_hint : 0;
-  if (fmt == 0) fmt = yp_sniff_head();
+  /* 嗅探会移动游标，所以只能在解码器打开**之前**做一次。 */
+  sniffed = (fmt == 0) ? yp_sniff_head() : 0;
+  if (fmt == 0) fmt = sniffed;
   if (fmt == 0) fmt = yp_format_from_path(path_hint);
   if (fmt == 0) {
     yunyin_log("yplayer: 认不出格式（既嗅不出魔数，也没有可用后缀）\n");
     yp_clear();
     return NULL;
   }
+  /* 打开之前把 IO 游标放回 0，让解码器从头开始读。 */
+  if (io->seek) io->seek(io->ctx, 0, SEEK_SET);
   if (yp_open_decoder(fmt, path_hint) != 0) {
     yp_clear();
     return NULL;
+  }
+  {
+    /* 真机验收用：证明这次打开确实走了 yp_io，并说明格式是谁定的
+     * （调用方提示 / 嗅字节 / 后缀兜底）。 */
+    char msg[128];
+    long long size = io->size ? io->size(io->ctx) : -1;
+    snprintf(msg, sizeof msg,
+             "yplayer: open via yp_io fmt=%d hint=%d sniff=%d size=%lld "
+             "rate=%d ch=%d\n",
+             fmt, format_hint, sniffed, size, g.rate, g.ch);
+    yunyin_log(msg);
   }
   return &g;
 }
