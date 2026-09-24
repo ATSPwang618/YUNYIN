@@ -132,6 +132,16 @@ struct Window {
     generation: u64,
     /// 消费端已登记一个取数需求，等取数线程去做。
     pending: bool,
+    /*
+     * 取数线程**正在**抓这一段。
+     *
+     * 为什么必须有它：以前"有没有人在抓"只能靠 pending 猜，而取数线程一开工就会把
+     * pending 置回 false。于是消费端在等待里被唤醒时，看到 pending=false 就以为
+     * "没人管这事"，于是**又登记一次**（代数 +1）—— 正在飞的那次抓取立刻被判过期，
+     * 抓到的字节被丢掉、窗口被清空，然后重来。真机日志里每一次"取数作废"后面
+     * 紧跟两次"登记取数"就是这么来的，最后拖到解码器放弃（详见 docs §8）。
+     */
+    inflight: bool,
     cancelled: bool,
 }
 
@@ -159,6 +169,7 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                 want_from: 0,
                 generation: 0,
                 pending: true, /* 打开就先抓第一窗 */
+                inflight: false,
                 cancelled: false,
             }),
             Condvar::new(),
@@ -198,6 +209,7 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                              * 还能照常命中缓存，不必为一个长度探测重下 128 KB。
                              */
                             w.pending = false;
+                            w.inflight = true; /* 告诉消费端"有人正在抓，别再重复登记" */
                         }
                         bump(2);
                         let got = st.read_at(from, &mut tmp);
@@ -207,13 +219,19 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                             if w.cancelled {
                                 break;
                             }
+                            w.inflight = false;
                             if w.generation != gen {
-                                // 期间发生了 seek：这一抓作废。
+                                /*
+                                 * 期间发生了真正的换位置（seek）：这一抓作废。
+                                 *
+                                 * 注意**不能**把 pending 清掉：能改代数的只有"登记"，
+                                 * 而登记一定会把 pending 置 true。这里清掉等于把
+                                 * 别人刚登记的那个请求吃掉，消费端会一直等到超时。
+                                 */
                                 bump(3);
                                 trace(&format!(
                                     "取数作废 from={from} got={got:?}（抓取期间登记了新请求）"
                                 ));
-                                w.pending = false;
                                 cv.notify_all();
                                 continue;
                             }
@@ -283,26 +301,33 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                 return covered;
             }
             /* 窗口没盖住要的位置：登记需求叫醒取数线程（读尽当前窗口时走这里）。 */
-            if !w.pending {
-                w.want_from = pos;
-                w.generation = w.generation.wrapping_add(1);
-                w.buf.clear();
-                w.start = pos;
-                w.end_at = None; /* 换了位置：关于"哪儿到底了"的旧结论作废 */
-                w.pending = true;
-                trace(&format!("登记取数 pos={pos} generation={}", w.generation));
-                cv.notify_all();
-            }
+            /*
+             * 登记的三个条件，缺一不可：
+             *   !pending  —— 还没有人为这个位置登记过；
+             *   !inflight —— 取数线程**不在**抓东西（这是关键：它一开工就会把
+             *                pending 置 false，只看 pending 会误判成"没人管"，
+             *                于是重复登记、把正在飞的抓取作废掉）；
+             *   还没超时   —— 超时之后再登记，等于留下一个没人等的请求，还会让
+             *                下一轮重复登记。所以超时判断必须放在登记**之前**。
+             */
             let now = std::time::Instant::now();
             if now >= deadline {
                 bump(4);
                 trace(&format!(
-                    "等 pos={pos} 超时（窗口=[{},{}) pending={}）",
+                    "等 pos={pos} 超时（窗口=[{},{}) pending={} inflight={}）",
                     w.start,
                     w.start + w.buf.len() as u64,
-                    w.pending
+                    w.pending,
+                    w.inflight
                 ));
                 return false;
+            }
+            if !w.pending && !w.inflight {
+                w.want_from = pos;
+                w.generation = w.generation.wrapping_add(1);
+                w.pending = true;
+                trace(&format!("登记取数 pos={pos} generation={}", w.generation));
+                cv.notify_all();
             }
             match cv.wait_timeout(w, deadline - now) {
                 Ok((g, _)) => w = g,
