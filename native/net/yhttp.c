@@ -38,6 +38,10 @@
 
 static yhttp_log_fn g_log;
 static int g_inited;
+/* 0 = 没人初始化，1 = 正在初始化，2 = 已完成。
+ * 探针线程和在线播放线程会同时进来（真机上抓到过两个线程并发 init，
+ * 第二个 sceNetInit 返回 0x80410110 EBUSY），所以这里必须串行化。 */
+static volatile int g_init_lock;
 static int g_ssl_inited;
 static int g_http_inited;
 static int g_ca_loaded;
@@ -69,7 +73,16 @@ int yhttp_init(void) {
     SceNetInitParam param;
     int ret;
 
-    if (g_inited) return 0;
+    for (;;) {
+        int v = g_init_lock;
+        if (v == 2) return 0;                       /* 已经好了 */
+        if (v == 0 && __sync_bool_compare_and_swap(&g_init_lock, 0, 1)) break;
+        sceKernelDelayThread(1000);                 /* 别人正在初始化，等它 */
+    }
+    if (g_inited) {
+        g_init_lock = 2;
+        return 0;
+    }
 
     ret = sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
     yh_logf("yhttp: sysmodule NET -> 0x%08X\n", (unsigned)ret);
@@ -86,7 +99,11 @@ int yhttp_init(void) {
     param.flags = 0;
     ret = sceNetInit(&param);
     yh_logf("yhttp: sceNetInit(%d) -> 0x%08X\n", YHTTP_NET_POOL, (unsigned)ret);
-    if (ret < 0) return ret;
+    /* EBUSY（0x80410110）= 网络栈已被初始化过：当成成功。 */
+    if (ret < 0 && (unsigned)ret != 0x80410110u) {
+        g_init_lock = 0; /* 让后来者能重试 */
+        return ret;
+    }
 
     ret = sceNetCtlInit();
     yh_logf("yhttp: sceNetCtlInit -> 0x%08X\n", (unsigned)ret);
@@ -101,10 +118,18 @@ int yhttp_init(void) {
     yh_logf("yhttp: sysmodule HTTPS -> 0x%08X\n", (unsigned)ret);
     ret = sceHttpInit(YHTTP_HTTP_POOL);
     yh_logf("yhttp: sceHttpInit(%d) -> 0x%08X\n", YHTTP_HTTP_POOL, (unsigned)ret);
-    if (ret < 0) return ret;
+    if (ret < 0) {
+        /* 0x80435020 = SSL ALREADY_INITED；HTTP 侧同类错误也一并容忍。 */
+        unsigned u = (unsigned)ret;
+        if (u != 0x80435020u && u != 0x80431012u) {
+            g_init_lock = 0;
+            return ret;
+        }
+    }
     g_http_inited = 1;
 
     g_inited = 1;
+    g_init_lock = 2;
     return 0;
 }
 

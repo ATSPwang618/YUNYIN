@@ -249,8 +249,8 @@ pub fn play_url(url: &str, referer: &str, duration_ms: i64) {
         return;
     }
     vita_audio_end();
-    if crate::media::source::remote::open_remote(url, referer, duration_ms).is_err() {
-        log::append(&format!("bgm: 在线打开失败 {url}"));
+    if let Err(e) = crate::media::source::remote::open_remote(url, referer, duration_ms) {
+        log::append(&format!("bgm: 在线打开失败 {:?} {url}", e));
         PLAYING.store(false, Ordering::Release);
         return;
     }

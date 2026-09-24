@@ -19,7 +19,7 @@
 
 |  |  |
 | --- | --- |
-| 当前版本 | **0.73** —— [下载 / 历史版本](https://github.com/ATSPwang618/YUNYIN/releases) |
+| 当前版本 | **0.74** —— [下载 / 历史版本](https://github.com/ATSPwang618/YUNYIN/releases) |
 | 曲库目录 | `ux0:/data/yunyin/music`（可以分子文件夹，最多 240 首） |
 | 音频格式 | MP3（最推荐） / M4A（AAC） / OGG / WAV / FLAC / OPUS |
 | 界面 | 首页播放器 · 全部曲目 · 专辑 · 收藏 · 设置 |

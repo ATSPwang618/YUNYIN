@@ -69,5 +69,6 @@ pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_s
     net::probe::start_once();
     /* Phase 2：卡里放 ux0:/data/yunyin/netplay.url 时，启动就试播这个在线 URL
      *（第一行 URL，第二行可选 Referer）。没有这个文件就什么都不做。 */
+    net::install_log(); /* 先接上 C 侧网络日志，在线播放也能看见 */
     source::remote::maybe_autoplay();
 }

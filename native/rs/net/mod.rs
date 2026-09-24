@@ -7,8 +7,32 @@
 //! HTTPS + Range + 206 + Cookie + 取消都能用，`yhttp.c`（§21）就是这一层的实现。
 #![allow(dead_code)]
 
+use crate::media::platform::log;
+
 pub mod http;
 pub mod probe;
+
+extern "C" {
+    fn yhttp_set_log(fn_: Option<unsafe extern "C" fn(*const u8, u32)>);
+}
+
+/// 把 C 侧网络层的日志接到主日志上。
+///
+/// 以前这活儿是探针线程干的（`probe.rs`），于是"不开探针"时在线播放的
+/// C 日志就没人接了；现在启动就装一次，谁都能看见。
+#[no_mangle]
+unsafe extern "C" fn yunyin_net_log_main(text: *const u8, len: u32) {
+    if text.is_null() || len == 0 {
+        return;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(text, len as usize) };
+    let line = alloc::string::String::from_utf8_lossy(bytes);
+    log::append(&alloc::format!("[net] {}", line.trim_end()));
+}
+
+pub fn install_log() {
+    unsafe { yhttp_set_log(Some(yunyin_net_log_main)) };
+}
 
 /// 网络层做到哪一步了。给界面用 —— About 页可以老老实实写"网络：未实现"，
 /// 而不是假装能用。

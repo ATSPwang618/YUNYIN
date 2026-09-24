@@ -11,7 +11,7 @@
 //! `close_remote()` 先关掉 C 侧播放器、再释放源，避免悬垂指针。
 #![allow(dead_code)]
 
-use super::http::HttpRangeSource;
+use super::http::{ByteTransport, HttpRangeSource};
 use super::{AudioSource, SourceError};
 use crate::media::platform::log;
 use crate::media::net::http::Stream;
@@ -103,7 +103,17 @@ unsafe extern "C" fn io_close(_ctx: *mut c_void) -> i32 {
 
 /// 打开一个在线 URL 交给解码器。`duration_ms` 是可选的时长提示（§37）。
 pub fn open_remote(url: &str, referer: &str, duration_ms: i64) -> Result<(), SourceError> {
-    let transport = Stream::open(url, referer, 0)?; /* TLS 默认模式 */
+    /* 每一步都单独记日志：真机上"在线打开失败"必须能分辨是取数没打开、
+     * 还是解码器不认识这份流。 */
+    let transport = match Stream::open(url, referer, 0) {
+        Ok(t) => t,
+        Err(e) => {
+            log::append(&format!("remote: 取数线程打不开流 {:?}", e));
+            return Err(e);
+        }
+    };
+    let size = transport.size();
+    log::append(&format!("remote: 流已打开 size={:?}", size));
     let source = HttpRangeSource::new(url, transport, Default::default());
     let mut slot = match REMOTE.lock() {
         Ok(g) => g,
@@ -137,8 +147,10 @@ pub fn open_remote(url: &str, referer: &str, duration_ms: i64) -> Result<(), Sou
     };
     if player.is_null() {
         drop(slot.take());
+        log::append("remote: 解码器打不开这份流（格式认不出或解码器失败）");
         return Err(SourceError::Unsupported);
     }
+    log::append("remote: 解码器已接上在线源");
     crate::media::decoder::adopt_remote(player, ctx);
     Ok(())
 }
