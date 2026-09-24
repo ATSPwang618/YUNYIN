@@ -217,6 +217,8 @@ pub fn close_remote() {
     if let Ok(mut slot) = REMOTE.lock() {
         drop(slot.take());
     }
+    /* 排障用：一行计数，回答"到底是谁在反复跑"（只在 debug 日志开着时写）。 */
+    super::http::trace_summary();
 }
 
 pub fn active() -> bool {

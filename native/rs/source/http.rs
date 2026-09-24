@@ -24,10 +24,58 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+/*
+ * 排障用的逐步轨迹（只在卡里有 `ux0:/data/yunyin/debug` 时写日志）。
+ *
+ * 为什么值得在正式代码里留这一小段：在线播放的失败几乎全在"取数线程 ↔ 解码线程"
+ * 的时序里，只看两端的现象永远猜不出来 —— 上一次真机排障就是靠这类轨迹才把
+ * "末尾"这个词的语义搞对的。上限 400 行，正常播放不会刷屏。
+ */
+static TRACE_LINES: AtomicU32 = AtomicU32::new(0);
+static COUNTERS: [AtomicU32; 6] = [
+    AtomicU32::new(0), /* 0 read 调用 */
+    AtomicU32::new(0), /* 1 seek 调用 */
+    AtomicU32::new(0), /* 2 取数次数 */
+    AtomicU32::new(0), /* 3 取数结果被作废次数 */
+    AtomicU32::new(0), /* 4 等超时次数 */
+    AtomicU32::new(0), /* 5 WouldBlock 次数 */
+];
+
+pub(crate) fn trace(msg: &str) {
+    if !crate::media::platform::log::enabled() {
+        return;
+    }
+    let n = TRACE_LINES.fetch_add(1, Ordering::Relaxed);
+    if n < 400 {
+        crate::media::platform::log::append(&format!("netdbg#{n} {msg}"));
+    }
+}
+
+fn bump(which: usize) {
+    COUNTERS[which].fetch_add(1, Ordering::Relaxed);
+}
+
+/// 收尾时把计数汇总一行，方便一眼看出"到底谁在反复跑"。
+pub(crate) fn trace_summary() {
+    if !crate::media::platform::log::enabled() {
+        return;
+    }
+    crate::media::platform::log::append(&format!(
+        "netdbg 统计: read={} seek={} fetch={} discard={} wait_timeout={} wouldblock={}（轨迹 {} 行）",
+        COUNTERS[0].load(Ordering::Relaxed),
+        COUNTERS[1].load(Ordering::Relaxed),
+        COUNTERS[2].load(Ordering::Relaxed),
+        COUNTERS[3].load(Ordering::Relaxed),
+        COUNTERS[4].load(Ordering::Relaxed),
+        COUNTERS[5].load(Ordering::Relaxed),
+        TRACE_LINES.load(Ordering::Relaxed),
+    ));
+}
 
 /// 一次 Range 抓多少（任务书 §13 的 refill 量级；也是"每窗口一次请求"的粒度）。
 pub const WINDOW_BYTES: usize = 256 * 1024;
@@ -52,7 +100,17 @@ pub trait ByteTransport: Send {
     fn size(&self) -> Option<u64>;
 }
 
-/// 取数线程与消费端共享的窗口。
+/*
+ * 取数线程与消费端共享的窗口。
+ *
+ * 一条重要规矩：**窗口里的数据不会因为"有人问了别的位置"而失效**。
+ *
+ * 以前每次登记新请求 / 取数线程开工，都会先把 `buf` 清空。于是：
+ *   解码器问一句"文件多长"（跳到末尾）→ 窗口被清掉 → 它再回尾部读
+ *   → 又得重新发一次 HTTP，把同一段 128 字节下载回来。
+ * 真机上就是靠这个把同一段尾部反复下载了十几次，一直拖到解码器放弃。
+ * 现在只有**真的抓到新数据**才会整体替换窗口。
+ */
 struct Window {
     buf: Vec<u8>,
     start: u64,
@@ -134,11 +192,14 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                             }
                             from = w.want_from;
                             gen = w.generation;
-                            w.pending = false; /* 这一抓由我负责 */
-                            w.buf.clear();
-                            w.start = from;
-                            w.end_at = None; /* 这一窗的结果等下重新判定 */
+                            /*
+                             * 只登记"这一抓由我负责"，**不碰已缓存的数据**：
+                             * 抓不到（越界/失败）时旧窗口依然是对的，解码器
+                             * 还能照常命中缓存，不必为一个长度探测重下 128 KB。
+                             */
+                            w.pending = false;
                         }
+                        bump(2);
                         let got = st.read_at(from, &mut tmp);
                         {
                             let (lock, cv) = &*shared;
@@ -148,16 +209,22 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                             }
                             if w.generation != gen {
                                 // 期间发生了 seek：这一抓作废。
+                                bump(3);
+                                trace(&format!(
+                                    "取数作废 from={from} got={got:?}（抓取期间登记了新请求）"
+                                ));
                                 w.pending = false;
                                 cv.notify_all();
                                 continue;
                             }
+                            trace(&format!("取数 from={from} got={got:?} 已发布"));
                             match got {
                                 Ok(0) => w.end_at = Some(from),
                                 Ok(n) => {
+                                    /* 抓到数据：整体替换窗口（只有这里会动 buf）。 */
+                                    w.buf.clear();
                                     w.buf.extend_from_slice(&tmp[..n]);
                                     w.start = from;
-                                    w.end_at = None; /* 这里拿到数据，说明末尾不在这儿之前 */
                                 }
                                 Err(e) => w.err = Some(e),
                             }
@@ -191,10 +258,6 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
         if let Ok(mut w) = lock.lock() {
             w.want_from = from;
             w.generation = w.generation.wrapping_add(1);
-            w.buf.clear();
-            w.start = from;
-            /* 换了位置：关于"哪儿到底了"的旧结论作废。 */
-            w.end_at = None;
             w.pending = true;
             cv.notify_all();
         }
@@ -211,6 +274,12 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
             /* 「到底」是一个位置：只有你要的位置已经过了那个点，才算是结束。 */
             let ended = w.end_at.map_or(false, |end| pos >= end);
             if covered || ended || w.err.is_some() || w.cancelled {
+                trace(&format!(
+                    "等 pos={pos} -> covered={covered} ended={ended} err={:?} 窗口=[{},{})",
+                    w.err,
+                    w.start,
+                    w.start + w.buf.len() as u64
+                ));
                 return covered;
             }
             /* 窗口没盖住要的位置：登记需求叫醒取数线程（读尽当前窗口时走这里）。 */
@@ -221,10 +290,18 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                 w.start = pos;
                 w.end_at = None; /* 换了位置：关于"哪儿到底了"的旧结论作废 */
                 w.pending = true;
+                trace(&format!("登记取数 pos={pos} generation={}", w.generation));
                 cv.notify_all();
             }
             let now = std::time::Instant::now();
             if now >= deadline {
+                bump(4);
+                trace(&format!(
+                    "等 pos={pos} 超时（窗口=[{},{}) pending={}）",
+                    w.start,
+                    w.start + w.buf.len() as u64,
+                    w.pending
+                ));
                 return false;
             }
             match cv.wait_timeout(w, deadline - now) {
@@ -242,13 +319,17 @@ impl<T: ByteTransport + 'static> AudioSource for HttpRangeSource<T> {
         if dst.is_empty() {
             return Ok(0);
         }
+        bump(0);
+        trace(&format!("read 入口 pos={} want={}", self.pos, want));
         /* 尽量填满：解码器（尤其是 m4a 的精确读）不接受"短读"，所以这里
          * 循环取数据，只有真正到流末尾才返回短读。 */
         while done < want {
             if let Some(e) = self.error() {
+                trace(&format!("read 出错返回 {:?}", e));
                 return Err(e);
             }
             if self.is_eof() {
+                trace(&format!("read 到末尾：pos={} -> 返回 {} 字节", self.pos, done));
                 break; /* 真正结束 */
             }
             let mut ready = false;
@@ -271,6 +352,8 @@ impl<T: ByteTransport + 'static> AudioSource for HttpRangeSource<T> {
                 if done > 0 {
                     break; /* 等超时：把已有的先给出去，上层 Gate 会决定是否静音 */
                 }
+                bump(5);
+                trace("read 等不到数据 -> WouldBlock");
                 return Err(SourceError::WouldBlock);
             }
             {
@@ -286,18 +369,26 @@ impl<T: ByteTransport + 'static> AudioSource for HttpRangeSource<T> {
                 done += n;
             }
         }
+        trace(&format!("read 出口 pos={} 返回 {} 字节", self.pos, done));
         Ok(done)
     }
 
     fn seek(&mut self, pos: u64) -> Result<(), SourceError> {
         self.pos = pos;
+        bump(1);
         /* 窗口里已经有目标位置就白拿；否则让取数线程挪过去。 */
         let covered = {
             let (lock, _cv) = &*self.shared;
             let Ok(w) = lock.lock() else {
                 return Err(SourceError::Io(String::from("window lock")));
             };
-            pos >= w.start && pos < w.start + w.buf.len() as u64
+            let c = pos >= w.start && pos < w.start + w.buf.len() as u64;
+            trace(&format!(
+                "seek pos={pos} 命中窗口={c} 窗口=[{},{})",
+                w.start,
+                w.start + w.buf.len() as u64
+            ));
+            c
         };
         if !covered {
             self.request_from(pos);

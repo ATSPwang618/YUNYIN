@@ -62,7 +62,7 @@ pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_s
      * 版本号写进日志：真机排障时第一件事就是确认"跑的是哪一版"。
      * 以前只能靠行为猜，白花了整整一轮往返。
      */
-    log::append("yunyin: start (in-process BGM) 版本 00.78");
+    log::append("yunyin: start (in-process BGM) 版本 00.79");
     ps_lock::init();
     bgm::acquire_on_start();
     power::start();
