@@ -67,13 +67,26 @@ unsafe extern "C" fn io_read(ctx: *mut c_void, dst: *mut c_void, n: u64) -> i64 
     }
 }
 
-unsafe extern "C" fn io_seek(ctx: *mut c_void, off: i64, _whence: i32) -> i64 {
+unsafe extern "C" fn io_seek(ctx: *mut c_void, off: i64, whence: i32) -> i64 {
     if ctx.is_null() {
         return -1;
     }
     let src = &mut *(ctx as *mut RemoteSource);
-    match src.seek(off.max(0) as u64) {
-        Ok(()) => off.max(0),
+    /*
+     * whence 必须真的按语义换算成绝对偏移：
+     * mpg123 会先 lseek(..., SEEK_END, 0) 问"文件多长"，如果这里把 off=0
+     * 当成"跳到 0"，它就以为流长度是 0，直接打不开（真机上就是这么挂的）。
+     */
+    let base = if whence == 2 {
+        src.size().unwrap_or(0) as i64 /* SEEK_END：从流末尾算 */
+    } else if whence == 1 {
+        src.tell() as i64 /* SEEK_CUR：从当前位置算 */
+    } else {
+        0 /* SEEK_SET：绝对值 */
+    };
+    let target = (base + off).max(0) as u64;
+    match src.seek(target) {
+        Ok(()) => target as i64,
         Err(_) => -1,
     }
 }
@@ -152,6 +165,14 @@ pub fn open_remote(url: &str, referer: &str, duration_ms: i64) -> Result<(), Sou
     }
     log::append("remote: 解码器已接上在线源");
     crate::media::decoder::adopt_remote(player, ctx);
+    /*
+     * 应用平时是"进来自动暂停、按 ○ 才开声"，测试开关也照这个规矩来：
+     * 这里先摆好并暂停。之后按 ○（界面上的播放）会走 vm.resume(path)，
+     * 而 resume 只在"已经就绪且暂停"时解除暂停、**不换曲目**，
+     * 于是按一下就是这首在线歌；按 L / R 换本地曲目则正常切走。
+     */
+    crate::media::bgm::pause();
+    log::append("remote: 已就绪并暂停 —— 按 ○ 开始播放这首在线歌曲");
     Ok(())
 }
 

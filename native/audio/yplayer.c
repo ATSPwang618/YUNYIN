@@ -594,6 +594,12 @@ yp_player *yp_open_io(const yp_io *io, int owns_io, const char *path_hint,
   /* 打开之前把 IO 游标放回 0，让解码器从头开始读。 */
   if (io->seek) io->seek(io->ctx, 0, SEEK_SET);
   if (yp_open_decoder(fmt, path_hint) != 0) {
+    {
+      char msg[96];
+      snprintf(msg, sizeof msg,
+               "yplayer: 解码器打开失败 fmt=%d（嗅探=%d）\n", fmt, sniffed);
+      yunyin_log(msg);
+    }
     yp_clear();
     return NULL;
   }
