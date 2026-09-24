@@ -85,8 +85,11 @@ unsafe extern "C" fn io_read(ctx: *mut c_void, dst: *mut c_void, n: u64) -> i64 
             /*
              * 别把"网络暂时没数据"和"这条流真的坏了"混在一起说。
              * 这里只负责如实记录；重试与判死都在 HttpRangeSource 里。
+             *
+             * 注意用 trace_f：播放阶段（音频线程）**不拼字符串、不写文件** ——
+             * 解码回调里做这些真的崩过一次；那时候只记数，收尾时统计一行。
              */
-            log::append(&format!("remote: 解码器读在线字节失败 {:?}", e));
+            super::http::trace_f(|| format!("remote: 解码器读在线字节失败 {:?}", e));
             -1
         }
     }
@@ -208,6 +211,12 @@ pub fn open_remote(
     }
     log::append("remote: 解码器已接上在线源");
     crate::media::decoder::adopt_remote(player, ctx);
+    /*
+     * 从这里开始进入播放阶段：解码器的每一次读都发生在音频线程的回调里，
+     * 那些地方**绝不能写日志**（真机上崩过一次，栈顶就是 Rust 的字符串格式化）。
+     * 逐条轨迹到此为止，只留原子计数。
+     */
+    super::http::trace_off();
     Ok(())
 }
 

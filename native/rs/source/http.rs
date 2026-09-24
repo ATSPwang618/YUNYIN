@@ -37,6 +37,16 @@ use std::time::Duration;
  * "末尾"这个词的语义搞对的。上限 400 行，正常播放不会刷屏。
  */
 static TRACE_LINES: AtomicU32 = AtomicU32::new(0);
+/*
+ * 逐条轨迹的开关。
+ *
+ * **解码器一旦接上就必须关掉**：轨迹要给每条读/等/取数拼一行字符串，而播放阶段
+ * 这些读发生在音频线程的 mpg123 回调里 —— 真机上就是这么崩的（dump 的栈顶是
+ * `<core::fmt::Formatter>::pad`，紧跟着 `mp3_io_read`）。
+ * 排障只需要**打开阶段**的轨迹，之后留计数就够了：计数只是原子加，不拼字符串。
+ */
+static TRACE_ON: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
 static COUNTERS: [AtomicU32; 6] = [
     AtomicU32::new(0), /* 0 read 调用 */
     AtomicU32::new(0), /* 1 seek 调用 */
@@ -47,13 +57,30 @@ static COUNTERS: [AtomicU32; 6] = [
 ];
 
 pub(crate) fn trace(msg: &str) {
-    if !crate::media::platform::log::enabled() {
+    if !TRACE_ON.load(Ordering::Relaxed) || !crate::media::platform::log::enabled() {
         return;
     }
     let n = TRACE_LINES.fetch_add(1, Ordering::Relaxed);
     if n < 400 {
         crate::media::platform::log::append(&format!("netdbg#{n} {msg}"));
     }
+}
+
+/*
+ * 带闭包的轨迹：**只有真的要写日志时才拼字符串**。
+ * 直接写 `trace(&format!(...))` 会在每次都拼一遍（哪怕日志关着），
+ * 这在解码回调里既费时又危险（真机崩过一次，见上面的说明）。
+ */
+pub(crate) fn trace_f<F: FnOnce() -> alloc::string::String>(f: F) {
+    if !TRACE_ON.load(Ordering::Relaxed) || !crate::media::platform::log::enabled() {
+        return;
+    }
+    trace(&f());
+}
+
+/// 关掉逐条轨迹（解码器接上以后调用）。计数仍然保留。
+pub(crate) fn trace_off() {
+    TRACE_ON.store(false, Ordering::Relaxed);
 }
 
 fn bump(which: usize) {
@@ -229,13 +256,13 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                                  * 别人刚登记的那个请求吃掉，消费端会一直等到超时。
                                  */
                                 bump(3);
-                                trace(&format!(
+                                trace_f(|| format!(
                                     "取数作废 from={from} got={got:?}（抓取期间登记了新请求）"
                                 ));
                                 cv.notify_all();
                                 continue;
                             }
-                            trace(&format!("取数 from={from} got={got:?} 已发布"));
+                            trace_f(|| format!("取数 from={from} got={got:?} 已发布"));
                             match got {
                                 Ok(0) => w.end_at = Some(from),
                                 Ok(n) => {
@@ -292,7 +319,7 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
             /* 「到底」是一个位置：只有你要的位置已经过了那个点，才算是结束。 */
             let ended = w.end_at.map_or(false, |end| pos >= end);
             if covered || ended || w.err.is_some() || w.cancelled {
-                trace(&format!(
+                trace_f(|| format!(
                     "等 pos={pos} -> covered={covered} ended={ended} err={:?} 窗口=[{},{})",
                     w.err,
                     w.start,
@@ -313,7 +340,7 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
             let now = std::time::Instant::now();
             if now >= deadline {
                 bump(4);
-                trace(&format!(
+                trace_f(|| format!(
                     "等 pos={pos} 超时（窗口=[{},{}) pending={} inflight={}）",
                     w.start,
                     w.start + w.buf.len() as u64,
@@ -326,7 +353,7 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                 w.want_from = pos;
                 w.generation = w.generation.wrapping_add(1);
                 w.pending = true;
-                trace(&format!("登记取数 pos={pos} generation={}", w.generation));
+                trace_f(|| format!("登记取数 pos={pos} generation={}", w.generation));
                 cv.notify_all();
             }
             match cv.wait_timeout(w, deadline - now) {
@@ -345,16 +372,16 @@ impl<T: ByteTransport + 'static> AudioSource for HttpRangeSource<T> {
             return Ok(0);
         }
         bump(0);
-        trace(&format!("read 入口 pos={} want={}", self.pos, want));
+        trace_f(|| format!("read 入口 pos={} want={}", self.pos, want));
         /* 尽量填满：解码器（尤其是 m4a 的精确读）不接受"短读"，所以这里
          * 循环取数据，只有真正到流末尾才返回短读。 */
         while done < want {
             if let Some(e) = self.error() {
-                trace(&format!("read 出错返回 {:?}", e));
+                trace_f(|| format!("read 出错返回 {:?}", e));
                 return Err(e);
             }
             if self.is_eof() {
-                trace(&format!("read 到末尾：pos={} -> 返回 {} 字节", self.pos, done));
+                trace_f(|| format!("read 到末尾：pos={} -> 返回 {} 字节", self.pos, done));
                 break; /* 真正结束 */
             }
             let mut ready = false;
@@ -394,7 +421,7 @@ impl<T: ByteTransport + 'static> AudioSource for HttpRangeSource<T> {
                 done += n;
             }
         }
-        trace(&format!("read 出口 pos={} 返回 {} 字节", self.pos, done));
+        trace_f(|| format!("read 出口 pos={} 返回 {} 字节", self.pos, done));
         Ok(done)
     }
 
@@ -408,7 +435,7 @@ impl<T: ByteTransport + 'static> AudioSource for HttpRangeSource<T> {
                 return Err(SourceError::Io(String::from("window lock")));
             };
             let c = pos >= w.start && pos < w.start + w.buf.len() as u64;
-            trace(&format!(
+            trace_f(|| format!(
                 "seek pos={pos} 命中窗口={c} 窗口=[{},{})",
                 w.start,
                 w.start + w.buf.len() as u64

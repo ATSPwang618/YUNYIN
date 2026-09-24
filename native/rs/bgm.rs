@@ -200,7 +200,12 @@ fn vita_audio_init(freq: i32) -> bool {
     AUDIO_READY.store(true, Ordering::Release);
     let handle = std::thread::Builder::new()
         .name("yunyin-bgm".into())
-        .stack_size(64 * 1024)
+        /*
+         * 音频线程要走"mpg123 → 我们的 io 回调 → Rust 取数层"这条链，
+         * 比一般的线程深；真机上出过一次栈顶落在 Rust 字符串格式化的崩溃，
+         * 顺手把栈加厚一倍，别让解码路径贴着栈顶跑。
+         */
+        .stack_size(128 * 1024)
         .spawn(audio_channel_thread);
     match handle {
         Ok(h) => {
@@ -286,7 +291,7 @@ pub fn play_url(url: &str, referer: &str, duration_ms: i64) {
     let referer_owned = String::from(referer);
     let spawned = std::thread::Builder::new()
         .name("yunyin-net-open".into())
-        .stack_size(64 * 1024)
+        .stack_size(96 * 1024) /* 打开阶段会走 yp_open_io → 解码器 → 取数层，同样要留余量 */
         .spawn(move || open_online(url_owned, referer_owned, duration_ms, token));
     if spawned.is_err() {
         log::append("bgm: 在线打开线程创建失败");
