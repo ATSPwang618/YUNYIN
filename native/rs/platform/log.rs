@@ -33,6 +33,28 @@ pub fn init() {
     }
 }
 
+/// 日志服务端口（电脑上 `curl http://<vita-ip>:1337/ -o yunyin.log`）。
+const LOG_SERVE_PORT: u16 = 1337;
+
+extern "C" {
+    fn yhttp_logserve_start(path: *const i8, port: u16) -> i32;
+}
+
+/// 开着日志时，在后台开一个"把日志文件回给电脑"的小服务。
+///
+/// 为什么值得有：真机排障最耗人的一步是"把 ux0:data/yunyin.log 手动拷到电脑"。
+/// 有了它，电脑上一条 `curl http://<vita-ip>:1337/ -o yunyin.log` 就够了
+/// （浏览器直接打开那个地址也能看）。
+pub fn start_log_server() {
+    if !enabled() {
+        return;
+    }
+    let Ok(path) = std::ffi::CString::new(LOG_PATH) else {
+        return;
+    };
+    unsafe { yhttp_logserve_start(path.as_ptr(), LOG_SERVE_PORT) };
+}
+
 pub fn enabled() -> bool {
     LOG_ON.load(Ordering::Relaxed)
 }

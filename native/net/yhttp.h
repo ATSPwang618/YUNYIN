@@ -139,6 +139,18 @@ void yhttp_stream_close(yhttp_stream *s);
 /* 最近一次失败的错误码（0 = 没有）。 */
 int yhttp_stream_error(const yhttp_stream *s);
 
+/* ------------------------------------------------------------ 日志服务 -- */
+/*
+ * 在后台线程开一个极小的 HTTP 服务，把 `path` 这个文件原样回给任何来访者。
+ * 真机排障时电脑上一条命令就能取日志，不用再手动拷：
+ *
+ *     curl http://<Vita 的 IP>:1337/ -o yunyin.log
+ *
+ * 只在日志开关打开时启动；失败只写一行日志，绝不影响播放。
+ * 成功返回 0，失败返回负值。
+ */
+int yhttp_logserve_start(const char *path, unsigned short port);
+
 #ifdef __cplusplus
 }
 #endif

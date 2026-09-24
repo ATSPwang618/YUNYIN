@@ -54,6 +54,25 @@ extern "C" {
 static REMOTE: Mutex<Option<alloc::boxed::Box<RemoteSource>>> = Mutex::new(None);
 
 /*
+ * `yp_io` 回调表必须**一直活着**，直到解码器被关掉。
+ *
+ * 解码器会把传进去的 `const yp_io *` 原样存进自己的状态（C 侧本地播放用的是
+ * `static yp_io file_io;`，就是这个道理）。以前这里直接在 open_remote() 里建了个
+ * 局部 `YpIo` 传指针 —— 函数一返回栈帧就没了，解码器手里就是野指针。打开阶段它
+ * 不需要读数据所以看不出问题，等播放中解码器再要数据时，读回调里的 io->ctx 已经是
+ * 垃圾，于是访问野地址崩溃（真机 dump：PC 落在 mp3_io_read，DFAR 是个堆地址）。
+ * 所以这里用静态槽保活，close_remote() 关掉解码器之后再释放。
+ */
+/*
+ * YpIo 里装的是函数指针与 ctx 裸指针（回调表本身就该是裸的），所以包一层显式声明
+ * "这份东西由我们自己保证跨线程使用是安全的"——它只在拿锁的代码里被读写。
+ */
+struct IoKeepAlive(alloc::boxed::Box<YpIo>);
+unsafe impl Send for IoKeepAlive {}
+
+static IO_SLOT: Mutex<Option<IoKeepAlive>> = Mutex::new(None);
+
+/*
  * 打开序号。在线打开要花几秒（DNS + TLS + 第一个窗口），必须放到后台线程去做，
  * 界面线程不能等它。既然是后台的，用户完全可能还没打开完就点了别的歌 ——
  * 每来一个新的播放请求就换一个序号，旧任务在每一步前后比对序号，发现过期就收手。
@@ -180,18 +199,38 @@ pub fn open_remote(
         Some(b) => (&mut **b) as *mut RemoteSource as *mut c_void,
         None => return Err(SourceError::Unsupported),
     };
-    let io = YpIo {
+    let io = alloc::boxed::Box::new(YpIo {
         ctx,
         read: Some(io_read),
         seek: Some(io_seek),
         tell: Some(io_tell),
         size: Some(io_size),
         close: Some(io_close),
+    });
+    /*
+     * 先把上一份回调表丢掉（它的解码器已经在 session_end() 里关过了），
+     * 再把这一份放进静态槽 —— 解码器只拿指针，所以这份表必须活到 yp_close()。
+     */
+    if let Ok(mut slot) = IO_SLOT.lock() {
+        *slot = Some(IoKeepAlive(io));
+    }
+    let io_ptr: *const YpIo = match IO_SLOT.lock() {
+        Ok(g) => match g.as_ref() {
+            Some(b) => &*b.0 as *const YpIo,
+            None => core::ptr::null(),
+        },
+        Err(_) => core::ptr::null(),
     };
+    if io_ptr.is_null() {
+        drop(slot.take());
+        clear_io_slot();
+        log::append("remote: 回调表保活失败，放弃这次打开");
+        return Err(SourceError::Unsupported);
+    }
     let hint = CString::new(url).unwrap_or_default();
     let player = unsafe {
         yp_open_io(
-            &io as *const YpIo,
+            io_ptr,
             0, /* 源的生命周期由 REMOTE 管 */
             hint.as_ptr(),
             0, /* 格式自动：先嗅字节，再按后缀 */
@@ -200,12 +239,14 @@ pub fn open_remote(
     };
     if player.is_null() {
         drop(slot.take());
+        clear_io_slot();
         log::append("remote: 解码器打不开这份流（格式认不出或解码器失败）");
         return Err(SourceError::Unsupported);
     }
     if !token_current(token) {
         unsafe { yp_close(player) };
         drop(slot.take());
+        clear_io_slot();
         log::append("remote: 打开完成后已被新的播放请求取代，已丢弃");
         return Err(SourceError::Cancelled);
     }
@@ -226,8 +267,19 @@ pub fn close_remote() {
     if let Ok(mut slot) = REMOTE.lock() {
         drop(slot.take());
     }
+    /*
+     * 解码器已经关了，回调表才可以丢 —— 顺序不能反：
+     * 反了就等于把解码器脚下的表抽掉（这正是之前真机崩的原因）。
+     */
+    clear_io_slot();
     /* 排障用：一行计数，回答"到底是谁在反复跑"（只在 debug 日志开着时写）。 */
     super::http::trace_summary();
+}
+
+fn clear_io_slot() {
+    if let Ok(mut g) = IO_SLOT.lock() {
+        *g = None;
+    }
 }
 
 pub fn active() -> bool {

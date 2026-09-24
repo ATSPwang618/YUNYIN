@@ -19,6 +19,7 @@
 #ifdef __vita__
 
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/io/fcntl.h>
 #include <psp2/libssl.h>
 #include <psp2/net/http.h>
 #include <psp2/net/net.h>
@@ -752,6 +753,138 @@ void yhttp_stream_close(yhttp_stream *s) {
 
 int yhttp_stream_error(const yhttp_stream *s) { return s ? s->err : -1; }
 
+/* ---------------------------------------------------------------- 日志服务 -- */
+/*
+ * 真机排障最费精力的其实是"每次都要把 ux0:data/yunyin.log 手动拷到电脑"。
+ * 这里在后台线程开一个极小的 HTTP 服务，电脑上一条命令就能把日志拿走：
+ *
+ *     curl http://<Vita 的 IP>:1337/ -o yunyin.log
+ *
+ * 规矩：
+ *   - 只在日志开关（ux0:/data/yunyin/debug）打开时由 Rust 侧启动；
+ *   - 任何一步失败都只写一行日志，绝不影响播放；
+ *   - 不解析请求，任何 GET 都把整份日志回过去（就这一个文件）。
+ */
+static char g_logserve_path[128];
+static unsigned short g_logserve_port;
+
+static void yh_send_all(int cli, const char *buf, int len) {
+    int off = 0;
+    while (off < len) {
+        int n = sceNetSend(cli, buf + off, (unsigned int)(len - off), 0);
+        if (n <= 0) return;
+        off += n;
+    }
+}
+
+static int yh_logserve_thread(unsigned int args, void *argp) {
+    int srv, cli;
+    SceNetSockaddrIn addr;
+    (void)args;
+    (void)argp;
+
+    srv = sceNetSocket("yunyin-logsrv", SCE_NET_AF_INET, SCE_NET_SOCK_STREAM, 0);
+    if (srv < 0) {
+        yh_logf("yhttp: 日志服务建 socket 失败 0x%08X\n", (unsigned)srv);
+        return 0;
+    }
+    {
+        int on = 1;
+        sceNetSetsockopt(srv, SCE_NET_SOL_SOCKET, SCE_NET_SO_REUSEADDR, &on,
+                         sizeof on);
+    }
+    memset(&addr, 0, sizeof addr);
+    addr.sin_len = sizeof addr;
+    addr.sin_family = SCE_NET_AF_INET;
+    addr.sin_port = sceNetHtons(g_logserve_port);
+    addr.sin_addr.s_addr = sceNetHtonl(SCE_NET_INADDR_ANY);
+    if (sceNetBind(srv, (SceNetSockaddr *)&addr, sizeof addr) < 0) {
+        yh_logf("yhttp: 日志服务 bind :%u 失败\n", (unsigned)g_logserve_port);
+        sceNetSocketClose(srv);
+        return 0;
+    }
+    if (sceNetListen(srv, 4) < 0) {
+        yh_logf("yhttp: 日志服务 listen 失败\n");
+        sceNetSocketClose(srv);
+        return 0;
+    }
+    {
+        /* 顺便把本机 IP 打出来，用户直接照着拼 URL。 */
+        SceNetCtlInfo info;
+        memset(&info, 0, sizeof info);
+        if (sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_IP_ADDRESS, &info) >= 0) {
+            yh_logf("yhttp: 日志服务就绪 -> http://%s:%u/  （电脑上 curl 它即可）\n",
+                    info.ip_address, (unsigned)g_logserve_port);
+        } else {
+            yh_logf("yhttp: 日志服务就绪（端口 %u）\n", (unsigned)g_logserve_port);
+        }
+    }
+
+    for (;;) {
+        char req[512];
+        unsigned int peerlen = sizeof addr;
+        cli = sceNetAccept(srv, (SceNetSockaddr *)&addr, &peerlen);
+        if (cli < 0) {
+            sceKernelDelayThread(200 * 1000);
+            continue;
+        }
+        (void)sceNetRecv(cli, req, sizeof req, 0); /* 请求内容不解析 */
+        {
+            SceUID f = sceIoOpen(g_logserve_path, SCE_O_RDONLY, 0);
+            if (f >= 0) {
+                SceOff sz = sceIoLseek(f, 0, SCE_SEEK_END);
+                char hdr[192];
+                int hlen;
+                char buf[4096];
+                int n;
+                sceIoLseek(f, 0, SCE_SEEK_SET);
+                hlen = snprintf(hdr, sizeof hdr,
+                                "HTTP/1.0 200 OK\r\n"
+                                "Content-Type: text/plain; charset=utf-8\r\n"
+                                "Content-Length: %lld\r\n"
+                                "Connection: close\r\n\r\n",
+                                (long long)sz);
+                yh_send_all(cli, hdr, hlen);
+                while ((n = sceIoRead(f, buf, sizeof buf)) > 0) {
+                    yh_send_all(cli, buf, n);
+                }
+                sceIoClose(f);
+            } else {
+                static const char nf[] = "HTTP/1.0 404 Not Found\r\n"
+                                         "Content-Length: 0\r\n"
+                                         "Connection: close\r\n\r\n";
+                yh_send_all(cli, nf, (int)(sizeof nf - 1));
+            }
+        }
+        sceNetSocketClose(cli);
+    }
+    return 0;
+}
+
+int yhttp_logserve_start(const char *path, unsigned short port) {
+    SceUID thid;
+    int ret;
+    if (!path || !*path || strlen(path) >= sizeof g_logserve_path) return -1;
+    strcpy(g_logserve_path, path);
+    g_logserve_port = port;
+    if (yhttp_init() < 0) {
+        yh_logf("yhttp: 日志服务需要网络栈，初始化失败\n");
+        return -1;
+    }
+    thid = sceKernelCreateThread("yunyin-logsrv", yh_logserve_thread,
+                                 0x10000100, 0x8000, 0, 0, NULL);
+    if (thid < 0) {
+        yh_logf("yhttp: 日志服务线程创建失败 0x%08X\n", (unsigned)thid);
+        return thid;
+    }
+    ret = sceKernelStartThread(thid, 0, NULL);
+    if (ret < 0) {
+        yh_logf("yhttp: 日志服务线程启动失败 0x%08X\n", (unsigned)ret);
+        sceKernelDeleteThread(thid);
+    }
+    return ret;
+}
+
 /* ---------------------------------------------------------------- 取消 -- */
 
 typedef struct {
@@ -927,6 +1060,10 @@ int yhttp_abort_probe(const char *url, const char *referer, int tls_mode,
 int yhttp_load_ca(void) { return -1; }
 unsigned int yhttp_ca_http_pool(void) { return 0; }
 unsigned int yhttp_ca_ssl_pool(void) { return 0; }
+int yhttp_logserve_start(const char *path, unsigned short port) {
+    (void)path; (void)port;
+    return -1;
+}
 yhttp_stream *yhttp_stream_open(const char *url, const char *referer,
                                 int tls_mode, long long *size_out,
                                 int *err_out) {
