@@ -291,7 +291,31 @@ pub fn active() -> bool {
 ///   在线播放 → 缓存够（或已到流末尾）才可以，否则音频线程输出静音。
 pub fn gate_ok() -> bool {
     const GATE_BYTES: usize = 64 * 1024;
-    !active() || is_eof() || available() >= GATE_BYTES
+    if !active() {
+        return true; /* 本地播放不受 Gate 限制 */
+    }
+    if is_eof() {
+        return true; /* 已经到流末尾：让解码器把最后几帧收完 */
+    }
+    if available() >= GATE_BYTES {
+        return true;
+    }
+    /*
+     * 剩下的就是"文件最后一段"：后面不会再有数据了，必须放行 ——
+     * 否则不足阈值就永远静音，歌会卡在结尾（真机上表现为"播放到最后卡住"）。
+     */
+    at_cached_end()
+}
+
+/// 缓存是否已经接到已知的流末尾（Gate 判"末尾放行"用）。
+pub fn at_cached_end() -> bool {
+    match REMOTE.lock() {
+        Ok(g) => match g.as_ref() {
+            Some(src) => src.at_cached_end(),
+            None => true,
+        },
+        Err(_) => true,
+    }
 }
 
 /// 还没解码的字节数（Gate 用它决定要不要调解码器）。

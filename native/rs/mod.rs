@@ -62,7 +62,7 @@ pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_s
      * 版本号写进日志：真机排障时第一件事就是确认"跑的是哪一版"。
      * 以前只能靠行为猜，白花了整整一轮往返。
      */
-    log::append("yunyin: start (in-process BGM) 版本 00.87");
+    log::append("yunyin: start (in-process BGM) 版本 00.88");
     /*
      * 排障效率：开着日志时顺便开一个"把日志回给电脑"的小服务，
      * 电脑上 `curl http://<vita-ip>:1337/ -o yunyin.log` 就能取，

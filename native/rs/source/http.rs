@@ -122,6 +122,18 @@ pub const WINDOW_BYTES: usize = 256 * 1024;
 pub const READ_WAIT_MS: u64 = 4000;
 
 /*
+ * 连续失败多少次才判定"这条流坏了"。
+ *
+ * 以前是**失败一次就永久记住**（err 字段粘性），于是网络抖一下之后：窗口永远补不上、
+ * Gate 永远静音、取数线程也再不去试（它看到已有错误就直接返回）—— 真机上表现就是
+ * "播着播着卡死、再也不动"。对网络流来说正确的做法是**自动重试**，只有连续多次
+ * 都失败才当成真坏了。
+ */
+pub const MAX_CONSECUTIVE_FAILS: u32 = 4;
+/// 失败后的退避时间，别把网络打爆。
+const RETRY_BACKOFF_MS: u64 = 300;
+
+/*
  * 一次 read() 内部最多等几轮（每轮 READ_WAIT_MS）。
  *
  * 为什么不能等一轮就放弃：解码器**读文件头**时不能被"暂时没数据"打断 —— 它会把
@@ -175,6 +187,8 @@ struct Window {
      */
     end_at: Option<u64>,
     err: Option<SourceError>,
+    /// 连续失败次数：到 MAX_CONSECUTIVE_FAILS 才把 err 置上（见常量说明）。
+    fail_count: u32,
     /// 消费端希望窗口从哪开始（seek 会改它）。
     want_from: u64,
     /// 请求代数：seek 后 +1，取数线程据此丢弃过期结果。
@@ -201,8 +215,8 @@ impl Window {
     }
 
     /// 当前窗口没盖住、但预取槽接得上时，把预取槽升格成当前窗口。
-    /// 返回"升格之后盖住了吗"。
-    fn promote_if_needed(&mut self, pos: u64) -> bool {
+    /// 返回"升格之后盖住了吗"。升格成功后**顺手再预取一窗**，别让提前量断链。
+    fn promote_if_needed(&mut self, pos: u64, cv: &Condvar) -> bool {
         if self.covers(pos) {
             return true;
         }
@@ -215,6 +229,8 @@ impl Window {
         core::mem::swap(&mut self.buf, &mut self.next);
         self.start = self.next_start;
         self.next.clear();
+        /* 升格用掉了预取槽 —— 立刻补下一窗，否则下一次跨窗又要等一次 HTTP。 */
+        Self::maybe_prefetch(self, cv);
         true
     }
 
@@ -263,6 +279,7 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                 next_start: 0,
                 end_at: None,
                 err: None,
+                fail_count: 0,
                 want_from: 0,
                 generation: 0,
                 pending: true, /* 打开就先抓第一窗 */
@@ -310,6 +327,7 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                         }
                         bump(2);
                         let got = st.read_at(from, &mut tmp);
+                        let failed = got.is_err(); /* match 会把 got 里的错误值移出去，先记下来 */
                         {
                             let (lock, cv) = &*shared;
                             let Ok(mut w) = lock.lock() else { break };
@@ -334,8 +352,12 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                             }
                             trace_f(|| format!("取数 from={from} got={got:?} 已发布"));
                             match got {
-                                Ok(0) => w.end_at = Some(from),
+                                Ok(0) => {
+                                    w.end_at = Some(from);
+                                    w.fail_count = 0;
+                                }
                                 Ok(n) => {
+                                    w.fail_count = 0; /* 抓到了：之前的失败不算数 */
                                     let contiguous = !w.buf.is_empty()
                                         && from == w.start + w.buf.len() as u64;
                                     if w.buf.is_empty() || !contiguous {
@@ -351,12 +373,39 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                                         w.next_start = from;
                                     }
                                 }
-                                Err(e) => w.err = Some(e),
+                                Err(e) => {
+                                    /*
+                                     * 网络抖一下不该把整首歌判死：连续失败够多次才算真坏。
+                                     * 中间的失败只记数 + 退避重试，Gate 那边会一直是静音，
+                                     * 一旦抓回来就自动继续放（真机上的"卡死再也不动"就是这么来的）。
+                                     */
+                                    w.fail_count = w.fail_count.saturating_add(1);
+                                    if w.fail_count >= MAX_CONSECUTIVE_FAILS {
+                                        trace_f(|| {
+                                            format!(
+                                                "取数连续失败 {} 次，判定这条流坏了：{:?}",
+                                                w.fail_count, e
+                                            )
+                                        });
+                                        w.err = Some(e);
+                                    } else {
+                                        trace_f(|| {
+                                            format!(
+                                                "取数失败（第 {} 次），退避后重试：{:?}",
+                                                w.fail_count, e
+                                            )
+                                        });
+                                    }
+                                }
                             }
                             w.pending = false;
                             Window::maybe_prefetch(&mut w, cv);
                             gen_hint.store(w.generation, Ordering::Release);
                             cv.notify_all();
+                        }
+                        if failed {
+                            /* 失败后退避一下再去试，别把网络打爆。 */
+                            std::thread::sleep(Duration::from_millis(RETRY_BACKOFF_MS));
                         }
                     }
                 })
@@ -397,7 +446,7 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
         let Ok(mut w) = lock.lock() else { return false };
         loop {
             /* 先用预取槽兜一下：上一窗读尽时，下一窗往往已经在内存里了。 */
-            let covered = w.promote_if_needed(pos);
+            let covered = w.promote_if_needed(pos, cv);
             /* 「到底」是一个位置：只有你要的位置已经过了那个点，才算是结束。 */
             let ended = w.end_at.map_or(false, |end| pos >= end);
             if covered || ended || w.err.is_some() || w.cancelled {
@@ -464,12 +513,39 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
         let (lock, cv) = &*self.shared;
         if let Ok(mut w) = lock.lock() {
             let pos = self.pos;
-            let covered = pos >= w.start && pos < w.start + w.buf.len() as u64;
-            let ended = w.end_at.map_or(false, |e| pos >= e);
-            if !covered && !ended {
+            /*
+             * 注意这里**不能**写成"当前位置没被盖住才去抓"。
+             *
+             * Gate 是在"剩余不足阈值"时静音的（真机日志里是剩 63 KB），那时位置
+             * 往往**还在窗口里** —— 按旧写法这里什么都不做，于是没人取数、Gate 永远
+             * 不开，一首歌播到 28 秒就永久静音。
+             *
+             * 正确的事是**保证提前量**：位置上没盖住就按位置抓；盖住了就把预取槽补上
+             * （maybe_prefetch 会从当前窗口末尾往后抓一窗）。
+             */
+            if w.covers(pos) {
+                Window::maybe_prefetch(&mut w, cv);
+            } else {
                 Self::register_locked(&mut w, cv, pos);
             }
         }
+    }
+
+    /// 缓存是不是已经接到了"已知的流末尾"。
+    ///
+    /// Gate 需要它：文件最后一段（比如只剩 100 KB）本身就不足阈值，如果还按
+    /// "缓存够不够"来判，解码器永远拿不到收尾的那几帧 —— 歌就卡在结尾了。
+    pub fn at_cached_end(&self) -> bool {
+        let (lock, _cv) = &*self.shared;
+        let Ok(w) = lock.lock() else { return false };
+        let Some(end) = w.end_at else { return false };
+        let cur_end = w.start + w.buf.len() as u64;
+        let next_end = if w.next.is_empty() {
+            cur_end
+        } else {
+            w.next_start + w.next.len() as u64
+        };
+        cur_end.max(next_end) >= end
     }
 }
 
@@ -539,12 +615,12 @@ impl<T: ByteTransport + 'static> AudioSource for HttpRangeSource<T> {
         bump(1);
         /* 窗口里已经有目标位置就白拿；否则让取数线程挪过去。 */
         let covered = {
-            let (lock, _cv) = &*self.shared;
+            let (lock, cv) = &*self.shared;
             let Ok(w) = lock.lock() else {
                 return Err(SourceError::Io(String::from("window lock")));
             };
             let mut w = w;
-            let c = w.promote_if_needed(pos);
+            let c = w.promote_if_needed(pos, cv);
             trace_f(|| format!(
                 "seek pos={pos} 命中窗口={c} 窗口=[{},{})",
                 w.start,
@@ -567,10 +643,10 @@ impl<T: ByteTransport + 'static> AudioSource for HttpRangeSource<T> {
     }
 
     fn available(&self) -> usize {
-        let (lock, _cv) = &*self.shared;
+        let (lock, cv) = &*self.shared;
         let Ok(mut w) = lock.lock() else { return 0 };
         /* 顺手升格预取槽：Gate 看的就是这个数，不能因为"还没升格"而误判缓存不够。 */
-        if !w.promote_if_needed(self.pos) {
+        if !w.promote_if_needed(self.pos, cv) {
             return 0;
         }
         let off = (self.pos - w.start) as usize;
