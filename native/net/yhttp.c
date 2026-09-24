@@ -441,6 +441,209 @@ done:
     return res->err_code;
 }
 
+/* ------------------------------------------------------------ 流式读取 -- */
+
+struct yhttp_stream {
+    char *url;
+    char *referer;
+    int tls_mode;
+    long long size;      /* -1 = 未知 */
+    unsigned char *win;  /* 当前窗口 */
+    int win_cap;
+    long long win_start; /* 窗口在文件里的起始偏移 */
+    int win_len;         /* 窗口里有效字节数 */
+    int eof;             /* 已经到流末尾 */
+    int err;             /* 最近一次错误码（0 = 没有） */
+    volatile int cancelled;
+};
+
+/*
+ * 抓一个窗口到 s->win（覆盖 [off, off+want)）。
+ *
+ * 复用探针那套已经真机验证过的用法：每次请求单独建 template/conn/req、
+ * 开自动重定向、响应头按 headerSize 限界、库返回的指针只读不 free。
+ */
+static int yh_stream_fetch(yhttp_stream *s, long long off, int want) {
+    int tmpl = -1, conn = -1, req = -1;
+    char *headers = NULL;
+    unsigned int headers_size = 0;
+    char range[64];
+    unsigned long long clen = 0;
+    yh_hdr cr;
+    int total = 0, start = 0;
+    int got = 0;
+    int ret;
+
+    if (s->cancelled) return -1;
+    if (s->size > 0 && off >= s->size) {
+        s->eof = 1;
+        return 0;
+    }
+
+    tmpl = sceHttpCreateTemplate(YHTTP_USER_AGENT, SCE_HTTP_VERSION_1_1,
+                                 SCE_HTTP_PROXY_AUTO);
+    if (tmpl < 0) { s->err = tmpl; return tmpl; }
+    conn = sceHttpCreateConnectionWithURL(tmpl, s->url, 1);
+    if (conn < 0) { s->err = conn; goto done; }
+    req = sceHttpCreateRequestWithURL(conn, SCE_HTTP_METHOD_GET, s->url, 0);
+    if (req < 0) { s->err = req; goto done; }
+
+    sceHttpSetAutoRedirect(req, 1);
+    sceHttpSetResolveTimeOut(req, YHTTP_RESOLVE_TIMEOUT_US);
+    sceHttpSetConnectTimeOut(req, YHTTP_CONNECT_TIMEOUT_US);
+    sceHttpSetRecvTimeOut(req, YHTTP_RECV_TIMEOUT_US);
+    sceHttpSetResponseHeaderMaxSize(req, YHTTP_HEADER_MAX);
+    snprintf(range, sizeof range, "bytes=%lld-%lld", off,
+             off + (long long)want - 1);
+    sceHttpAddRequestHeader(req, "Range", range, SCE_HTTP_HEADER_ADD);
+    if (s->referer && *s->referer)
+        sceHttpAddRequestHeader(req, "Referer", s->referer, SCE_HTTP_HEADER_ADD);
+
+    ret = sceHttpSendRequest(req, NULL, 0);
+    if (ret < 0) { s->err = ret; goto done; }
+    ret = sceHttpGetStatusCode(req, &total);
+    if (ret < 0) { s->err = ret; goto done; }
+    if (total != 200 && total != 206) {
+        s->err = -1;
+        yh_logf("yhttp: stream status=%d (需要 206/200)\n", total);
+        goto done;
+    }
+    if (sceHttpGetResponseContentLength(req, &clen) < 0) clen = 0;
+
+    /* Content-Range 告诉我们这段是从哪开始的、全长多少（§19）。 */
+    if (sceHttpGetAllResponseHeaders(req, &headers, &headers_size) >= 0 &&
+        headers) {
+        cr = yh_header_find(headers, headers_size, "Content-Range");
+        if (cr.ptr && cr.len > 0) {
+            char tmp[64];
+            int n = cr.len < (int)sizeof tmp - 1 ? cr.len : (int)sizeof tmp - 1;
+            unsigned long long a = 0, b = 0, t = 0;
+            memcpy(tmp, cr.ptr, (size_t)n);
+            tmp[n] = 0;
+            if (sscanf(tmp, "bytes %llu-%llu/%llu", &a, &b, &t) >= 2) {
+                start = (int)a;
+                s->size = (long long)t;
+            }
+        }
+    }
+    /* 服务器无视 Range（200）：这一坨是从 0 开始的整段流。 */
+    if (total == 200 && off > 0) {
+        start = 0;
+        yh_logf("yhttp: stream 服务器忽略 Range，退回整段读\n");
+    }
+
+    {
+        int cap = s->win_cap;
+        if (clen > 0 && (long long)clen < (long long)cap) cap = (int)clen;
+        while (got < cap) {
+            ret = sceHttpReadData(req, s->win + got, (unsigned int)(cap - got));
+            if (ret == 0) break;
+            if (ret < 0) { s->err = ret; goto done; }
+            got += ret;
+        }
+    }
+    s->win_start = (long long)start;
+    s->win_len = got;
+    if (got == 0) s->eof = 1;
+    else if (s->size > 0 && (long long)start + got >= s->size) s->eof = 1;
+    yh_logf("yhttp: stream 窗口 %lld..%lld（%d 字节，总长 %lld）\n",
+            s->win_start, s->win_start + got, got, s->size);
+
+done:
+    if (req >= 0) sceHttpDeleteRequest(req);
+    if (conn >= 0) sceHttpDeleteConnection(conn);
+    if (tmpl >= 0) sceHttpDeleteTemplate(tmpl);
+    return s->err;
+}
+
+yhttp_stream *yhttp_stream_open(const char *url, const char *referer,
+                                int tls_mode, long long *size_out, int *err_out) {
+    yhttp_stream *s;
+    if (!url || !*url) return NULL;
+    if (yhttp_init() < 0) {
+        if (err_out) *err_out = -1;
+        return NULL;
+    }
+    if (tls_mode == YHTTP_TLS_VERIFY) yh_load_system_ca();
+
+    s = (yhttp_stream *)calloc(1, sizeof *s);
+    if (!s) return NULL;
+    s->win_cap = YHTTP_WINDOW;
+    s->win = (unsigned char *)malloc((size_t)s->win_cap);
+    s->url = (char *)malloc(strlen(url) + 1);
+    s->referer = (char *)malloc(referer ? strlen(referer) + 1 : 1);
+    if (!s->win || !s->url || !s->referer) {
+        yhttp_stream_close(s);
+        return NULL;
+    }
+    strcpy(s->url, url);
+    if (referer) strcpy(s->referer, referer);
+    else s->referer[0] = 0;
+    s->tls_mode = tls_mode;
+    s->size = -1;
+
+    /* 第一次取窗口：顺带知道总长度（Content-Range 的 "/total"）。 */
+    if (yh_stream_fetch(s, 0, s->win_cap) < 0) {
+        if (err_out) *err_out = s->err;
+        yhttp_stream_close(s);
+        return NULL;
+    }
+    if (size_out) *size_out = s->size;
+    if (err_out) *err_out = 0;
+    return s;
+}
+
+long long yhttp_stream_read(yhttp_stream *s, long long off, void *dst,
+                            long long n) {
+    long long done = 0;
+    unsigned char *out = (unsigned char *)dst;
+    if (!s || !dst || n <= 0) return -1;
+    if (s->cancelled) return -1;
+    if (s->err) return s->err;
+    if (s->size > 0 && off >= s->size) return 0; /* 真正结束 */
+
+    while (done < n) {
+        long long want = off + done;
+        /* 命中窗口就直接拷，不命中就把窗口挪过去（一次 Range 请求）。 */
+        if (want < s->win_start || want >= s->win_start + s->win_len) {
+            if (s->eof && s->win_len == 0) break;
+            if (yh_stream_fetch(s, want, s->win_cap) < 0) {
+                return done > 0 ? done : s->err;
+            }
+            if (s->win_len == 0) break;
+            if (want < s->win_start || want >= s->win_start + s->win_len) {
+                yh_logf("yhttp: stream 窗口没盖住请求偏移 %lld\n", want);
+                s->err = -1;
+                return done > 0 ? done : -1;
+            }
+        }
+        {
+            long long avail = s->win_start + s->win_len - want;
+            long long take = n - done;
+            if (take > avail) take = avail;
+            if (take <= 0) break;
+            memcpy(out + done, s->win + (want - s->win_start), (size_t)take);
+            done += take;
+        }
+    }
+    return done; /* 0 = 真正结束 */
+}
+
+void yhttp_stream_cancel(yhttp_stream *s) {
+    if (s) s->cancelled = 1;
+}
+
+void yhttp_stream_close(yhttp_stream *s) {
+    if (!s) return;
+    yhttp_stream_cancel(s);
+    free(s->win);
+    free(s->url);
+    free(s->referer);
+    free(s);
+}
+
+int yhttp_stream_error(const yhttp_stream *s) { return s ? s->err : -1; }
+
 /* ---------------------------------------------------------------- 取消 -- */
 
 typedef struct {
@@ -616,5 +819,21 @@ int yhttp_abort_probe(const char *url, const char *referer, int tls_mode,
 int yhttp_load_ca(void) { return -1; }
 unsigned int yhttp_ca_http_pool(void) { return 0; }
 unsigned int yhttp_ca_ssl_pool(void) { return 0; }
+yhttp_stream *yhttp_stream_open(const char *url, const char *referer,
+                                int tls_mode, long long *size_out,
+                                int *err_out) {
+    (void)url; (void)referer; (void)tls_mode;
+    if (size_out) *size_out = -1;
+    if (err_out) *err_out = -1;
+    return NULL;
+}
+long long yhttp_stream_read(yhttp_stream *s, long long off, void *dst,
+                            long long n) {
+    (void)s; (void)off; (void)dst; (void)n;
+    return -1;
+}
+void yhttp_stream_cancel(yhttp_stream *s) { (void)s; }
+void yhttp_stream_close(yhttp_stream *s) { (void)s; }
+int yhttp_stream_error(const yhttp_stream *s) { (void)s; return -1; }
 
 #endif /* __vita__ */

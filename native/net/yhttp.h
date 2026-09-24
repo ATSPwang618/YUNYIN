@@ -101,6 +101,44 @@ int yhttp_load_ca(void);
 unsigned int yhttp_ca_http_pool(void);
 unsigned int yhttp_ca_ssl_pool(void);
 
+/* ------------------------------------------------------------ 流式读取 -- */
+/*
+ * Phase 2：把 HTTP 当"可随机读取的文件"来用（任务书 §17-§19）。
+ *
+ * 内部按 Range 维护一个窗口（默认 256 KiB）：落在窗口里的读直接命中，
+ * 窗口外的读发一次新的 Range 请求把窗口挪过去。这样解码器"读一次发一次请求"
+ * 的情况不会发生 —— 平均每个窗口只发一次。
+ *
+ * 与 yp_io 的约定一致：read 返回 0 只代表**流真的结束**；出错返回负值。
+ * 取消（切歌/退出）用 yhttp_stream_cancel()，之后所有 read 立刻返回负数。
+ */
+
+typedef struct yhttp_stream yhttp_stream;
+
+#define YHTTP_WINDOW (256 * 1024)
+
+/*
+ * 打开流并取到头部窗口（顺带拿到总长度）。
+ * `size_out` 可为 NULL；拿到 Content-Range/Length 时写入总字节数（未知为 -1）。
+ * 失败返回 NULL，*err_out 写入 Vita 错误码（可为 NULL）。
+ */
+yhttp_stream *yhttp_stream_open(const char *url, const char *referer,
+                                int tls_mode, long long *size_out,
+                                int *err_out);
+
+/* 从绝对偏移 off 读最多 n 字节；返回读到的字节数，0 = 结束，负数 = 错误。 */
+long long yhttp_stream_read(yhttp_stream *s, long long off, void *dst,
+                            long long n);
+
+/* 取消：正在进行的请求会被打断，之后的读一律失败（切歌、退出时调用）。 */
+void yhttp_stream_cancel(yhttp_stream *s);
+
+/* 释放（内部会先取消）。 */
+void yhttp_stream_close(yhttp_stream *s);
+
+/* 最近一次失败的错误码（0 = 没有）。 */
+int yhttp_stream_error(const yhttp_stream *s);
+
 #ifdef __cplusplus
 }
 #endif

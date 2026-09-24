@@ -1,70 +1,161 @@
-//! `HttpRangeSource` — the network side of the seam (Phase 2, task book §78).
+//! `HttpRangeSource` —— 网络侧的 `AudioSource`（Phase 2，任务书 §17-§19/§78）。
 //!
-//! 当前状态：只有接口与设计。在 `net::http` 能在 Vita 上真正发 Range 请求之前，
-//! 每个方法都返回 `Unsupported`。
-//!
-//! 形态照抄 cspot 的 `CDNAudioFile`（§7 指定的参考实现）—— 同样的硬件、同样的问题，
-//! 它已经解过一遍：
+//! 形状照参考实现 cspot 的 `CDNAudioFile`：
 //!
 //! ```text
-//! open  -> Range: bytes=0-8191        头部窗口：解码器在这里嗅探魔数
-//!       -> Range: bytes=-12288        尾部窗口：Ogg/Opus 的 seek 需要文件尾
-//! read  -> 先从字节缓存取；取不到就按当前位置发一次约 14 KiB 的 Range
-//!          （绝不做"解码器每读一次就发一次请求"）
-//! seek  -> 移动游标、丢掉窗口；下一次 read 重新取，并留一点 margin，
-//!          这样小幅回退不用重新请求（§54）
+//! 取数线程（网络线程）           消费端（解码器所在的音频线程）
+//! ──────────────────            ──────────────────────────────
+//! 按窗口抓字节（256 KiB）   ──→   窗口里有就直接拷走
+//! 窗口不够就继续抓               没有就等（条件变量），最多等 READ_WAIT_MS
+//! seek 时丢掉窗口重抓            真正的结束只有"已 EOF 且窗口空"才报
 //! ```
 //!
-//! §15 的两条推论：
-//!   - 解码器永远看不到 socket：它只看到缓存里的字节，或者 `WouldBlock`；
-//!   - 这里的 seek 以**字节**为单位，"时间 → 字节"由解码器自己换算。
+//! 两条硬约束都落在这里：
+//   - 解码器**看不到 socket**：它只看到窗口里的字节，或者"稍后再来"；
+//   - 绝不做"解码器读一次就发一次请求"：一个窗口只发一次 Range。
+//!
+//! `ByteTransport` 把"怎么取字节"抽出来，Vita 上用 `net::http::Stream`，
+// 电脑上用一个内存假实现 —— 窗口/seek/EOF 这套逻辑因此可以离线验证。
 #![allow(dead_code)]
 
-use super::cache::{ByteCache, CacheConfig};
+use super::cache::CacheConfig;
 use super::{AudioSource, SourceError, SourceKind};
 use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
-/// 一次取数请求：从哪开始、要多少。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FetchRequest {
-    pub offset: u64,
-    pub len: usize,
+/// 一次 Range 抓多少（任务书 §13 的 refill 量级；也是"每窗口一次请求"的粒度）。
+pub const WINDOW_BYTES: usize = 256 * 1024;
+/// 消费端等数据的上限：等不到就返回"稍后再来"，由上层 Gate 决定是否静音。
+pub const READ_WAIT_MS: u64 = 4000;
+
+/// "从哪儿按偏移取字节"的最小接口。
+pub trait ByteTransport: Send {
+    /// 从绝对偏移 `off` 读最多 `dst.len()` 字节；`Ok(0)` = 真正结束。
+    fn read_at(&mut self, off: u64, dst: &mut [u8]) -> Result<usize, SourceError>;
+    /// 总长度（未知则 None）。
+    fn size(&self) -> Option<u64>;
 }
 
-/// 交给网络线程的接口：`HttpRangeSource` 只申明"我要什么"，
-/// 网络线程负责真正传输，并把字节推回来（§9）。
-pub trait RangeFetcher {
-    /// 从 `offset` 开始传；后一次调用会顶掉前一次（§56）。
-    fn request(&mut self, req: FetchRequest) -> Result<(), SourceError>;
-    /// 取消正在进行的传输（切歌时用）。
-    fn cancel(&mut self) -> Result<(), SourceError>;
+/// 取数线程与消费端共享的窗口。
+struct Window {
+    buf: Vec<u8>,
+    start: u64,
+    eof: bool,
+    err: Option<SourceError>,
+    /// 消费端希望窗口从哪开始（seek 会改它）。
+    want_from: u64,
+    /// 请求代数：seek 后 +1，取数线程据此丢弃过期结果。
+    generation: u64,
+    /// 消费端已登记一个取数需求，等取数线程去做。
+    pending: bool,
+    cancelled: bool,
 }
 
-/// 尺寸取自参考实现。两个值都故意取小 —— Vita 上稀缺的是网络缓冲（§66）。
-pub const HEADER_WINDOW: usize = 8 * 1024;
-pub const FOOTER_WINDOW: usize = 12 * 1024;
-pub const SEEK_MARGIN: u64 = 4 * 1024;
-
-pub struct HttpRangeSource {
-    url: String,
-    cache: ByteCache,
+pub struct HttpRangeSource<T: ByteTransport + 'static> {
+    shared: Arc<(Mutex<Window>, Condvar)>,
     pos: u64,
-    /// 服务器给了 Content-Length 时的流总长度。
     size: Option<u64>,
-    error: Option<SourceError>,
+    gen_hint: Arc<AtomicU64>,
+    url: String,
+    worker: Option<JoinHandle<()>>,
+    /// 传输由取数线程独占，这里只是让类型参数有落脚点。
+    _owns: PhantomData<T>,
 }
 
-impl HttpRangeSource {
-    /// 绑定到已解析出的 URL。URL 的生命周期归调用方（Provider）：
-    /// CDN 回 403/404 时由 Provider 重新解析并重建这个对象
-    /// —— 这就是 `SourceError::Expired` 存在的原因（§52）。
-    pub fn new(url: &str, cfg: CacheConfig) -> Self {
+impl<T: ByteTransport + 'static> HttpRangeSource<T> {
+    /// `transport` 交给取数线程独占（只有它做 I/O）。
+    pub fn new(url: &str, transport: T, _cfg: CacheConfig) -> Self {
+        let size = transport.size();
+        let shared = Arc::new((
+            Mutex::new(Window {
+                buf: Vec::new(),
+                start: 0,
+                eof: false,
+                err: None,
+                want_from: 0,
+                generation: 0,
+                pending: true, /* 打开就先抓第一窗 */
+                cancelled: false,
+            }),
+            Condvar::new(),
+        ));
+        let gen_hint = Arc::new(AtomicU64::new(0));
+
+        let worker = {
+            let shared = Arc::clone(&shared);
+            let gen_hint = Arc::clone(&gen_hint);
+            let mut st = transport;
+            std::thread::Builder::new()
+                .name("yunyin-net-http".into())
+                .stack_size(64 * 1024)
+                .spawn(move || {
+                    let mut tmp = vec![0u8; WINDOW_BYTES];
+                    loop {
+                        let mut gen;
+                        let from;
+                        {
+                            let (lock, cv) = &*shared;
+                            let Ok(mut w) = lock.lock() else { break };
+                            // 有需求才干活；没需求就睡着等消费端登记。
+                            while !w.cancelled && !w.pending {
+                                match cv.wait_timeout(w, Duration::from_millis(200)) {
+                                    Ok((g, _)) => w = g,
+                                    Err(e) => w = e.into_inner().0,
+                                }
+                            }
+                            if w.cancelled {
+                                break;
+                            }
+                            from = w.want_from;
+                            gen = w.generation;
+                            w.pending = false; /* 这一抓由我负责 */
+                            w.buf.clear();
+                            w.start = from;
+                        }
+                        let got = st.read_at(from, &mut tmp);
+                        {
+                            let (lock, cv) = &*shared;
+                            let Ok(mut w) = lock.lock() else { break };
+                            if w.cancelled {
+                                break;
+                            }
+                            if w.generation != gen {
+                                // 期间发生了 seek：这一抓作废。
+                                w.pending = false;
+                                cv.notify_all();
+                                continue;
+                            }
+                            match got {
+                                Ok(0) => w.eof = true,
+                                Ok(n) => {
+                                    w.buf.extend_from_slice(&tmp[..n]);
+                                    w.start = from;
+                                }
+                                Err(e) => w.err = Some(e),
+                            }
+                            w.pending = false;
+                            gen_hint.store(w.generation, Ordering::Release);
+                            cv.notify_all();
+                        }
+                    }
+                })
+                .ok()
+        };
+
         Self {
-            url: String::from(url),
-            cache: ByteCache::new(cfg),
+            shared,
             pos: 0,
-            size: None,
-            error: None,
+            size,
+            gen_hint,
+            url: String::from(url),
+            worker,
+            _owns: PhantomData,
         }
     }
 
@@ -72,51 +163,108 @@ impl HttpRangeSource {
         &self.url
     }
 
-    /// 网络线程下一次该取什么；窗口已经在 refill 水位之上时返回 `None`。
-    pub fn next_fetch(&self) -> Option<FetchRequest> {
-        if self.cache.is_eof() {
-            return None;
+    /// 让取数线程把窗口挪到 `from`（内部用）。
+    fn request_from(&self, from: u64) {
+        let (lock, cv) = &*self.shared;
+        if let Ok(mut w) = lock.lock() {
+            w.want_from = from;
+            w.generation = w.generation.wrapping_add(1);
+            w.buf.clear();
+            w.start = from;
+            w.pending = true;
+            cv.notify_all();
         }
-        if !self.cache.wants_refill() && self.cache.available() > 0 {
-            return None;
-        }
-        Some(FetchRequest {
-            offset: self.cache.start() + self.cache.available() as u64,
-            len: self.cache.config().refill,
-        })
+        self.gen_hint.store(0, Ordering::Release);
     }
 
-    pub fn cache(&self) -> &ByteCache {
-        &self.cache
-    }
-
-    /// 把下载好的字节交给窗口（由网络线程调用）。
-    pub fn deliver(&mut self, data: &[u8]) {
-        self.cache.push(data);
+    /// 等窗口覆盖 `pos`（或 EOF / 出错）。
+    fn wait_for(&self, pos: u64, timeout_ms: u64) -> bool {
+        let (lock, cv) = &*self.shared;
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let Ok(mut w) = lock.lock() else { return false };
+        loop {
+            let covered = pos >= w.start && pos < w.start + w.buf.len() as u64;
+            if covered || w.eof || w.err.is_some() || w.cancelled {
+                return covered;
+            }
+            /* 窗口没盖住要的位置：登记需求叫醒取数线程（读尽当前窗口时走这里）。 */
+            if !w.pending {
+                w.want_from = pos;
+                w.generation = w.generation.wrapping_add(1);
+                w.buf.clear();
+                w.start = pos;
+                w.pending = true;
+                cv.notify_all();
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            match cv.wait_timeout(w, deadline - now) {
+                Ok((g, _)) => w = g,
+                Err(e) => w = e.into_inner().0,
+            }
+        }
     }
 }
 
-impl AudioSource for HttpRangeSource {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, SourceError> {
-        if let Some(e) = &self.error {
-            return Err(e.clone());
+impl<T: ByteTransport + 'static> AudioSource for HttpRangeSource<T> {
+    fn read(&mut self, dst: &mut [u8]) -> Result<usize, SourceError> {
+        let want = dst.len();
+        let mut done = 0usize;
+        if dst.is_empty() {
+            return Ok(0);
         }
-        if self.cache.available() > 0 {
-            let n = self.cache.read(buf);
-            self.pos += n as u64;
-            return Ok(n);
+        /* 尽量填满：解码器（尤其是 m4a 的精确读）不接受"短读"，所以这里
+         * 循环取数据，只有真正到流末尾才返回短读。 */
+        while done < want {
+            if let Some(e) = self.error() {
+                return Err(e);
+            }
+            if self.is_eof() {
+                break; /* 真正结束 */
+            }
+            if !self.wait_for(self.pos, READ_WAIT_MS) {
+                if let Some(e) = self.error() {
+                    return Err(e);
+                }
+                if self.is_eof() {
+                    break;
+                }
+                if done > 0 {
+                    break; /* 等超时：把已有的先给出去，上层 Gate 会决定是否静音 */
+                }
+                return Err(SourceError::WouldBlock);
+            }
+            {
+                let (lock, _cv) = &*self.shared;
+                let Ok(w) = lock.lock() else {
+                    return Err(SourceError::Io(String::from("window lock")));
+                };
+                let off = (self.pos - w.start) as usize;
+                let n = (want - done).min(w.buf.len() - off);
+                dst[done..done + n].copy_from_slice(&w.buf[off..off + n]);
+                drop(w);
+                self.pos += n as u64;
+                done += n;
+            }
         }
-        if self.cache.is_eof() {
-            return Ok(0); /* real end of stream */
-        }
-        /* 缓存空了：Gate 会在窗口回到 `decode_margin` 之上前挡住解码器，
-         * 所以"请稍后再来"才是诚实的回答。 */
-        Err(SourceError::WouldBlock)
+        Ok(done)
     }
 
     fn seek(&mut self, pos: u64) -> Result<(), SourceError> {
-        self.cache.seek(pos);
         self.pos = pos;
+        /* 窗口里已经有目标位置就白拿；否则让取数线程挪过去。 */
+        let covered = {
+            let (lock, _cv) = &*self.shared;
+            let Ok(w) = lock.lock() else {
+                return Err(SourceError::Io(String::from("window lock")));
+            };
+            pos >= w.start && pos < w.start + w.buf.len() as u64
+        };
+        if !covered {
+            self.request_from(pos);
+        }
         Ok(())
     }
 
@@ -129,18 +277,43 @@ impl AudioSource for HttpRangeSource {
     }
 
     fn available(&self) -> usize {
-        self.cache.available()
+        let (lock, _cv) = &*self.shared;
+        let Ok(w) = lock.lock() else { return 0 };
+        if self.pos < w.start {
+            return 0;
+        }
+        let off = (self.pos - w.start) as usize;
+        w.buf.len().saturating_sub(off)
     }
 
     fn is_eof(&self) -> bool {
-        self.cache.is_eof() && self.cache.available() == 0
+        let (lock, _cv) = &*self.shared;
+        let Ok(w) = lock.lock() else { return false };
+        w.eof && self.pos >= w.start + w.buf.len() as u64
     }
 
     fn error(&self) -> Option<SourceError> {
-        self.error.clone()
+        let (lock, _cv) = &*self.shared;
+        let Ok(w) = lock.lock() else { return None };
+        w.err.clone()
     }
 
     fn kind(&self) -> SourceKind {
         SourceKind::HttpRange
+    }
+}
+
+impl<T: ByteTransport + 'static> Drop for HttpRangeSource<T> {
+    fn drop(&mut self) {
+        {
+            let (lock, cv) = &*self.shared;
+            if let Ok(mut w) = lock.lock() {
+                w.cancelled = true;
+                cv.notify_all();
+            }
+        }
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
     }
 }
