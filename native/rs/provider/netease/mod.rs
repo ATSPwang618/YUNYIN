@@ -15,6 +15,8 @@
 pub mod account;
 pub mod api;
 pub mod crypto;
+pub mod login;
+pub mod qr;
 pub mod resolve;
 
 use super::{AudioInfo, MusicProvider, ProviderError, Quality};
@@ -47,15 +49,26 @@ impl MusicProvider for NetEaseProvider {
         "netease"
     }
 
-    fn resolve(&self, _song_id: &str, _quality: Quality) -> Result<AudioInfo, ProviderError> {
-        /* Phase 3：api::song_url() → resolve::to_audio_info() → URL 缓存。 */
-        Err(ProviderError::Unsupported)
+    fn resolve(&self, song_id: &str, quality: Quality) -> Result<AudioInfo, ProviderError> {
+        resolve::fetch(song_id, quality)
     }
 }
 
 /// CDN 期望的 Referer。放在 Provider 旁边，因为这是"平台的事实"，
 /// 不是"传输层的事实"。
 pub const REFERER: &str = "https://music.163.com/";
+
+pub use resolve::prepare_play_url;
+
+/// 匿名播放地址。曲库扫描只拼这个字符串，不发网络请求。
+pub fn anonymous_media_url(song_id: &str) -> Option<String> {
+    if song_id.is_empty() || song_id.len() > 20 || !song_id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(alloc::format!(
+        "https://music.163.com/song/media/outer/url?id={song_id}.mp3"
+    ))
+}
 pub const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
      Chrome/120.0.0.0 Safari/537.36";

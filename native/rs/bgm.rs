@@ -335,10 +335,19 @@ fn open_online(url: String, referer: String, duration_ms: i64, token: u32) {
     if !crate::media::source::remote::token_current(token) {
         return;
     }
+    /*
+     * 匿名 outer/url 先问一次 weapi，拿到 CDN 直链再开流。
+     * 问失败就用原来的地址，00.88 那条已经播完的链不能回退。
+     * 这一步在音频线程起来之前，而且上一首的流已经关掉。
+     */
+    let (url, referer) = crate::media::provider::netease::prepare_play_url(&url, &referer);
+    if !crate::media::source::remote::token_current(token) {
+        return;
+    }
     if let Err(e) =
         crate::media::source::remote::open_remote(&url, &referer, duration_ms, token)
     {
-        log::append(&format!("bgm: 在线打开失败 {:?} {url}", e));
+        log::append(&format!("bgm: 在线打开失败 {:?}", e));
         return;
     }
     /* 排障面包屑：这条链每一步单独记一行，崩了就知道停在哪一步（用完可删）。 */

@@ -84,6 +84,19 @@ int yhttp_probe(const char *url, const char *range, const char *referer,
                 unsigned char *out, int out_cap, yhttp_result *res);
 
 /*
+ * 一次 POST，给网易云 weapi 用。不走流式窗口，也不装载根证书
+ * （装载会拆掉正在用的网络栈）。
+ *
+ * 成功拿到响应时返回读到的字节数（>=0），并把 HTTP 状态码写进 *status_out。
+ * 连接失败返回负的 Vita 错误码。`body` 按 body_len 发送，不必以 NUL 结尾之外
+ * 还保证里面没有提前的 0（表单是 ASCII）。
+ */
+int yhttp_post(const char *url, const char *body, int body_len,
+               const char *referer, const char *cookie,
+               unsigned char *out, int out_cap, int *status_out,
+               char *set_cookie, int set_cookie_cap);
+
+/*
  * 取消测试（§24）：在工作线程里发起请求，主线程等它真的在传数据之后调用
  * sceHttpAbortRequest()，并报告被阻塞的传输究竟多快停下。
  */

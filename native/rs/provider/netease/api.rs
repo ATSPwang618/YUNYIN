@@ -40,30 +40,132 @@ pub struct Call {
 }
 
 impl Call {
+    /// 播放地址。`encodeType` 用 mp3（无损档才问 flac）：匿名状态下
+    /// `standard` + mp3 拿回来的就是真机已经整曲播完的那份文件。
     pub fn url_quality(song_id: &str, quality: Quality, level: &str) -> Self {
         use alloc::string::String;
         use alloc::vec;
+        let encode = match quality {
+            Quality::Lossless => "flac",
+            _ => "mp3",
+        };
         Self {
             path: PATH_SONG_URL_V1,
             flavour: Flavour::WeApi,
             params: vec![
-                (String::from("ids"), alloc::format!("[{}]", song_id)),
+                (String::from("ids"), alloc::format!("[{song_id}]")),
                 (String::from("level"), String::from(level)),
-                (String::from("encodeType"), String::from("aac")),
-                (String::from("_q"), String::from(quality_id(quality))),
+                (String::from("encodeType"), String::from(encode)),
+                (String::from("csrf_token"), String::from("")),
             ],
         }
     }
 }
 
-fn quality_id(q: Quality) -> &'static str {
-    super::quality_id(q)
+/// 发一次 weapi。歌曲地址只在打开线程里调用；扫码登录在自己的线程里调用。
+/// 曲库扫描不能走这里。失败就让调用方退回匿名 `outer/url`。
+pub fn call(c: &Call) -> Result<alloc::string::String, ProviderError> {
+    if c.flavour != Flavour::WeApi {
+        return Err(ProviderError::Unsupported);
+    }
+    let payload = super::crypto::encrypt_weapi(&c.params).map_err(|_| ProviderError::Unsupported)?;
+    let (body, _) = post_payload(c.path, &payload, &super::login::api_cookie())?;
+    Ok(body)
 }
 
-/// 真正发一次调用。Phase 3 用 `net::http` 补上；Provider 不直接调它，由
-/// `resolve` 调。
-pub fn call(_c: &Call) -> Result<alloc::string::String, ProviderError> {
-    Err(ProviderError::Unsupported)
+/// `path` 用 `/api/...`，这里改成 `/weapi/...`。第二个返回值是 Set-Cookie，不写日志。
+pub fn post_weapi(
+    path: &str,
+    json: &str,
+    cookie: &str,
+) -> Result<(alloc::string::String, alloc::string::String), ProviderError> {
+    let secret = super::crypto::random_secret();
+    let payload =
+        super::crypto::encrypt_weapi_json(json, &secret).map_err(|_| ProviderError::Unsupported)?;
+    post_payload(path, &payload, cookie)
+}
+
+fn post_payload(
+    path: &str,
+    payload: &super::crypto::Payload,
+    cookie: &str,
+) -> Result<(alloc::string::String, alloc::string::String), ProviderError> {
+    let enc = payload.enc_sec_key.clone().unwrap_or_default();
+    let body = alloc::format!(
+        "params={}&encSecKey={enc}",
+        super::crypto::form_escape(&payload.params)
+    );
+    let url = weapi_url(path);
+    let cookie = if cookie.is_empty() { "os=pc" } else { cookie };
+    post_form(&url, &body, cookie)
+}
+
+fn weapi_url(path: &str) -> alloc::string::String {
+    let path = path.replacen("/api/", "/weapi/", 1);
+    alloc::format!("{HOST}{path}")
+}
+
+fn post_form(
+    url: &str,
+    body: &str,
+    cookie: &str,
+) -> Result<(alloc::string::String, alloc::string::String), ProviderError> {
+    use alloc::string::String;
+    use alloc::vec;
+    use std::ffi::CString;
+
+    let Ok(c_url) = CString::new(url) else {
+        return Err(ProviderError::Network(String::from("bad url")));
+    };
+    let Ok(c_ref) = CString::new("https://music.163.com/") else {
+        return Err(ProviderError::Network(String::from("bad referer")));
+    };
+    let Ok(c_cookie) = CString::new(cookie) else {
+        return Err(ProviderError::Network(String::from("bad cookie")));
+    };
+    let mut buf = vec![0u8; 16384];
+    let mut set_cookie = vec![0u8; 4096];
+    let mut status: i32 = 0;
+    let n = unsafe {
+        yhttp_post(
+            c_url.as_ptr(),
+            body.as_ptr(),
+            body.len() as i32,
+            c_ref.as_ptr(),
+            c_cookie.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len() as i32,
+            &mut status,
+            set_cookie.as_mut_ptr(),
+            set_cookie.len() as i32,
+        )
+    };
+    if n < 0 {
+        return Err(ProviderError::Network(alloc::format!("post {n}")));
+    }
+    if status != 200 {
+        return Err(ProviderError::Network(alloc::format!("status {status}")));
+    }
+    let n = (n as usize).min(buf.len());
+    let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+    let cookie_n = set_cookie.iter().position(|b| *b == 0).unwrap_or(set_cookie.len());
+    let cookie_text = String::from_utf8_lossy(&set_cookie[..cookie_n]).into_owned();
+    Ok((text, cookie_text))
+}
+
+extern "C" {
+    fn yhttp_post(
+        url: *const i8,
+        body: *const u8,
+        body_len: i32,
+        referer: *const i8,
+        cookie: *const i8,
+        out: *mut u8,
+        out_cap: i32,
+        status_out: *mut i32,
+        set_cookie: *mut u8,
+        set_cookie_cap: i32,
+    ) -> i32;
 }
 
 /// 留着给以后的 Provider 自证实现了那条接缝。

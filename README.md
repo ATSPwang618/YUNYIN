@@ -161,10 +161,15 @@ https://music.163.com/
 - 一首放完自动下一首、L/R 切歌、暂停/继续；
 - 断网/请求失败会退避重试，恢复后接着放（连续 4 次失败才判定这条流坏了）。
 
-还没有做的（任务书 Phase 3–5）：
+还没有做的（任务书后半段）：
 
-- weapi/eapi 加密接口、账号登录、歌单、歌词 —— 现在只走"匿名 outer/url"这一条链；
-- 界面上的在线曲库/缓冲状态提示（现在这些信息在日志里）。
+- 登录之后的歌单、歌词接口；
+- 界面上的缓冲进度（失败时日志里有 `netease: weapi …` / `登录失败`）。
+
+00.90：`netease.ids` 进曲库。点播放时打开线程用 weapi 要 CDN 直链，失败退回 `outer/url`。
+设置页「登录」走扫码（unikey → 屏幕二维码 → 801/802/803）。只有登录成功才把 Cookie
+写进 `ux0:/data/yunyin/store/netease_cookie`。列表页是本地目录，专辑里的「在线歌曲」是云端。
+这版还没上机。
 
 ## 代码结构
 
@@ -212,8 +217,8 @@ wsl -d pocket-ubuntu -u root bash -lc 'cd /mnt/d/AI-PSVITA/yunyin && python3 scr
 wsl -d pocket-ubuntu -u root bash /mnt/d/AI-PSVITA/yunyin/scripts/build-variants.sh
 ```
 
-- 版本号（`param.sfo` 里的 `APP_VER`，VitaShell 里能看到）在 `scripts/build-vpk.py` 顶部，默认 `00.88`；
-  也可以用环境变量覆盖：`YUNYIN_APP_VER=00.90`。**日志第一行也会写版本号**，方便确认机上跑的是哪一版。
+- 版本号（`param.sfo` 里的 `APP_VER`，VitaShell 里能看到）在 `scripts/build-vpk.py` 顶部，默认 `00.90`；
+  也可以用环境变量覆盖：`YUNYIN_APP_VER=00.91`。**日志第一行也会写版本号**，方便确认机上跑的是哪一版。
 - PocketJS 装在别的地方：`POCKETJS_ROOT=/你的路径 python3 scripts/build-vpk.py`。
 - 流式字库 `fonts/chinese/cjk.pjfa` 由 `scripts/bake-cjk-archive.ts` 烘出来，构建时会直接用缓存；
   换了字体或改了 `fonts/chinese/cjk-stream.txt`，把这个文件删掉让它重烘。
@@ -227,9 +232,9 @@ wsl -d pocket-ubuntu -u root bash /mnt/d/AI-PSVITA/yunyin/scripts/build-variants
 | 0 | 网络冒烟测试（HTTPS / Range 206 / 证书校验 / 取消 / 内存池） | ✅ 完成（00.71 真机九项全过） |
 | 1 | 解码器 IO 抽象 `yp_io`（六个格式走同一组回调） | ✅ 完成（00.72 真机六格式全过） |
 | 2 | `HttpRangeSource` 在线播放（双窗口预取 / Gate / 重试） | ✅ **完成**（00.88 真机整曲播完） |
-| 3 | `NetEaseProvider`：`songId → 可播地址`（weapi/eapi 加密 + URL 缓存） | 🔄 匿名 `outer/url` 已通，加密接口待做 |
-| 4 | 账号 / 歌单 / 歌词 | 待开始 |
-| 5 | 在线 UI（在线曲库、缓冲状态、失败提示进界面） | 待开始 |
+| 3 | `NetEaseProvider`：`songId → 可播地址`（weapi + URL 缓存） | 🔄 00.90 已接，失败回退 outer/url；**还没上机** |
+| 4 | 扫码登录 / 歌单 / 歌词 | 🔄 扫码与 Cookie 已接（00.90，未上机）；歌单、歌词未做 |
+| 5 | 在线 UI（本地 / 云端分栏、登录、缓冲状态） | 🔄 文案与登录页已进 `app.tsx`；缓冲条还没有 |
 
 排障全过程（6 个平台特有的坑：并发写日志、回调表生命周期、Gate 死锁……）
 记在 [docs/重构计划.md](docs/重构计划.md) 第八节，值得以后动网络/音频线程前先看一遍。

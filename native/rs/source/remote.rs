@@ -378,6 +378,7 @@ pub fn url() -> String {
 /* ------------------------------------------------------- 真机测试开关 -- */
 
 const NETPLAY_FILE: &str = "ux0:data/yunyin/netplay.url";
+const NETEASE_IDS_FILE: &str = "ux0:data/yunyin/netease.ids";
 
 /*
  * 在线曲目清单。
@@ -411,12 +412,24 @@ fn url_id_hint(url: &str) -> String {
     digits
 }
 
-/// 读 `netplay.url` 并把每首歌整理成一条记录（文件不存在 = 空）。
+/// 读 `netplay.url` 和 `netease.ids`。两个文件互相独立：
+/// 只有其中一个时也能列出歌。这里只读卡，不发 HTTP（界面线程会进来）。
 pub fn netplay_tracks() -> Vec<NetplayTrack> {
-    let Ok(text) = std::fs::read_to_string(NETPLAY_FILE) else {
-        return Vec::new();
-    };
     let mut out: Vec<NetplayTrack> = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(NETPLAY_FILE) {
+        parse_netplay(&text, &mut out);
+    }
+    if let Ok(text) = std::fs::read_to_string(NETEASE_IDS_FILE) {
+        for track in parse_netease_ids(&text) {
+            if !out.iter().any(|t| t.url == track.url) {
+                out.push(track);
+            }
+        }
+    }
+    out
+}
+
+fn parse_netplay(text: &str, out: &mut Vec<NetplayTrack>) {
     let mut block: Vec<String> = Vec::new();
     let flush = |block: &mut Vec<String>, out: &mut Vec<NetplayTrack>| {
         if block.is_empty() {
@@ -430,12 +443,17 @@ pub fn netplay_tracks() -> Vec<NetplayTrack> {
             if id.is_empty() {
                 String::from("[在线] 网络歌曲")
             } else {
-                format!("[在线] {}", id)
+                format!("[在线] {id}")
             }
         } else {
             title
         };
         if url.starts_with("http://") || url.starts_with("https://") {
+            let referer = if referer.is_empty() {
+                default_referer(&url)
+            } else {
+                referer
+            };
             out.push(NetplayTrack { url, referer, title });
         }
         block.clear();
@@ -443,28 +461,68 @@ pub fn netplay_tracks() -> Vec<NetplayTrack> {
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() {
-            flush(&mut block, &mut out); /* 空行 = 一首歌结束 */
+            flush(&mut block, out);
             continue;
         }
         if line.starts_with('#') {
-            continue; /* 注释行 */
+            continue;
         }
         block.push(String::from(line));
         if block.len() == 3 {
-            flush(&mut block, &mut out);
+            flush(&mut block, out);
         }
     }
-    flush(&mut block, &mut out);
+    flush(&mut block, out);
+}
+
+/// `netease.ids`：一行一个歌曲 ID，后面可以跟显示名。拼成匿名 outer/url。
+fn parse_netease_ids(text: &str) -> Vec<NetplayTrack> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(id) = parts.next() else { continue };
+        let Some(url) = crate::media::provider::netease::anonymous_media_url(id) else {
+            continue;
+        };
+        let rest: Vec<&str> = parts.collect();
+        let title = if rest.is_empty() {
+            format!("[在线] {id}")
+        } else {
+            rest.join(" ")
+        };
+        out.push(NetplayTrack {
+            url,
+            referer: String::from(crate::media::provider::netease::REFERER),
+            title,
+        });
+    }
     out
+}
+
+fn default_referer(url: &str) -> String {
+    if url.contains("music.163.com") || url.contains("126.net") {
+        String::from(crate::media::provider::netease::REFERER)
+    } else {
+        String::new()
+    }
 }
 
 /// 这首歌要用哪个 Referer（按 URL 查；没有就返回空串）。
 pub fn referer_for(url: &str) -> String {
-    netplay_tracks()
+    let found = netplay_tracks()
         .into_iter()
         .find(|t| t.url == url)
         .map(|t| t.referer)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if found.is_empty() {
+        default_referer(url)
+    } else {
+        found
+    }
 }
 
 /// 给界面用的 JSON 清单：`[{"url":...,"title":...,"referer":...}]`。

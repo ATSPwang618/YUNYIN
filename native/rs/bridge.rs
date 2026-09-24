@@ -176,6 +176,42 @@ unsafe extern "C" fn js_net_probe(
     js_str(ctx, &guarded("net_probe", String::new(), crate::media::net::probe::state_json))
 }
 
+unsafe extern "C" fn js_qr_start(
+    _ctx: *mut JSContext,
+    _this: JSValue,
+    _argc: i32,
+    _argv: *mut JSValue,
+) -> JSValue {
+    guarded("qr_start", (), crate::media::provider::netease::login::start);
+    JS_UNDEFINED
+}
+
+unsafe extern "C" fn js_qr_state(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    _argc: i32,
+    _argv: *mut JSValue,
+) -> JSValue {
+    js_str(
+        ctx,
+        &guarded(
+            "qr_state",
+            String::from("{\"phase\":\"fail\",\"hint\":\"\",\"tex\":-1}"),
+            crate::media::provider::netease::login::state_json,
+        ),
+    )
+}
+
+unsafe extern "C" fn js_qr_logout(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    _argc: i32,
+    _argv: *mut JSValue,
+) -> JSValue {
+    guarded("qr_logout", (), crate::media::provider::netease::login::logout);
+    JS_NewInt32(ctx, 0)
+}
+
 /// 卡里 `ux0:/data/yunyin/netplay.url` 描述的在线曲目清单。
 ///
 /// 界面拿它把在线歌**当成曲库里的独立条目**显示（自己的专辑「在线歌曲」），
@@ -264,6 +300,9 @@ pub unsafe fn install(ctx: *mut JSContext, global: JSValue) {
     add_fn(ctx, obj, b"setPsLock\0", js_set_ps_lock, 1);
     add_fn(ctx, obj, b"netProbe\0", js_net_probe, 0);
     add_fn(ctx, obj, b"netplay\0", js_netplay, 0);
+    add_fn(ctx, obj, b"qrStart\0", js_qr_start, 0);
+    add_fn(ctx, obj, b"qrState\0", js_qr_state, 0);
+    add_fn(ctx, obj, b"qrLogout\0", js_qr_logout, 0);
     add_fn(ctx, obj, b"store_get\0", js_store_get, 1);
     add_fn(ctx, obj, b"store_set\0", js_store_set, 2);
     JS_SetPropertyStr(ctx, global, c"vitaMedia".as_ptr(), obj);

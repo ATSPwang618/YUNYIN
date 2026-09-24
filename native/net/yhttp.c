@@ -490,6 +490,114 @@ done:
     return res->err_code;
 }
 
+static void yh_collect_cookies(const char *headers, unsigned int size,
+                               char *out, int cap) {
+    unsigned int i = 0;
+    int used = 0;
+    if (!out || cap < 2) return;
+    out[0] = 0;
+    if (!headers || size == 0) return;
+    while (i < size) {
+        unsigned int line_start = i;
+        unsigned int line_end = i;
+        unsigned int v, vend;
+        int n;
+        while (line_end < size && headers[line_end] != '\n' &&
+               headers[line_end] != '\r')
+            line_end++;
+        n = (int)(line_end - line_start);
+        if (n > 10 && headers[line_start + 10] == ':' &&
+            strncasecmp(headers + line_start, "set-cookie", 10) == 0) {
+            v = line_start + 11;
+            while (v < line_end && (headers[v] == ' ' || headers[v] == '\t')) v++;
+            vend = v;
+            while (vend < line_end && headers[vend] != ';') vend++;
+            n = (int)(vend - v);
+            if (n > 0 && used + n + 3 < cap) {
+                if (used > 0) {
+                    out[used++] = ';';
+                    out[used++] = ' ';
+                }
+                memcpy(out + used, headers + v, (size_t)n);
+                used += n;
+                out[used] = 0;
+            }
+        }
+        if (line_end == i) break;
+        i = line_end;
+        while (i < size && (headers[i] == '\r' || headers[i] == '\n')) i++;
+    }
+}
+
+/*
+ * weapi 用的 POST。和探针分开写，避免改到已经真机验过的 GET / 流式路径。
+ * 不调用 yh_load_system_ca()：那会 sceHttpTerm 再 Init，把在线流的请求拆掉。
+ * set_cookie 只抄 Set-Cookie 的名值，按长度限界，不打印。
+ */
+int yhttp_post(const char *url, const char *body, int body_len,
+               const char *referer, const char *cookie,
+               unsigned char *out, int out_cap, int *status_out,
+               char *set_cookie, int set_cookie_cap) {
+    int tmpl = -1, conn = -1, req = -1;
+    char *headers = NULL;
+    unsigned int headers_size = 0;
+    int status = 0;
+    int got = 0;
+    int ret = -1;
+
+    if (status_out) *status_out = 0;
+    if (set_cookie && set_cookie_cap > 0) set_cookie[0] = 0;
+    if (!url || !*url || !body || body_len < 0) return -1;
+    if (yhttp_init() < 0) return -1;
+
+    tmpl = sceHttpCreateTemplate(YHTTP_USER_AGENT, SCE_HTTP_VERSION_1_1,
+                                 SCE_HTTP_PROXY_AUTO);
+    if (tmpl < 0) return tmpl;
+    conn = sceHttpCreateConnectionWithURL(tmpl, url, 0);
+    if (conn < 0) { ret = conn; goto done; }
+    req = sceHttpCreateRequestWithURL(conn, SCE_HTTP_METHOD_POST, url,
+                                      (unsigned long long)body_len);
+    if (req < 0) { ret = req; goto done; }
+
+    sceHttpSetAutoRedirect(req, 1);
+    sceHttpSetResolveTimeOut(req, YHTTP_RESOLVE_TIMEOUT_US);
+    sceHttpSetConnectTimeOut(req, YHTTP_CONNECT_TIMEOUT_US);
+    sceHttpSetRecvTimeOut(req, YHTTP_RECV_TIMEOUT_US);
+    sceHttpSetResponseHeaderMaxSize(req, YHTTP_HEADER_MAX);
+    sceHttpAddRequestHeader(req, "Content-Type",
+                            "application/x-www-form-urlencoded",
+                            SCE_HTTP_HEADER_ADD);
+    if (referer && *referer)
+        sceHttpAddRequestHeader(req, "Referer", referer, SCE_HTTP_HEADER_ADD);
+    if (cookie && *cookie)
+        sceHttpAddRequestHeader(req, "Cookie", cookie, SCE_HTTP_HEADER_ADD);
+
+    ret = sceHttpSendRequest(req, body, (unsigned int)body_len);
+    if (ret < 0) goto done;
+    ret = sceHttpGetStatusCode(req, &status);
+    if (ret < 0) goto done;
+    if (status_out) *status_out = status;
+    if (sceHttpGetAllResponseHeaders(req, &headers, &headers_size) >= 0 && headers)
+        yh_collect_cookies(headers, headers_size, set_cookie, set_cookie_cap);
+
+    if (out && out_cap > 0) {
+        while (got < out_cap) {
+            ret = sceHttpReadData(req, out + got, (unsigned int)(out_cap - got));
+            if (ret == 0) break;
+            if (ret < 0) goto done;
+            got += ret;
+        }
+    }
+    yh_logf("yhttp: post status=%d bytes=%d\n", status, got);
+    ret = got;
+
+done:
+    if (req >= 0) sceHttpDeleteRequest(req);
+    if (conn >= 0) sceHttpDeleteConnection(conn);
+    if (tmpl >= 0) sceHttpDeleteTemplate(tmpl);
+    return ret;
+}
+
 /* ------------------------------------------------------------ 流式读取 -- */
 
 struct yhttp_stream {
@@ -1057,6 +1165,16 @@ int yhttp_abort_probe(const char *url, const char *referer, int tls_mode,
     return -1;
 }
 
+int yhttp_post(const char *url, const char *body, int body_len,
+               const char *referer, const char *cookie,
+               unsigned char *out, int out_cap, int *status_out,
+               char *set_cookie, int set_cookie_cap) {
+    (void)url; (void)body; (void)body_len; (void)referer; (void)cookie;
+    (void)out; (void)out_cap; (void)set_cookie; (void)set_cookie_cap;
+    if (status_out) *status_out = 0;
+    if (set_cookie && set_cookie_cap > 0) set_cookie[0] = 0;
+    return -1;
+}
 int yhttp_load_ca(void) { return -1; }
 unsigned int yhttp_ca_http_pool(void) { return 0; }
 unsigned int yhttp_ca_ssl_pool(void) { return 0; }

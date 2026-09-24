@@ -20,6 +20,8 @@ use alloc::vec::Vec;
 
 /// 比"真的过期"提前这么多就重新解析。
 pub const EXPIRY_MARGIN_MS: u64 = 3 * 60 * 1000;
+/// CDN 地址大约还能用十几分钟。缓存短一点，长队列不会走到最后才发现链接死了。
+const URL_TTL_MS: u64 = 12 * 60 * 1000;
 
 #[derive(Clone, Debug)]
 pub struct CachedUrl {
@@ -44,6 +46,12 @@ pub struct UrlCache {
 }
 
 impl UrlCache {
+    pub const fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
     pub fn get(&self, song_id: &str, quality: Quality, now_ms: u64) -> Option<&CachedUrl> {
         self.entries
             .iter()
@@ -91,12 +99,184 @@ pub fn to_audio_info(
     }
 }
 
-/// Phase 3：调 API 并组装条目。作为唯一入口，让 §52 的"重试策略"只存在一处。
+/// Phase 3：调 weapi，把 CDN 地址放进缓存。失败由调用方退回 outer/url。
 pub fn resolve(
     song_id: &str,
     quality: Quality,
-    _cache: &mut UrlCache,
+    cache: &mut UrlCache,
 ) -> Result<AudioInfo, ProviderError> {
-    let _ = api::Call::url_quality(song_id, quality, super::quality_id(quality));
-    Err(ProviderError::Unsupported)
+    if !song_id.bytes().all(|b| b.is_ascii_digit()) || song_id.is_empty() || song_id.len() > 20 {
+        return Err(ProviderError::NotFound);
+    }
+    let now = now_ms();
+    if let Some(hit) = cache.get(song_id, quality, now) {
+        return Ok(to_audio_info(
+            song_id,
+            quality,
+            &hit.url,
+            hit.size,
+            hit.bitrate,
+            0,
+            hit.expires_at_ms,
+            Some(AudioFormat::Mp3),
+        ));
+    }
+    let level = super::quality_id(quality);
+    let raw = api::call(&api::Call::url_quality(song_id, quality, level))?;
+    let parsed = parse_song_url(&raw).ok_or(ProviderError::NotFound)?;
+    let expires = now.saturating_add(URL_TTL_MS);
+    cache.put(CachedUrl {
+        song_id: String::from(song_id),
+        quality,
+        url: parsed.url.clone(),
+        size: parsed.size,
+        bitrate: parsed.bitrate,
+        expires_at_ms: expires,
+    });
+    let format = match parsed.kind.as_str() {
+        "mp3" => Some(AudioFormat::Mp3),
+        "m4a" | "aac" => Some(AudioFormat::M4a),
+        "flac" => Some(AudioFormat::Flac),
+        _ => None,
+    };
+    Ok(to_audio_info(
+        song_id,
+        quality,
+        &parsed.url,
+        parsed.size,
+        parsed.bitrate,
+        0,
+        expires,
+        format,
+    ))
+}
+
+/// 打开线程用的入口：有缓存就复用，没有就问一次 weapi。
+pub fn fetch(song_id: &str, quality: Quality) -> Result<AudioInfo, ProviderError> {
+    let mut guard = cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    resolve(song_id, quality, &mut guard)
+}
+
+/// 只升级网易云匿名 `outer/url`。其它地址原样返回。
+/// weapi 失败（没网、参数被拒、响应里没有 url）时退回原来的地址，
+/// 匿名播放不能因为这次解析失败而比 00.88 更差。
+pub fn prepare_play_url(url: &str, referer: &str) -> (String, String) {
+    let referer_out = if referer.is_empty() && is_netease_host(url) {
+        String::from(super::REFERER)
+    } else {
+        String::from(referer)
+    };
+    let Some(id) = outer_song_id(url) else {
+        return (String::from(url), referer_out);
+    };
+    match fetch(&id, Quality::Low) {
+        Ok(info) if info.url.starts_with("http://") || info.url.starts_with("https://") => {
+            crate::media::platform::log::append("netease: weapi 拿到播放地址，改走 CDN");
+            (info.url, String::from(super::REFERER))
+        }
+        Ok(_) => {
+            crate::media::platform::log::append("netease: weapi 没有可播地址，继续 outer/url");
+            (String::from(url), referer_out)
+        }
+        Err(_) => {
+            crate::media::platform::log::append("netease: weapi 失败，继续 outer/url");
+            (String::from(url), referer_out)
+        }
+    }
+}
+
+fn cache() -> &'static std::sync::Mutex<UrlCache> {
+    static CACHE: std::sync::Mutex<UrlCache> = std::sync::Mutex::new(UrlCache::empty());
+    &CACHE
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn is_netease_host(url: &str) -> bool {
+    url.contains("music.163.com") || url.contains("126.net")
+}
+
+fn outer_song_id(url: &str) -> Option<String> {
+    if !url.contains("music.163.com/song/media/outer/url") {
+        return None;
+    }
+    let after = url.split("id=").nth(1)?;
+    let id: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if id.is_empty() || id.len() > 20 {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+struct ParsedUrl {
+    url: String,
+    size: Option<u64>,
+    bitrate: u32,
+    kind: String,
+}
+
+fn parse_song_url(json: &str) -> Option<ParsedUrl> {
+    let url = json_string(json, "url")?;
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return None;
+    }
+    Some(ParsedUrl {
+        url,
+        size: json_u64(json, "size"),
+        bitrate: json_u64(json, "br").unwrap_or(0) as u32,
+        kind: json_string(json, "type").unwrap_or_default(),
+    })
+}
+
+pub(crate) fn json_i32(json: &str, key: &str) -> Option<i32> {
+    let pat = alloc::format!("\"{key}\":");
+    let i = json.find(&pat)?;
+    let rest = json[i + pat.len()..].trim_start();
+    let neg = rest.starts_with('-');
+    let body = if neg { &rest[1..] } else { rest };
+    let digits: String = body.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let n: i32 = digits.parse().ok()?;
+    Some(if neg { -n } else { n })
+}
+
+pub(crate) fn json_string(json: &str, key: &str) -> Option<String> {
+    let pat = alloc::format!("\"{key}\":\"");
+    let i = json.find(&pat)?;
+    let rest = &json[i + pat.len()..];
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(n) = chars.next() {
+                out.push(n);
+            }
+        } else if c == '"' {
+            break;
+        } else {
+            out.push(c);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn json_u64(json: &str, key: &str) -> Option<u64> {
+    let pat = alloc::format!("\"{key}\":");
+    let i = json.find(&pat)?;
+    let rest = json[i + pat.len()..].trim_start();
+    if rest.starts_with("null") {
+        return None;
+    }
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() { None } else { digits.parse().ok() }
 }

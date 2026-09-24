@@ -53,6 +53,9 @@ type VitaMedia = {
   /* 在线曲目清单（卡里 ux0:/data/yunyin/netplay.url 描述的歌），
    * 返回 [{"url":..,"title":..,"referer":..}]；没有这个文件时是 "[]"。 */
   netplay?: () => string;
+  qrStart?: () => void;
+  qrState?: () => string;
+  qrLogout?: () => void;
   setPsLock?: (on: boolean) => number;
   logEnabled?: () => number;
   store_get?: (key: string) => string;
@@ -430,6 +433,68 @@ const SKINS: Record<UiSkin, SkinMap> = {
 const [uiTheme, setUiTheme] = createSignal<UiSkin>("dark");
 const useSkin = (): SkinMap => SKINS[uiTheme()];
 
+/* 扫码登录状态。HTTP 在原生线程里，这里只读 vitaMedia.qrState。 */
+const [qrPhase, setQrPhase] = createSignal("idle");
+const [qrHint, setQrHint] = createSignal("未登录");
+const [qrImage, setQrImage] = createSignal("");
+let qrTexSeen = -2;
+
+function pullQrState(): void {
+  const api = media();
+  if (!api || !api.qrState) {
+    setQrPhase("fail");
+    setQrHint("真机可扫码，电脑预览没有接口");
+    setQrImage("");
+    return;
+  }
+  let raw = "";
+  try {
+    raw = api.qrState() || "";
+  } catch {
+    return;
+  }
+  let parsed: { phase?: string; hint?: string; tex?: number } = {};
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (parsed.phase) setQrPhase(parsed.phase);
+  if (typeof parsed.hint === "string") setQrHint(parsed.hint);
+  if (typeof parsed.tex === "number" && parsed.tex >= 0 && parsed.tex !== qrTexSeen) {
+    try {
+      registerTexture("yunyin-qr", parsed.tex);
+      qrTexSeen = parsed.tex;
+      setQrImage("yunyin-qr");
+    } catch {
+      setQrImage("");
+    }
+  }
+}
+
+function beginQr(): void {
+  setQrImage("");
+  qrTexSeen = -2;
+  try {
+    media()?.qrStart?.();
+  } catch {
+    /* 电脑上的 playground 没有这个方法 */
+  }
+  pullQrState();
+}
+
+function logoutQr(): void {
+  try {
+    media()?.qrLogout?.();
+  } catch {
+    /* ignore */
+  }
+  setQrImage("");
+  qrTexSeen = -2;
+  pullQrState();
+  beginQr();
+}
+
 /* 主题化文字色：dark 皮肤上文字要浅色，light 上深色。 */
 const isDarkish = () => uiTheme() !== "light";
 /* 只有 dark 主题把面板/卡片也做成深色（其余主题面板仍是浅色），故面板文字以此判定。 */
@@ -457,9 +522,9 @@ const PANEL_TXT = THEME_COLORS.ui as Record<UiSkin, Record<string, string>>;
 const pTxt = (key: string) => PANEL_TXT[uiTheme()][key] ?? "";
 
 /* 软件版本：About 页展示，和 param.sfo APP_VER 00.63 对齐。 */
-const APP_VERSION = "0.88";
+const APP_VERSION = "0.90";
 /* param.sfo 里的 APP_VER（VitaShell 里显示的那串），和 APP_VERSION 一起改。 */
-const APP_VER_SFO = "00.88";
+const APP_VER_SFO = "00.90";
 const POCKETJS_VERSION = "0.12.0";
 
 type CjkMode = "baked" | "stream";
@@ -1490,7 +1555,7 @@ export default function Music() {
   const [lyricsClosing, setLyricsClosing] = createSignal(false);
   /* 设置页里的子页面：about（关于）/ keys（按键说明）/ null（没开）。
    * 两者共用同一套进出动画和"△ 返回"，都只是一页静态文字。 */
-  const [subPage, setSubPage] = createSignal<"about" | "keys" | null>(null);
+  const [subPage, setSubPage] = createSignal<"about" | "keys" | "login" | null>(null);
   const [subClosing, setSubClosing] = createSignal(false);
 
   const [listCursor, setListCursor] = createSignal(0);
@@ -1664,7 +1729,7 @@ export default function Music() {
     const currentScreen = screen();
 
     if (currentScreen === "list") {
-      return tracks().map((song) => song.id);
+      return tracks().filter((song) => !song.online).map((song) => song.id);
     }
 
     if (currentScreen === "loved") {
@@ -2150,10 +2215,12 @@ export default function Music() {
     }
 
     if (index === 1) {
-      /* KEYS：按键操作说明（和 About 一样的静态文字页，△ 返回）。 */
-      setSubPage("keys");
+      /* 登录：网易云扫码。已登录就只看状态，○ 再退出重扫。 */
+      setSubPage("login");
       setSubClosing(false);
       focusContent();
+      pullQrState();
+      if (qrPhase() !== "ok") beginQr();
       return;
     }
 
@@ -2215,6 +2282,11 @@ export default function Music() {
     }
 
     if (screen() === "setting") {
+      if (subPage() === "login") {
+        if (qrPhase() === "ok") logoutQr();
+        else beginQr();
+        return;
+      }
       if (subPage()) {
         /* 子页面是纯文字，○ 在这里不做任何事（△ 返回）。 */
         return;
@@ -2507,6 +2579,10 @@ export default function Music() {
     if (displayOff()) return;
     frameCounter += 1;
 
+    if (screen() === "setting" && subPage() === "login" && frameCounter % 30 === 0) {
+      pullQrState();
+    }
+
     /* Native state() 约 10Hz；两次采样之间由 audioEngine 平滑预测。 */
     const snap = audioEngine.snapshot(frameCounter === 1);
 
@@ -2561,7 +2637,7 @@ export default function Music() {
       <View class="flex-row items-center justify-between h-6">
         <View class="flex-row items-center gap-1">
           <Text class={pTxt("brand")}>
-            YUNYIN
+            云音
           </Text>
         </View>
 
@@ -2693,8 +2769,8 @@ export default function Music() {
             {screen() === "list" && (
               <PageEnter dir={1}>
                 <MusicListPage
-                  title="ALL TRACKS"
-                  subtitle={`${tracks().length} SONGS`}
+                  title="本地音乐"
+                  subtitle="ux0:/data/yunyin/music"
                   trackIds={currentListTrackIds()}
                   getTrack={getTrack}
                   cursor={listCursor}
@@ -2721,8 +2797,8 @@ export default function Music() {
             {screen() === "album" && selectedAlbumId() !== null && (
               <PageEnter dir={1}>
                 <MusicListPage
-                  title={album()?.title ?? "ALBUM"}
-                  subtitle={`${album()?.trackIds.length ?? 0} TRACKS`}
+                  title={album()?.title ?? "专辑"}
+                  subtitle={`${album()?.trackIds.length ?? 0} 首`}
                   trackIds={currentListTrackIds()}
                   getTrack={getTrack}
                   cursor={listCursor}
@@ -2736,8 +2812,8 @@ export default function Music() {
             {screen() === "loved" && (
               <PageEnter dir={1}>
                 <MusicListPage
-                  title="LOVED TRACKS"
-                  subtitle={`${favorites().length} FAVORITES`}
+                  title="我喜欢"
+                  subtitle={`${favorites().length} 首`}
                   trackIds={currentListTrackIds()}
                   getTrack={getTrack}
                   cursor={listCursor}
@@ -2760,7 +2836,13 @@ export default function Music() {
                       focusContent();
                     }}
                   >
-                    {subPage() === "keys" ? <KeyGuidePage /> : <AboutPage />}
+                    {subPage() === "keys" ? (
+                      <KeyGuidePage />
+                    ) : subPage() === "login" ? (
+                      <LoginPage />
+                    ) : (
+                      <AboutPage />
+                    )}
                   </PageInOut>
                 ) : (
                   <SettingPage cursor={settingCursor} />
@@ -2774,10 +2856,10 @@ export default function Music() {
       {/* FOOTER */}
 
       <View class="flex-row items-center justify-between">
-      <Text class={pTxt("footer")}>○ SELECT</Text>
-      <Text class={pTxt("footer")}>△ BACK</Text>
-      <Text class={pTxt("footer")}>L PREV | R NEXT</Text>
-      <Text class={pTxt("footer")}>◎ MENU</Text>
+      <Text class={pTxt("footer")}>○ 确定</Text>
+      <Text class={pTxt("footer")}>△ 返回</Text>
+      <Text class={pTxt("footer")}>L/R 切歌</Text>
+      <Text class={pTxt("footer")}>◎ 菜单</Text>
       </View>
 
       {/* 息屏（Start）：一层纯黑遮罩盖住整个画面。屏幕其实还亮着，
@@ -3003,11 +3085,11 @@ function HomePage(props: {
 
             {/* STATUS + LYRICS — 合并成一行，给封面/进度留空 */}
             <View class="flex-row items-center gap-2">
-              <Text class={pTxt("label")}>MODE</Text>
+              <Text class={pTxt("label")}>{props.track().online ? "云端" : "本地"}</Text>
               <Text class={pTxt("status")}>
-                {props.playbackMode() === "sequence" ? "LIST" : "ONE"}
+                {props.playbackMode() === "sequence" ? "顺序" : "单曲"}
               </Text>
-              <Text class={pTxt("label")}>{props.favorite() ? "LOVED" : ""}</Text>
+              <Text class={pTxt("label")}>{props.favorite() ? "喜欢" : ""}</Text>
               <View class={lyricsButtonClass()}>
                 <Text
                   class={
@@ -3016,7 +3098,7 @@ function HomePage(props: {
                       : "text-xs text-slate-700 font-bold"
                   }
                 >
-                  LYRICS
+                  歌词
                 </Text>
               </View>
             </View>
@@ -3225,7 +3307,7 @@ function MusicListPage(props: {
             <Text
               class={current ? pTxt("navActive") : pTxt("listSub")}
             >
-              {current ? "PLAY" : ""}
+              {current ? "播放" : song.online ? "云端" : ""}
             </Text>
           </View>
         );
@@ -3287,8 +3369,8 @@ function AlbumGrid(props: {
     <View class="flex-col w-96 h-48">
       <View class="flex-row items-center justify-between h-7 px-2">
         <View class="flex-col">
-          <Text class={pTxt("listTitle")}>ALBUMS</Text>
-          <Text class={pTxt("listSub")}>YOUR MUSIC COLLECTION</Text>
+          <Text class={pTxt("listTitle")}>专辑</Text>
+          <Text class={pTxt("listSub")}>本地与云端</Text>
         </View>
         <Text class={pTxt("listSub")}>
           {props.cursor() + 1}/{props.albums().length}
@@ -3448,11 +3530,11 @@ function AboutPage() {
       <Image src={useSkin().aboutBg} class="absolute inset-0 w-full h-full" />
       <View class="relative flex-col w-96 h-48 p-3 gap-1">
         <View class="flex-row items-center justify-between h-7">
-          <Text class={pTxt("aboutTitle")}>ABOUT US</Text>
-          <Text class={pTxt("aboutSub")}>YUNYIN</Text>
+          <Text class={pTxt("aboutTitle")}>关于</Text>
+          <Text class={pTxt("aboutSub")}>云音</Text>
         </View>
         <View class="grow flex-col items-center justify-center gap-1">
-          <Text class={pTxt("aboutTitle")}>YUNYIN 云音 for vita</Text>
+          <Text class={pTxt("aboutTitle")}>云音 · 本地与网易云</Text>
           <Text class={pTxt("aboutSub")}>
             VER {APP_VERSION}  ·  APP {APP_VER_SFO}  ·  PJ {POCKETJS_VERSION}
           </Text>
@@ -3513,6 +3595,32 @@ function KeyGuidePage() {
   );
 }
 
+function LoginPage() {
+  return (
+    <View class="relative overflow-hidden flex-col w-96 h-48 p-3 gap-1 rounded-xl">
+      <Image src={useSkin().aboutBg} class="absolute inset-0 w-full h-full" />
+      <View class="relative flex-row items-center w-96 h-48 p-3 gap-2">
+        <View class="w-[120] h-[120] bg-white items-center justify-center rounded-xl">
+          <Show
+            when={qrImage()}
+            fallback={<Text class={pTxt("aboutSub")}>等待二维码</Text>}
+          >
+            <Image src={qrImage()} class="w-[112] h-[112]" />
+          </Show>
+        </View>
+        <View class="flex-col gap-1 w-[200]">
+          <Text class={pTxt("aboutTitle")}>网易云登录</Text>
+          <Text class={pTxt("aboutSub")}>{clip(qrHint(), 18)}</Text>
+          <Text class={pTxt("aboutSub")}>
+            {qrPhase() === "ok" ? "○ 退出并重扫" : "○ 刷新二维码"}
+          </Text>
+          <Text class={pTxt("aboutSub")}>△ 返回</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
 /* =========================================================
  * SETTINGS
  * ======================================================= */
@@ -3535,10 +3643,10 @@ function SettingPage(props: {
       <View class="relative flex-col w-96 h-48 p-2 gap-2">
         <View class="flex-row items-center justify-between h-7">
           <View class="flex-col">
-            <Text class={pTxt("setHeader")}>MUSIC SETTINGS</Text>
-            <Text class={pTxt("setSub")}>SYSTEM CONFIGURATION</Text>
+            <Text class={pTxt("setHeader")}>设置</Text>
+            <Text class={pTxt("setSub")}>本地目录与网易云</Text>
           </View>
-          <Text class={pTxt("setSub")}>4 OPTIONS</Text>
+          <Text class={pTxt("setSub")}>四项</Text>
         </View>
 
         <View class="flex-row items-center justify-center gap-3 grow">
@@ -3555,8 +3663,8 @@ function SettingPage(props: {
               )}
               {i === 1 && (
                 <>
-                  <Text class={props.cursor() === 1 ? pTxt("navActive") : pTxt("setTitle")}>KEYS</Text>
-                  <Text class={pTxt("setInfo")}>INFO</Text>
+                  <Text class={props.cursor() === 1 ? pTxt("navActive") : pTxt("setTitle")}>登录</Text>
+                  <Text class={pTxt("setInfo")}>扫码</Text>
                 </>
               )}
               {i === 2 && (

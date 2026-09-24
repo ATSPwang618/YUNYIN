@@ -62,7 +62,7 @@ pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_s
      * 版本号写进日志：真机排障时第一件事就是确认"跑的是哪一版"。
      * 以前只能靠行为猜，白花了整整一轮往返。
      */
-    log::append("yunyin: start (in-process BGM) 版本 00.88");
+    log::append("yunyin: start (in-process BGM) 版本 00.90");
     /*
      * 排障效率：开着日志时顺便开一个"把日志回给电脑"的小服务，
      * 电脑上 `curl http://<vita-ip>:1337/ -o yunyin.log` 就能取，
@@ -73,6 +73,7 @@ pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_s
     bgm::acquire_on_start();
     power::start();
     bridge::install(ctx, global);
+    crate::media::provider::netease::login::load_saved();
     cjk_host::install(ctx, global);
     /* Phase 0 network probe: inert unless the card asks for it
      * (ux0:/data/yunyin/netprobe.url or the debug flag). */
@@ -86,7 +87,7 @@ pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_s
     let online = source::remote::netplay_tracks().len();
     if online > 0 {
         log::append(&format!(
-            "remote: netplay.url 里有 {online} 首在线曲目，已交给界面显示（独立成组）"
+            "remote: 在线曲目 {online} 首（netplay.url / netease.ids），已交给界面显示"
         ));
     }
 }
