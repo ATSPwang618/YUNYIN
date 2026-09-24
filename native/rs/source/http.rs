@@ -362,16 +362,43 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                 ));
                 return false;
             }
-            if !w.pending && !w.inflight {
-                w.want_from = pos;
-                w.generation = w.generation.wrapping_add(1);
-                w.pending = true;
-                trace_f(|| format!("登记取数 pos={pos} generation={}", w.generation));
-                cv.notify_all();
-            }
+            Self::register_locked(&mut w, cv, pos);
             match cv.wait_timeout(w, deadline - now) {
                 Ok((g, _)) => w = g,
                 Err(e) => w = e.into_inner().0,
+            }
+        }
+    }
+
+    /// 登记一次取数需求（拿锁后再调）。
+    fn register_locked(w: &mut Window, cv: &Condvar, pos: u64) {
+        if w.pending || w.inflight || w.cancelled {
+            return;
+        }
+        w.want_from = pos;
+        w.generation = w.generation.wrapping_add(1);
+        w.pending = true;
+        trace_f(|| format!("登记取数 pos={pos} generation={}", w.generation));
+        cv.notify_all();
+    }
+
+    /*
+     * **主动补数据**：Gate 决定"先静音"时也要叫一次。
+     *
+     * 为什么必须这样（真机现象：在线歌播到第 12~16 秒卡死）：
+     *   第一个窗口 256 KiB 播完后，缓存剩余低于 Gate 的阈值 → Gate 只输出静音、
+     *   **不调解码器** → 解码器没机会要下一段 → 取数线程收不到任何登记 → 缓存
+     *   永远补不上 → 一直静音。也就是"没人拉数据，就永远没数据"的死锁。
+     *   所以静音这条路必须顺手把取数线程叫醒，让它去把窗口挪到当前位置。
+     */
+    pub fn prime(&self) {
+        let (lock, cv) = &*self.shared;
+        if let Ok(mut w) = lock.lock() {
+            let pos = self.pos;
+            let covered = pos >= w.start && pos < w.start + w.buf.len() as u64;
+            let ended = w.end_at.map_or(false, |e| pos >= e);
+            if !covered && !ended {
+                Self::register_locked(&mut w, cv, pos);
             }
         }
     }

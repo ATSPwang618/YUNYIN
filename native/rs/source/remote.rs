@@ -305,6 +305,15 @@ pub fn available() -> usize {
     }
 }
 
+/// 主动让取数线程去补数据（Gate 决定静音时调用，见 `HttpRangeSource::prime`）。
+pub fn prime() {
+    if let Ok(g) = REMOTE.lock() {
+        if let Some(src) = g.as_ref() {
+            src.prime();
+        }
+    }
+}
+
 pub fn is_eof() -> bool {
     match REMOTE.lock() {
         Ok(g) => match g.as_ref() {

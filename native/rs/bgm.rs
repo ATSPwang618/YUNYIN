@@ -43,6 +43,8 @@ static POS_MS: AtomicU32 = AtomicU32::new(0);
 static DUR_MS: AtomicU32 = AtomicU32::new(0);
 static RATE_HZ: AtomicU32 = AtomicU32::new(44100);
 static PATH_LEN: AtomicUsize = AtomicUsize::new(0);
+/* Gate 的静音状态：只为在日志里留一行"什么时候开始静音 / 什么时候恢复"。 */
+static GATE_SILENT: AtomicBool = AtomicBool::new(false);
 static PATH_BUF: Mutex<String> = Mutex::new(String::new());
 static WORKER: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 /*
@@ -93,10 +95,28 @@ fn audio_decode(buf: &mut [i16], frames: i32) {
      * Phase 2 的 Gate（任务书 §8/§65）：在线源缓存不够时只输出静音，
      * **不调解码器**。这样"网络暂时没数据"永远不会被解码器当成流结束，
      * 断网时表现是"卡住缓冲"，而不是"这首歌放完了"。
+     *
+     * 但静音这条路**必须顺手叫醒取数线程**（remote::prime）：否则就成了
+     * "没人拉数据 → 永远没数据 → 一直静音"的死锁 —— 真机上"在线歌播到十几秒
+     * 卡死"就是这个（第一窗播完、缓存低于阈值，取数线程再没被叫过）。
      */
     if !crate::media::source::remote::gate_ok() {
+        crate::media::source::remote::prime();
+        if !GATE_SILENT.swap(true, Ordering::AcqRel) {
+            /* 只记状态跳变那一次，不刷屏（音频线程上写日志现在是安全的：日志有锁）。 */
+            log::append(&format!(
+                "remote: 缓冲不足，先静音（剩 {} KB）",
+                crate::media::source::remote::available() / 1024
+            ));
+        }
         buf.fill(0);
         return;
+    }
+    if GATE_SILENT.swap(false, Ordering::AcqRel) {
+        log::append(&format!(
+            "remote: 缓冲恢复（{} KB）",
+            crate::media::source::remote::available() / 1024
+        ));
     }
     let got = decoder::decode(buf, frames);
     if got <= 0 {
