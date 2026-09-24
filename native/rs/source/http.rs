@@ -46,7 +46,19 @@ static TRACE_LINES: AtomicU32 = AtomicU32::new(0);
  * 排障只需要**打开阶段**的轨迹，之后留计数就够了：计数只是原子加，不拼字符串。
  */
 static TRACE_ON: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(true);
+    core::sync::atomic::AtomicBool::new(false);
+
+/// 逐条轨迹的开关文件：卡里放 `ux0:/data/yunyin/netdbg` 才开。
+///
+/// 默认关：在线播放阶段任何一处字符串格式化都可能踩到真机上那个坑
+/// （见 docs/网络探针实测.md §6.7），排障要用时再显式打开。
+const TRACE_FLAG: &str = "ux0:data/yunyin/netdbg";
+
+pub(crate) fn trace_enable_if_requested() {
+    if std::fs::metadata(TRACE_FLAG).is_ok() {
+        TRACE_ON.store(true, Ordering::Relaxed);
+    }
+}
 static COUNTERS: [AtomicU32; 6] = [
     AtomicU32::new(0), /* 0 read 调用 */
     AtomicU32::new(0), /* 1 seek 调用 */
@@ -186,6 +198,7 @@ pub struct HttpRangeSource<T: ByteTransport + 'static> {
 impl<T: ByteTransport + 'static> HttpRangeSource<T> {
     /// `transport` 交给取数线程独占（只有它做 I/O）。
     pub fn new(url: &str, transport: T, _cfg: CacheConfig) -> Self {
+        trace_enable_if_requested(); /* 卡里放了 netdbg 文件才开逐条轨迹 */
         let size = transport.size();
         let shared = Arc::new((
             Mutex::new(Window {

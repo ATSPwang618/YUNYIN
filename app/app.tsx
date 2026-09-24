@@ -457,9 +457,9 @@ const PANEL_TXT = THEME_COLORS.ui as Record<UiSkin, Record<string, string>>;
 const pTxt = (key: string) => PANEL_TXT[uiTheme()][key] ?? "";
 
 /* 软件版本：About 页展示，和 param.sfo APP_VER 00.63 对齐。 */
-const APP_VERSION = "0.82";
+const APP_VERSION = "0.83";
 /* param.sfo 里的 APP_VER（VitaShell 里显示的那串），和 APP_VERSION 一起改。 */
-const APP_VER_SFO = "00.82";
+const APP_VER_SFO = "00.83";
 const POCKETJS_VERSION = "0.12.0";
 
 type CjkMode = "baked" | "stream";

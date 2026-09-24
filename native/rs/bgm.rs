@@ -137,6 +137,13 @@ fn audio_channel_thread() {
     let mut buf_a = vec![0i16; (VITA_NUM_AUDIO_SAMPLES as usize) * 2];
     let mut buf_b = vec![0i16; (VITA_NUM_AUDIO_SAMPLES as usize) * 2];
     let mut use_a = true;
+    {
+        /* 面包屑：音频线程真的跑起来了就记一行（只记第一次）。 */
+        static FIRST_TICK: AtomicBool = AtomicBool::new(true);
+        if FIRST_TICK.swap(false, Ordering::AcqRel) {
+            log::append("dbg: 音频线程第一拍");
+        }
+    }
     while AUDIO_TERMINATE.load(Ordering::Acquire) == false {
         let buf = if use_a {
             buf_a.as_mut_slice()
@@ -314,19 +321,25 @@ fn open_online(url: String, referer: String, duration_ms: i64, token: u32) {
         log::append(&format!("bgm: 在线打开失败 {:?} {url}", e));
         return;
     }
+    /* 排障面包屑：这条链每一步单独记一行，崩了就知道停在哪一步（用完可删）。 */
+    log::append("dbg: 在线源已接上，取格式");
     let rate = decoder::rate();
+    log::append("dbg: 取时长（mpg123_length 会扫流）");
     let dur = decoder::duration_ms();
+    log::append("dbg: 时长已取到");
     RATE_HZ.store(rate as u32, Ordering::Release);
     DUR_MS.store(dur, Ordering::Release);
     POS_MS.store(0, Ordering::Release);
     PLAYING.store(true, Ordering::Release);
     /* PAUSED 不动：用户在打开过程中按了暂停，就保持暂停。 */
     set_path(&url);
+    log::append("dbg: 起音频口");
     if !vita_audio_init(rate) {
         PLAYING.store(false, Ordering::Release);
         crate::media::source::remote::close_remote();
         return;
     }
+    log::append("dbg: 音频口已起");
     log::append(&format!("bgm: play_url {url} rate={rate} dur={dur}ms"));
 }
 
@@ -353,6 +366,17 @@ pub fn stop() {
 
 pub fn state_json() -> String {
     let path = get_path();
+    /*
+     * 面包屑：真机上崩在"格式化一个 60 字节字符串"的地方，而这条 URL 正好 60 字节，
+     * 所以先确认状态 JSON 这条路径（它由界面每 6 帧问一次）。只记前几次，不刷屏。
+     */
+    if path.starts_with("http") {
+        static STATE_DBG: AtomicU32 = AtomicU32::new(0);
+        let n = STATE_DBG.fetch_add(1, Ordering::Relaxed);
+        if n < 3 {
+            log::append(&format!("dbg: state_json 进入（在线，path {} 字节）", path.len()));
+        }
+    }
     format!(
         "{{\"playing\":{},\"paused\":{},\"path\":\"{}\",\"pos\":{},\"dur\":{},\"rate\":{},\"dec\":\"bgm\"}}",
         if PLAYING.load(Ordering::Acquire) && !PAUSED.load(Ordering::Acquire) {
