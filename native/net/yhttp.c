@@ -531,7 +531,16 @@ static int yh_stream_fetch(yhttp_stream *s, long long off, int want) {
 
     if (s->cancelled) return -1;
     if (s->size > 0 && off >= s->size) {
+        /*
+         * 请求的位置已经在流末尾之外（解码器探测长度时会这么问）。
+         * 这里必须把窗口一并清空：否则窗口还是上一次的旧内容，"请求的偏移
+         * 没被窗口盖住"那条分支会把它当成错误（s->err=-1）抛回去 —— 解码器
+         * 把负返回值当硬错误，就再也不回开头重读了。
+         * 清空窗口 = "这个位置已经没有数据"，read() 会以短读正常收工。
+         */
         s->eof = 1;
+        s->win_start = off;
+        s->win_len = 0;
         return 0;
     }
 

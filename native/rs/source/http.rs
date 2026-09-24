@@ -34,6 +34,16 @@ pub const WINDOW_BYTES: usize = 256 * 1024;
 /// 消费端等数据的上限：等不到就返回"稍后再来"，由上层 Gate 决定是否静音。
 pub const READ_WAIT_MS: u64 = 4000;
 
+/*
+ * 一次 read() 内部最多等几轮（每轮 READ_WAIT_MS）。
+ *
+ * 为什么不能等一轮就放弃：解码器**读文件头**时不能被"暂时没数据"打断 —— 它会把
+ * 负的读返回值当成硬错误，然后连"回到开头重读"都不做了，整首歌就废了（真机上
+ * "在线歌打不开"的最后一段就是这么来的）。所以打开阶段要足够耐心，把网络首包
+ * 的几秒等完。真正等不到的时候仍然返回 WouldBlock，由 Gate 输出静音。
+ */
+pub const READ_WAIT_ROUNDS: usize = 3;
+
 /// "从哪儿按偏移取字节"的最小接口。
 pub trait ByteTransport: Send {
     /// 从绝对偏移 `off` 读最多 `dst.len()` 字节；`Ok(0)` = 真正结束。
@@ -46,7 +56,17 @@ pub trait ByteTransport: Send {
 struct Window {
     buf: Vec<u8>,
     start: u64,
-    eof: bool,
+    /*
+     * 「流到哪儿就没有数据了」——这是一个**位置**，不是一个布尔。
+     *
+     * 以前这里是个 bool `eof`，语义是"我们见过一次末尾"。问题是解码器探测完
+     * 文件尾巴一定会 seek 回前面，那时这个陈旧的 true 会立刻告诉它"没数据"，
+     * 解码器拿到 -1 之后连"回到开头重读"都不做了 —— 真机上"在线歌打不开、
+     * 卡在文件尾部刷屏"就是这么来的。
+     *   Some(off) = 从 off 开始就已经没有数据了；
+     *   None      = 目前不知道（刚换了位置 / 这次抓到了数据）。
+     */
+    end_at: Option<u64>,
     err: Option<SourceError>,
     /// 消费端希望窗口从哪开始（seek 会改它）。
     want_from: u64,
@@ -76,7 +96,7 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
             Mutex::new(Window {
                 buf: Vec::new(),
                 start: 0,
-                eof: false,
+                end_at: None,
                 err: None,
                 want_from: 0,
                 generation: 0,
@@ -117,7 +137,7 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                             w.pending = false; /* 这一抓由我负责 */
                             w.buf.clear();
                             w.start = from;
-                            w.eof = false; /* 这一窗的结果等下重新判定 */
+                            w.end_at = None; /* 这一窗的结果等下重新判定 */
                         }
                         let got = st.read_at(from, &mut tmp);
                         {
@@ -133,10 +153,11 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                                 continue;
                             }
                             match got {
-                                Ok(0) => w.eof = true,
+                                Ok(0) => w.end_at = Some(from),
                                 Ok(n) => {
                                     w.buf.extend_from_slice(&tmp[..n]);
                                     w.start = from;
+                                    w.end_at = None; /* 这里拿到数据，说明末尾不在这儿之前 */
                                 }
                                 Err(e) => w.err = Some(e),
                             }
@@ -172,12 +193,8 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
             w.generation = w.generation.wrapping_add(1);
             w.buf.clear();
             w.start = from;
-            /*
-             * "到过流末尾"是**上一个位置**的结论，不能跟着窗口一起搬过来：
-             * 解码器探测完文件尾巴一定会 seek 回开头，那时这里必须重新允许取数，
-             * 否则 wait_for 会因为陈旧的 eof 直接返回"没数据"，开门就是假 EOF。
-             */
-            w.eof = false;
+            /* 换了位置：关于"哪儿到底了"的旧结论作废。 */
+            w.end_at = None;
             w.pending = true;
             cv.notify_all();
         }
@@ -191,7 +208,9 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
         let Ok(mut w) = lock.lock() else { return false };
         loop {
             let covered = pos >= w.start && pos < w.start + w.buf.len() as u64;
-            if covered || w.eof || w.err.is_some() || w.cancelled {
+            /* 「到底」是一个位置：只有你要的位置已经过了那个点，才算是结束。 */
+            let ended = w.end_at.map_or(false, |end| pos >= end);
+            if covered || ended || w.err.is_some() || w.cancelled {
                 return covered;
             }
             /* 窗口没盖住要的位置：登记需求叫醒取数线程（读尽当前窗口时走这里）。 */
@@ -200,7 +219,7 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
                 w.generation = w.generation.wrapping_add(1);
                 w.buf.clear();
                 w.start = pos;
-                w.eof = false; /* 同上：换了位置，之前的"到底"结论作废 */
+                w.end_at = None; /* 换了位置：关于"哪儿到底了"的旧结论作废 */
                 w.pending = true;
                 cv.notify_all();
             }
@@ -232,7 +251,17 @@ impl<T: ByteTransport + 'static> AudioSource for HttpRangeSource<T> {
             if self.is_eof() {
                 break; /* 真正结束 */
             }
-            if !self.wait_for(self.pos, READ_WAIT_MS) {
+            let mut ready = false;
+            for _ in 0..READ_WAIT_ROUNDS {
+                if self.wait_for(self.pos, READ_WAIT_MS) {
+                    ready = true;
+                    break;
+                }
+                if self.error().is_some() || self.is_eof() {
+                    break;
+                }
+            }
+            if !ready {
                 if let Some(e) = self.error() {
                     return Err(e);
                 }
@@ -296,17 +325,15 @@ impl<T: ByteTransport + 'static> AudioSource for HttpRangeSource<T> {
 
     fn is_eof(&self) -> bool {
         /*
-         * 长度已知时，"结束"只由**当前位置**决定。
-         * 之前用"抓取线程报过 eof"来判断，结果解码器一探测（mpg123 打开流
-         * 时会 seek 到很远处问长度，我就把那次越界当成整条流结束）之后，
-         * 所有读都变成 0 = EOF，解码器直接放弃打开。
+         * 长度已知时，"结束"只由**当前位置**决定；长度未知时才看"取数线程
+         * 在哪儿发现的末尾"（这也是一个位置，不是布尔）。
          */
         if let Some(sz) = self.size {
             return self.pos >= sz;
         }
         let (lock, _cv) = &*self.shared;
         let Ok(w) = lock.lock() else { return false };
-        w.eof && self.pos >= w.start + w.buf.len() as u64
+        w.end_at.map_or(false, |end| self.pos >= end)
     }
 
     fn error(&self) -> Option<SourceError> {
