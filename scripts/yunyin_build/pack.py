@@ -170,6 +170,20 @@ def repack():
         fonts_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(pjfa, fonts_dir / "cjk.pjfa")
         print(f"[build-vpk] packed {pjfa.name} ({pjfa.stat().st_size} bytes) -> app0:/fonts/cjk.pjfa")
+    # 根证书：SceSsl 默认只认固件自带的那份库，随包带一张 DigiCert Global Root G2
+    # （网易云整条链都用它），开机由 yhttp_load_ca() 注册进去 —— 老机器/模拟器上
+    # 缺新根时也能验通。PEM 和 DER 都带上：SceHttpsData 没写明格式，运行时两个都试。
+    ca_dir = PROJECT_ROOT / "certs"
+    certs = sorted(ca_dir.glob("*")) if ca_dir.is_dir() else []
+    if certs:
+        dst = staging / "certs"
+        dst.mkdir(parents=True, exist_ok=True)
+        for f in certs:
+            if f.is_file():
+                shutil.copy2(f, dst / f.name)
+        print(f"[build-vpk] packed {len(certs)} 个根证书文件 -> app0:/certs/")
+    else:
+        print("[build-vpk] WARN: certs/ 为空，内置根证书不会随包发布")
     out = PROJECT_ROOT / "dist" / f"{OUT}.vpk"
     # dist/ 不入库：全新克隆里没有这个目录，这里自己建（以前靠本地残留的 dist/，
     # 换台机器/新克隆就会在最后一步写 VPK 时崩）。

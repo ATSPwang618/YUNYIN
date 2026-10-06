@@ -37,6 +37,11 @@
 #define YHTTP_RECV_TIMEOUT_US    (10 * 1000 * 1000)
 #define YHTTP_HEADER_MAX         (16 * 1024)
 
+/* 随包发的根证书放在 app0:/certs/（打包脚本从仓库 certs/ 拷进去）。
+ * 上限 16 KB：一张 X.509 根证书 PEM ≈ 1.4 KB，DER ≈ 0.9 KB，够用了。 */
+#define YHTTP_CA_DIR "app0:/certs"
+#define YHTTP_CA_MAX (16 * 1024)
+
 static yhttp_log_fn g_log;
 static int g_inited;
 /* 0 = 没人初始化，1 = 正在初始化，2 = 已完成。
@@ -149,6 +154,12 @@ int yhttp_init(void) {
     }
     g_http_inited = 1;
 
+    /*
+     * 尽力而为：把随包发的根证书注册进 SceSsl（失败只记日志，不影响后面请求）。
+     * 放在这里而不是外面，是因为 sceHttps* 要求 HTTPS 系统模块已加载 + 栈已 Init。
+     */
+    yhttp_load_ca();
+
     g_inited = 1;
     g_init_lock = 2;
     return 0;
@@ -242,21 +253,80 @@ int yhttp_memory(unsigned int *pool, unsigned int *in_use, unsigned int *peak) {
 }
 
 /*
- * 证书校验相关的接口（§23）。**已经不再做"拆栈重装根证书"那套动作了。**
+ * 证书校验相关的接口（§23）。
  *
- * 原来这里会逐档放大池子重试 sceHttpsLoadCert()，但实测（真机 + 模拟器）它在
- * 任何池大小下都是 0x80431022 OUT_OF_MEMORY —— 从来没有成功过一次；代价却是
- * 要先 sceHttpTerm() + sceSslTerm() 把整个网络栈拆掉重建。歌单同步是并发发
- * 多个请求的，重建期间在飞的请求全部作废，模拟器上重建之后 TLS 会一直
- * 0x80431075 握手被拒 —— 用户看到的就是"网络明明是好的，歌单一个都同步不了"。
+ * 老版本这里是"拆栈 + 逐档放大池子重装固件根证书"，实测（真机 + 模拟器）在任何
+ * 池大小下都是 0x80431022 OUT_OF_MEMORY，代价却是先把整个网络栈 sceHttpTerm() +
+ * sceSslTerm() 拆掉 —— 并发在飞的请求全部作废，模拟器上重建之后 TLS 会一直
+ * 0x80431075（"网络明明是好的，歌单一个都同步不了"）。那套动作已经删掉。
  *
- * 校验本身不依赖这一步：真正生效的是 sceHttpsEnableOption() 那几个 flag，
- * 根证书由固件自带的那份库负责。所以这里只留一个入口给探针/日志用。
+ * 现在这条只做一件事：把**随包发的**根证书注册进 SceSsl（见下面的注释）。
+ * 校验本身由 sceHttpsEnableOption() 的几个 flag 生效，注册只是让"这台机器缺根"
+ * 不再成为问题；注册失败也只是少一条可信根，不影响原有行为。
  */
 int yhttp_load_ca(void) {
-    if (g_ca_tried) return -1;
+    /*
+     * 随包发一张根证书（app0:/certs/），开机注册进 SceSsl。
+     *
+     * 为什么值得做：SceSsl 默认只认**固件自带**的根证书库，那个库跟着系统版本
+     * 走 —— 老机器、模拟器上可能缺新根。网易云整条链（music.163.com 和
+     * *.music.126.net CDN）都挂在 **DigiCert Global Root G2** 下面，把这一张
+     * 带上，就不用赌用户机器上的库全不全。
+     *
+     * 注意三件事：
+     *   * 这是"**额外注册**"（sceHttpsLoadCert），不是替换固件那份 —— 成功只是多
+     *     一条可信根，原来的行为不变；
+     *   * 失败一律只记日志：Vita3K 里这个 API 是 UNIMPLEMENTED（返回 -1），真机上
+     *     历史上报 0x80431022 OUT_OF_MEMORY；两者都不影响后面用固件根库继续跑；
+     *   * PEM / DER 各试一次：SceHttpsData 只声明了 ptr+size，没写格式，两边都试
+     *     是最省事的确定办法 —— 哪次成功会直接写进日志。
+     */
+    static unsigned char ca_buf[YHTTP_CA_MAX];
+    static const struct {
+        const char *file;
+        const char *what;
+    } cands[] = {
+        { "digicert-global-root-g2.pem", "PEM" },
+        { "digicert-global-root-g2.der", "DER" },
+    };
+    char path[64];
+    unsigned int i;
+
+    if (g_ca_tried) return g_ca_loaded ? 0 : -1;
     g_ca_tried = 1;
-    yh_logf("yhttp: 跳过根证书装载（任何池大小都是 OOM，且拆栈会毁掉在飞的请求）\n");
+
+    for (i = 0; i < sizeof cands / sizeof cands[0]; i++) {
+        SceUID fd;
+        int n, rc;
+        SceHttpsData data;
+        const SceHttpsData *list[1];
+
+        snprintf(path, sizeof path, "%s/%s", YHTTP_CA_DIR, cands[i].file);
+        fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+        if (fd < 0) {
+            yh_logf("yhttp: 内置根证书 %s 打不开（%s，0x%08X）\n",
+                    cands[i].what, path, (unsigned)fd);
+            continue;
+        }
+        n = sceIoRead(fd, ca_buf, sizeof ca_buf);
+        sceIoClose(fd);
+        if (n <= 0) {
+            yh_logf("yhttp: 内置根证书 %s 读出来是空的（%s）\n", cands[i].what, path);
+            continue;
+        }
+        data.ptr = (char *)ca_buf;
+        data.size = (unsigned)n;
+        list[0] = &data;
+        rc = sceHttpsLoadCert(1, list, NULL, NULL);
+        yh_logf("yhttp: 内置根证书 %s（%d 字节）sceHttpsLoadCert -> 0x%08X\n",
+                cands[i].what, n, (unsigned)rc);
+        if (rc >= 0) {
+            g_ca_loaded = 1;
+            yh_logf("yhttp: 根证书 = 固件库 + 内置 DigiCert Global Root G2\n");
+            return 0;
+        }
+    }
+    yh_logf("yhttp: 内置根证书没装上（这台机器不支持/内存不够），继续用固件根库\n");
     return -1;
 }
 
@@ -270,6 +340,7 @@ int yhttp_load_ca(void) {
 
 unsigned int yhttp_ca_http_pool(void) { return g_http_pool; }
 unsigned int yhttp_ca_ssl_pool(void) { return g_ssl_pool; }
+int yhttp_inflight(void) { return g_inflight; }
 
 /*
  * 把"校验"打开。
@@ -1230,6 +1301,7 @@ int yhttp_post(const char *url, const char *body, const char *content_type,
 }
 
 int yhttp_load_ca(void) { return -1; }
+int yhttp_inflight(void) { return 0; }
 int yhttp_dl_active(void) { return 0; }
 long long yhttp_dl_got(void) { return 0; }
 long long yhttp_dl_total(void) { return -1; }

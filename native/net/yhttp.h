@@ -113,13 +113,19 @@ int yhttp_abort_probe(const char *url, const char *referer, int tls_mode,
                       unsigned int wait_ms, yhttp_result *res);
 
 /*
- * 根证书库的装载（§23/§27）。
+ * 注册**随包发的**根证书（§23/§27）：app0:/certs/digicert-global-root-g2.{pem,der}。
  *
- * 已废弃：`sceHttpsLoadCert`（注册 47 张额外根证书）在任何池大小下都返回
- * OUT_OF_MEMORY，而它要求先把 SceHttp/SceSsl 拆掉重建 —— 在飞的请求会当场
- * 作废、后续 TLS 也可能一直握手失败。现在只留一个记录用的空入口。
+ * 老版本这里是"拆栈重装固件那 47 张根证书"，从来只返回 OUT_OF_MEMORY，还把网络
+ * 栈拆坏过；现在改成"额外注册一张我们自己的根"（网易云整条链都用 DigiCert
+ * Global Root G2），不拆栈、不替换固件库。
+ *
+ * 返回 0 = 注册成功；负 = 这台机器不支持（Vita3K 里该 API 是 UNIMPLEMENTED）或
+ * 内存不够 —— 失败不影响原有行为。重复调用返回第一次的结果。
  */
 int yhttp_load_ca(void);
+
+/* 现在有多少个 POST / 探针请求在飞（探针的取消测试拿它判断"能不能安全打断"）。 */
+int yhttp_inflight(void);
 
 /*
  * 下载进度（正文字节）：界面拿它显示"正在同步歌单… 32%"。

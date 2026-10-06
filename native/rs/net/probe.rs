@@ -138,6 +138,8 @@ extern "C" {
     fn yhttp_memory(pool: *mut u32, in_use: *mut u32, peak: *mut u32) -> i32;
     fn yhttp_ca_http_pool() -> u32;
     fn yhttp_ca_ssl_pool() -> u32;
+    fn yhttp_load_ca() -> i32;
+    fn yhttp_inflight() -> i32;
     fn yhttp_probe(
         url: *const i8,
         range: *const i8,
@@ -371,6 +373,18 @@ enum Judge {
 }
 
 fn abort_attempt(note: &str, url: &str, referer: &str, tls: i32, wait_ms: u32) {
+    /*
+     * 别的线程还有请求在飞就别测取消：这条测试本来就要"打断一个正在传输的请求"，
+     * 顺手把 App 自己的清单同步/播放请求一起打断纯属干扰（真机日志里出现过
+     * 探针和界面同步互相拖慢）。
+     */
+    let busy = unsafe { yhttp_inflight() };
+    if busy > 0 {
+        report(&format!(
+            "NET abort     跳过（另有 {busy} 个请求在飞，取消测试会打断它们）"
+        ));
+        return;
+    }
     let mut res = YhttpResult::default();
     let Some(c_url) = cstr(url) else { return };
     let c_referer = cstr(referer).unwrap_or_default();
@@ -494,6 +508,15 @@ fn run() {
         "NET clock     {}",
         crate::media::platform::time::wall_clock_text()
     ));
+    /*
+     * 根证书：0 = 随包发的 DigiCert Global Root G2 已经注册进 SceSsl（固件库之外
+     * 多一条可信根）；负 = 这台机器不支持（Vita3K 里该 API 是 UNIMPLEMENTED）或
+     * 内存不够，此时仍然只用固件根库 —— 两种情况都不影响后面的请求。
+     */
+    report(&format!(
+        "NET ca        yhttp_load_ca -> 0x{:08X}（0 = 内置根证书已注册）",
+        unsafe { yhttp_load_ca() } as u32
+    ));
 
     let custom = url_file_target();
     if let Some(t) = custom {
@@ -593,6 +616,17 @@ fn spawn_run() {
         .stack_size(96 * 1024)
         .spawn(|| {
             unsafe { yhttp_set_log(Some(yunyin_net_log)) };
+            /*
+             * 先让开启动阶段 20 秒。
+             *
+             * 探针和界面首屏（清单同步、二维码贴图）抢的是同一套网络栈和同一颗 CPU：
+             * 日志里出现过"探针在跑 + 二维码贴图上传"凑进同一个 2.1 秒的 guest 帧，
+             * 而 PocketJS 的 dev 宿主有"单帧 JS 时间预算"看门狗 —— 超了直接把 guest
+             * 打死（Vita3K 上就是黑屏，`ux0:/data/pocketjs-dev/<TITLEID>/health.json`
+             * 里写着 `guest JavaScript time budget exceeded`）。诊断工具不该干扰被测对象，
+             * 所以先睡一会儿再跑；要立刻重测可以用 `vitaMedia.netProbe()`。
+             */
+            std::thread::sleep(std::time::Duration::from_secs(20));
             run();
             log::append(&format!("net: Phase 0 report -> {REPORT}"));
             RUNNING.store(false, Ordering::Release);
