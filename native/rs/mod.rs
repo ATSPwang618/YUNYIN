@@ -87,6 +87,7 @@ pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_s
      * 之前只有"AVCDEC 预挂"和"运行环境"两行，中间隔着网络查询 —— 粒度太粗，
      * 白花了一轮往返。现在每一步之前都留一句，崩在哪一步一眼可见。
      */
+    net::install_log(); /* 先接上 C 侧网络日志，初始化/TLS 失败也要可见 */
     log::append("yunyin: 启动 1/4 查询联网状态");
     let net_ok = net::http::online();
     log::append("yunyin: 启动 2/4 网络状态已取到");
@@ -101,10 +102,13 @@ pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_s
     bridge::install(ctx, global);
     cjk_host::install(ctx, global);
     log::append("yunyin: 启动 4/4 桥接完成，进入正常帧循环");
-    /* Phase 0 network probe: inert unless the card asks for it
-     * (ux0:/data/yunyin/netprobe.url or the debug flag). */
-    net::probe::start_once();
-    net::install_log(); /* 先接上 C 侧网络日志，在线播放也能看见 */
+    /*
+     * Phase 0 probe is diagnostic only. Do not start it from the normal
+     * startup path: it opens several HTTPS transfers while the first frame,
+     * list sync, and login may also be active, which can starve PocketJS on
+     * real hardware. Keep it available through the explicit
+     * `vitaMedia.netProbe()` entry point for a deliberate test.
+     */
     /*
      * 卡里放 ux0:/data/yunyin/playlist.json 时，里面的歌会作为
      * **曲库里的独立条目**交给界面（vitaMedia.netplay()），不再偷偷占用

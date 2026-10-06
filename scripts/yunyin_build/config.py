@@ -57,6 +57,11 @@ BARE_GRAPHICS = os.environ.get("YUNYIN_BARE_GRAPHICS") == "1"
 CATCH_HANG = os.environ.get("YUNYIN_CATCH_HANG") == "1"
 
 
+# 诊断开关：YUNYIN_NO_FRAME_SKIP=1 时保留 PocketJS 原始的每帧 render/present，
+# 用来隔离宿主的 frame_changed() 跳帧逻辑；正常包不要打开。
+NO_FRAME_SKIP = os.environ.get("YUNYIN_NO_FRAME_SKIP") == "1"
+
+
 TITLE_ID = os.environ.get("YUNYIN_TITLE_ID", "")  # 留空 = 用 app/catalog.ts 的 TITLE_ID / PF2A47F97
 
 

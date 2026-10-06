@@ -46,12 +46,15 @@ export function AccountPage(props: {
     if (!url || url === lastQrUrl) return;
     lastQrUrl = url;
     try {
-      const key = "qr-login-" + url.slice(-8);
+      /* 固定 key：旧句柄由 qr.ts 回收，渲染器里只保留当前二维码。 */
+      const key = "qr-login";
       uploadQrTexture(key, url);
       setQrTexKey(key);
       logMsg(`qr: 贴图已上传 ${key}`);
     } catch {
       /* 页面照常显示文字提示 */
+      logMsg("qr: 贴图上传失败");
+      setQrTexKey("");
     }
   });
 
@@ -60,7 +63,7 @@ export function AccountPage(props: {
   return (
     <View class="flex-col w-full grow gap-1 overflow-hidden">
       <View class="flex-row w-full items-center justify-center">
-        {props.snapshot().url ? (
+        {props.snapshot().url && qrTexKey() ? (
           <View class={bgCls("qrBox")}>
             <Image src={qrTexKey()} class="w-[124] h-[124]" />
             {expired() ? (

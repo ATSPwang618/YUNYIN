@@ -65,6 +65,7 @@ def patch_host():
         or "empva_bridge" in b
         or "taihen_loader" in b
         or 'cargo:rustc-link-lib=mpg123' not in b
+        or 'cargo:rustc-link-lib=curl_yunyin' not in b
     )
     if needs_cc:
         b = re.sub(
@@ -115,6 +116,19 @@ def patch_host():
             '\n      println!("cargo:rustc-link-lib=ogg");'
             '\n      println!("cargo:rustc-link-lib=opusfile");'
             '\n      println!("cargo:rustc-link-lib=opus");'
+            # Use the YUNYIN-built libcurl/OpenSSL transport rather than the
+            # firmware-dependent SceHttp/SceSsl handshake. The stock 2026.08
+            # SDK curl archive was built against a different OpenSSL package;
+            # libcurl_yunyin is built in the same image against the SDK's
+            # current headers and libraries.
+            '\n      println!("cargo:rustc-link-lib=curl_yunyin");'
+            '\n      println!("cargo:rustc-link-lib=ssl");'
+            '\n      println!("cargo:rustc-link-lib=crypto");'
+            '\n      println!("cargo:rustc-link-lib=z");'
+            '\n      println!("cargo:rustc-link-lib=zstd");'
+            # OpenSSL's VitaSDK archive uses pthread rwlocks; keep pthread
+            # after the archive that introduced those references.
+            '\n      println!("cargo:rustc-link-lib=pthread");'
             '\n      println!("cargo:rustc-link-search=native/libs");'
             '\n      println!("cargo:rerun-if-changed=native/audio");'
             '\n      println!("cargo:rerun-if-changed=native/host");'
@@ -128,6 +142,43 @@ def patch_host():
     build.write_text(b)
     patches_graphics.patch_streamed_cjk()
     print("[build-vpk] host patched (v0.12.0 anchors, no SceShellSvc)")
+
+
+def patch_host_defer_dynamic_texture_gpu():
+    """Defer JS texture GPU mirrors until the render scene is open.
+
+    `ui.uploadTexture()` is called from QuickJS.  The Vita host used to copy
+    the same texture into a vita2d/GXM texture immediately, which can wait for
+    the previous GPU scene and make the guest frame exceed a second on real
+    hardware.  The graphics backend already lazily resolves missing handles
+    from the DrawList, so keeping the core upload here and letting render()
+    register the mirror preserves the ABI while keeping blocking GPU work out
+    of the JS/input frame.
+    """
+    ffi = PKJ / "hosts/vita/src/ffi.rs"
+    if not ffi.exists():
+        return
+    t = ffi.read_text()
+    if "YUNYIN_DEFER_DYNAMIC_TEXTURE_GPU" in t:
+        print("[build-vpk] dynamic texture GPU upload already deferred")
+        return
+    old = (
+        "    if handle >= 0 {\n"
+        "        // GE samples RAM: write the core's aligned copy (pixels + CLUT) back\n"
+        "        // once at upload.\n"
+        "        crate::graphics::register_texture(ui(), handle);\n"
+        "    }\n"
+    )
+    new = (
+        "    /* YUNYIN_DEFER_DYNAMIC_TEXTURE_GPU: graphics::resolve_texture() registers\n"
+        "     * this handle during render, after begin_frame() has made GXM idle.\n"
+        "     * Doing it here runs inside QuickJS and can stall input/guest frames. */\n"
+    )
+    if old not in t:
+        print("[build-vpk] WARN: ffi.rs dynamic texture upload anchor not found")
+        return
+    ffi.write_text(t.replace(old, new, 1))
+    print("[build-vpk] dynamic texture GPU upload deferred to render")
 
 
 def patch_host_offload_frames():

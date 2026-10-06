@@ -493,6 +493,22 @@ fn play_song_id(song_id: &str) {
                             e
                         ));
                         last_reason = short_provider_reason(&e);
+                        /* 业务拒绝不会因为重发同一个请求而改变：-110（登录/会员
+                         * 权限）、404（无版权）和明确的认证错误直接结束，别让用户
+                         * 再等两轮并误以为是网络超时。 */
+                        if matches!(
+                            e,
+                            crate::media::provider::ProviderError::Auth(_)
+                                | crate::media::provider::ProviderError::VipRequired
+                                | crate::media::provider::ProviderError::NotFound
+                                | crate::media::provider::ProviderError::Unsupported
+                        ) {
+                            log::append(&format!(
+                                "bgm: 在线歌曲最终失败（无需重试）{last_reason} id={id}"
+                            ));
+                            set_play_error(last_reason);
+                            return;
+                        }
                     }
                 }
                 if attempt < 3 {

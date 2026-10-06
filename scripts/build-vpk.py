@@ -47,18 +47,27 @@ def apply_host_patches(*, diagnostics: bool = True) -> None:
     patches_host.patch_force_cjk_baked()
     patches_host.patch_no_cover()
     patches_host.patch_host()
+    patches_host.patch_host_defer_dynamic_texture_gpu()
     # 流式字库的本地 offload 通道每帧复位一次（Vita 宿主漏了这一步，见函数注释）。
     patches_host.patch_host_offload_frames()
     patches_host.patch_vita_release_guards()
+    # media/ui/font_gpu.rs calls graphics::refresh_font_atlas() in every
+    # build mode. This compatibility hook is required even for
+    # BARE_GRAPHICS; only the heavier glyph-inset/font-upload changes stay
+    # disabled there.
+    patches_graphics.patch_font_gpu()
     if diagnostics:
         patches_host.patch_host_frame_diag()
         patches_host.patch_host_present_diag()
     # 帧跳过放最后：它要一次性把 render/overlay/present 包进 frame_changed()，
     # 所以必须看到"已经加过计时"的最终文本（见 patches_host.patch_host_frame_loop）。
-    patches_host.patch_host_frame_loop()
+    # YUNYIN_NO_FRAME_SKIP=1 是黑屏排查用 A/B 开关，回到 PocketJS 原始帧路径。
+    if config.NO_FRAME_SKIP:
+        print("[build-vpk] diagnostic: keep PocketJS render/present every frame")
+    else:
+        patches_host.patch_host_frame_loop()
     if not config.BARE_GRAPHICS:
         patches_graphics.patch_graphics_glyph()
-        patches_graphics.patch_font_gpu()
     patches_graphics.patch_font_dirty()
 
 

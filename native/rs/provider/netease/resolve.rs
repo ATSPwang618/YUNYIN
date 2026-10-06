@@ -109,6 +109,7 @@ fn cached_from_body(
     song_id: &str,
     quality: Quality,
     body: &str,
+    logged_in: bool,
     now_ms: u64,
 ) -> Result<CachedUrl, ProviderError> {
     let root = Json::parse(body)
@@ -129,6 +130,12 @@ fn cached_from_body(
     match item.get("code").and_then(Json::as_i64) {
         Some(200) => {}
         Some(404) => return Err(ProviderError::NotFound),
+        /* `-110` 是播放地址接口的业务拒绝，不是 socket/TLS 失败。匿名时先
+         * 引导扫码；已有会话仍拿不到资源时才提示会员/权限。 */
+        Some(-110) if !logged_in => {
+            return Err(ProviderError::Auth(String::from("播放需要登录")))
+        }
+        Some(-110) => return Err(ProviderError::VipRequired),
         Some(c) => return Err(ProviderError::Network(format!("网易云歌曲 code={c}"))),
         None => {
             return Err(ProviderError::Network(String::from(
@@ -198,7 +205,7 @@ pub fn resolve(
     }
     let call = api::Call::url_quality(song_id, quality, super::quality_id(quality));
     let body = api::call(&call, secret, post, session)?;
-    let entry = cached_from_body(song_id, quality, &body, now_ms)?;
+    let entry = cached_from_body(song_id, quality, &body, session.is_logged_in(), now_ms)?;
     let info = audio_info_from(&entry);
     cache.put(entry);
     Ok(info)
@@ -277,6 +284,29 @@ mod tests {
             matches!(err, ProviderError::Network(ref m) if m.contains("JSON")),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn resolve_maps_player_code_110_to_login_or_permission() {
+        let body = r#"{"code":200,"data":[{"id":3346495279,"url":null,"code":-110}]}"#;
+        let mut post = FakePost::ok(body);
+        let mut cache = UrlCache::default();
+        let err = resolve_test(TEST_ID, &mut post, &mut cache, NOW).unwrap_err();
+        assert_eq!(err, ProviderError::Auth(String::from("播放需要登录")));
+
+        let mut post = FakePost::ok(body);
+        let mut cache = UrlCache::default();
+        let err = resolve(
+            TEST_ID,
+            Quality::Auto,
+            FIXED_SECRET,
+            &mut post,
+            &Session::from_cookie("MUSIC_U=present"),
+            &mut cache,
+            NOW,
+        )
+        .unwrap_err();
+        assert_eq!(err, ProviderError::VipRequired);
     }
 
     #[test]

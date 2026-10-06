@@ -2,18 +2,31 @@
  *
  * 用 vendor/ 里的 MIT 单文件编码器（qrcode-generator，不引 npm 依赖）编出矩阵，
  * 在 JS 里铺成 RGBA 位图，走 PocketJS 的 uploadTexture + registerTexture，
- * 页面里用 <Image src={key}> 显示 —— 和专辑封面同一条通道。 */
+ * 页面里用 <Image src={key}> 显示 —— 和专辑封面同一条通道。
+ *
+ * 二维码是登录页里唯一的动态 GPU 贴图；它不能沿用“每次刷新都生成一个
+ * 新 key”的写法，否则每次刷新都会把旧句柄留在渲染器里。 */
 
 import { getOps, registerTexture } from "@pocketjs/framework";
 import qrcode from "../vendor/qrcode.js";
 
-/* 贴图边长：2 的幂、≤512。256 在 480×272 的逻辑屏上显示 160 逻辑像素够扫。 */
-const TEX = 256;
+/* 贴图边长：2 的幂、≤512。二维码实际显示 124 逻辑像素，128 足够且更适合
+ * Vita 的小显存/动态纹理路径。显示端是点采样，放大后仍保持黑白模块边界。 */
+const TEX = 128;
 /* 静区：规格要求 4 个模块宽，少了手机对不上焦。 */
 const QUIET = 4;
+let lastQrHandle = -1;
 
 /** 把 `text` 编成二维码、上传成贴图并注册到 `key`；返回实际绘制边长（像素）。 */
 export function uploadQrTexture(key: string, text: string): number {
+  const ops = getOps();
+  /* 先回收上一张二维码。native 侧会把 GPU 镜像放入安全的回收队列，
+   * 不是在当前场景里直接销毁。 */
+  if (lastQrHandle >= 0) {
+    ops.freeTexture?.(lastQrHandle);
+    lastQrHandle = -1;
+  }
+
   const qr = qrcode(0, "L"); /* 0 = 自动挑版本；L 纠错同尺寸容量最大 */
   qr.addData(text);
   qr.make();
@@ -45,8 +58,9 @@ export function uploadQrTexture(key: string, text: string): number {
     }
   }
 
-  const handle = getOps().uploadTexture(rgba, TEX, TEX, 3);
+  const handle = ops.uploadTexture(rgba, TEX, TEX, 3);
   if (handle < 0) throw new Error("二维码贴图上传失败");
+  lastQrHandle = handle;
   registerTexture(key, handle);
   return drawn;
 }
