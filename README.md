@@ -107,6 +107,32 @@ ux0:/data/yunyin/
 
 应用**不起任何服务、不监听端口**，所有文件都在这一个文件夹里。
 
+## 配套工具：PC 端歌曲标签检查
+
+本地曲库能不能在 Vita 上正确显示（歌名 / 歌手 / 专辑 / 封面 / 歌词），取决于文件的
+标签写得对不对。这个小工具在 PC 上**按和播放器一样的规则**把曲库读一遍，列出有问题的
+文件，需要时联网匹配后一键写好：
+
+* **检查规则与 Vita 播放器一致**：只读文件头 1 MB + 64 KB 元数据前缀；MP3 读 ID3v2
+  （TIT2 / TPE1 / TALB / APIC / USLT），FLAC / OGG / OPUS 读 Vorbis Comment；
+  封面只认内嵌 JPEG / PNG 且 ≤ 1 MB；WAV 只看文件名。
+* **输出**：缺歌名 / 缺歌手 / 缺专辑 / 无封面 / 编码乱码 / 解析失败；可导出明细 CSV，
+  也可以导出"待修文件夹"丢给 MusicBrainz Picard。
+* **修复**：用 iTunes / MusicBrainz 联网匹配（可勾选覆盖已有标签、下载内嵌封面、
+  从 LRCLIB 匹配歌词），预览确认后再写回文件。
+
+下载：[**YUNYIN-TagCheck.exe**](https://github.com/ATSPwang618/YUNYIN/releases/download/v1.10/YUNYIN-TagCheck.exe)
+（Windows，12 MB，绿色免安装）
+
+用法：双击 → 选音乐文件夹（例如从卡里拷出来的 `ux0:/data/yunyin/music/`，或把 SD 卡挂到 PC）
+→ 开始检查 → 需要时点「联网匹配并修复…」。
+
+源码在 `scripts/tools/tagcheck.py`；自己重新打包：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/tools/build-tagcheck-exe.ps1
+```
+
 ## 自行构建
 
 在 WSL2（Ubuntu）里准备 **VitaSDK**、**bun**、**PocketJS 0.13 源码检出**：
