@@ -34,6 +34,13 @@ const DEBUG_FLAG: &str = "ux0:data/yunyin/debug";
 const TLS_DEFAULT: i32 = 0;
 const TLS_VERIFY: i32 = 1;
 
+/// 这次探针里出现过"TLS 握手/证书被拒"（0x80431075）吗（报告末尾给提示用）。
+static TLS_REJECTED: AtomicBool = AtomicBool::new(false);
+
+fn any_tls_rejected() -> bool {
+    TLS_REJECTED.load(Ordering::Acquire)
+}
+
 /// 失败发生在哪一步，与 `yhttp_result.err_at` 对应。
 fn stage_name(at: i32) -> &'static str {
     match at {
@@ -261,6 +268,14 @@ fn attempt(note: &str, url: &str, referer: &str, cookie: &str, tls: i32,
     }
 
     let first = &buf[..res.bytes_read.max(0) as usize];
+    /*
+     * 记一笔"握手被拒"。报告末尾据此给一句人话提示：这一台机器上所有 HTTPS 都
+     * 倒在 0x80431075 时，原因基本只有两个 —— 系统时间不对，或者固件的 SceSsl
+     * 太老（协商不上服务器要求的 TLS 1.2+）。
+     */
+    if res.err_code as u32 == 0x80431075 {
+        TLS_REJECTED.store(true, Ordering::Release);
+    }
     let (judge_name, pass, why) = match judge {
         Judge::Range206 => (
             "range206",
@@ -471,6 +486,14 @@ fn run() {
         unsafe { yhttp_init() },
         unsafe { yhttp_online() }
     ));
+    /*
+     * 系统时间：证书有效期检查（yhttp: sceHttpsEnableOption(0x3D)）是开着的，
+     * 时钟不对 → 所有 HTTPS 都在握手阶段被拒（0x80431075）。真机排障先看这一行。
+     */
+    report(&format!(
+        "NET clock     {}",
+        crate::media::platform::time::wall_clock_text()
+    ));
 
     let custom = url_file_target();
     if let Some(t) = custom {
@@ -549,6 +572,13 @@ fn run() {
     }
 
     memory_report();
+    if any_tls_rejected() {
+        report(
+            "NET hint      所有 HTTPS 都倒在握手（0x80431075）：\n\
+             \x20             ① 先核对「设置 → 日期与时间」（时钟不对 → 证书有效期检查必失败）\n\
+             \x20             ② 老固件装 iTLS-Enso，给 SceSsl 补上 TLS 1.2/1.3",
+        );
+    }
     report("=== probe finished ===");
 }
 

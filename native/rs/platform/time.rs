@@ -9,6 +9,64 @@ extern "C" {
     fn sceKernelGetSystemTimeWide() -> i64;
 }
 
+/*
+ * 卡里的**系统时间**（本地时区）。
+ *
+ * 为什么要专门读它：证书校验里"有效期（NOT_BEFORE / NOT_AFTER）"是开着的
+ * （见 native/net/yhttp.c 的 yhttp: sceHttpsEnableOption(0x3D)），主机时钟一旦
+ * 不对，**所有** HTTPS 请求都会在握手阶段被拒（0x80431075）——表现就是
+ * "二维码死活刷新不了 / 歌单一个都同步不了，但网络明明是好的"。
+ * 所以每次启动把日期打进日志：真有这个毛病，一眼就能看出来。
+ */
+#[repr(C)]
+struct SceDateTime {
+    year: u16,
+    month: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    microsecond: u32,
+}
+
+extern "C" {
+    fn sceRtcGetCurrentClockLocalTime(t: *mut SceDateTime) -> i32;
+}
+
+/// 系统时间（本地时区）：`(年, 月, 日, 时, 分, 秒)`；读不到返回 None。
+pub fn wall_clock() -> Option<(u16, u16, u16, u16, u16, u16)> {
+    let mut t = SceDateTime {
+        year: 0,
+        month: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        microsecond: 0,
+    };
+    let rc = unsafe { sceRtcGetCurrentClockLocalTime(&mut t) };
+    if rc < 0 || t.year == 0 {
+        return None;
+    }
+    Some((t.year, t.month, t.day, t.hour, t.minute, t.second))
+}
+
+/// 系统时间的日志文本；年份明显不对时自带警告（那会让所有 HTTPS 失败）。
+pub fn wall_clock_text() -> alloc::string::String {
+    use alloc::format;
+    match wall_clock() {
+        Some((y, mo, d, h, mi, s)) => {
+            let line = format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}");
+            if y < 2020 || y > 2100 {
+                format!("{line} ← 时钟不对！证书有效期检查会拒掉所有 HTTPS（0x80431075）")
+            } else {
+                line
+            }
+        }
+        None => alloc::string::String::from("读不到（sceRtcGetCurrentClockLocalTime 失败）"),
+    }
+}
+
 /// 单调微秒（开机起算）。
 pub fn now_us() -> u64 {
     let t = unsafe { sceKernelGetSystemTimeWide() };

@@ -63,6 +63,14 @@ pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_s
      * 以前只能靠行为猜，白花了整整一轮往返。
      */
     log::append("yunyin: start (in-process BGM) 版本 01.10");
+    /*
+     * 系统时间一行：证书有效期检查是开着的，时钟不对 = 所有 HTTPS 直接握手被拒
+     * （0x80431075，表现就是"二维码死活刷新不了"）。先写进日志，省一轮往返。
+     */
+    log::append(&format!(
+        "yunyin: 系统时间 {}",
+        platform::time::wall_clock_text()
+    ));
     ps_lock::init();
     bgm::acquire_on_start();
     /* 预挂 AAC 硬解模块：第一次播 M4A 时才加载会让渲染卡 4.5 秒（真机日志）。 */
