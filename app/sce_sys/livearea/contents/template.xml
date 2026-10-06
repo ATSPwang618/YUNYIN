@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<livearea style="ad0" format-ver="01.00" content-rev="1"> 
+	<livearea-background>
+		<image>bg.png</image> 
+	</livearea-background>
+
+	<frame id='frame1' multi='o' autoflip='1' >  
+		<liveitem> 
+			<target>psla:eboot</target>
+			<image y="25" x="0" width="400" height="226">startup.png</image>  
+		</liveitem>
+	</frame>
+
+	<frame id="frame3">
+		<liveitem>
+			<text align="left" text-align="left" word-wrap="off" ellipsis="on">
+				<str size="22" color="#05b1f0" shadow="on">By qianmo</str>
+			</text>
+		</liveitem>
+	</frame>
+</livearea>

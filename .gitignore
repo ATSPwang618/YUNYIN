@@ -1,0 +1,38 @@
+# ── 构建产物（VPK 走 GitHub Releases 发布，不进版本库）────────────────
+dist/
+*.vpk
+
+# ── 构建派生物（构建时自动重新生成，源码里不留）────────────────────
+# app/theme-seed.tsx：由 app/colors.json 生成
+# app/images.json  ：由 asset/** 扫描生成
+# fonts/*/cjk.pjfa ：流式字库归档（scripts/bake-cjk-archive.ts 烘）
+app/theme-seed.tsx
+app/images.json
+fonts/*/cjk.pjfa
+
+# 真机崩溃 dump
+*.psp2dmp
+
+# ── 依赖 / 测试缓存 ───────────────────────────────────────────────
+node_modules/
+tests/target/
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# ── 本地草稿与一次性素材（不进构建，也不进版本库）──────────────────
+app/model/
+图标/
+图标.7z
+.tmp-*/
+
+# ── 维护工具（scripts/tools）的产物 ────────────────────────────────
+build_tmp/
+scripts/tools/*.exe
+tag-report.csv
+music-to-fix.m3u8
+*.log
+
+# ── OS / 编辑器 ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

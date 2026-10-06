@@ -1,0 +1,4 @@
+# YUNYIN light/pure 主题的「中文补充字符集」。
+# 中文常用字形已由「内容收割」(UI 文案 + MP3 元数据) 覆盖，这里补标点与 CJK 符号。
+U+3000-U+303F       # CJK 标点/注音
+U+FF01-U+FF5E       # 全角 ASCII

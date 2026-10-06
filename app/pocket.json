@@ -1,0 +1,25 @@
+{
+  "$schema": "https://pocketjs.dev/schema/pocket-2.json",
+  "pocket": 2,
+  "id": "dev.pocket-stack.yunyin",
+  "name": "yunyin",
+  "title": "云音",
+  "version": "0.6.1",
+  "engine": {
+    "capabilities": {
+      "requires": ["text.glyphs.baked", "input.buttons"],
+      "enhances": ["audio.pcm", "text.glyphs.streamed", "io.offload"]
+    }
+  },
+  "app": {
+    "entry": "apps/yunyin/main.tsx",
+    "output": "yunyin-main",
+    "framework": "solid",
+    "viewport": {
+      "fixed": {
+        "logical": [480, 272],
+        "presentation": "integer-fit"
+      }
+    }
+  }
+}

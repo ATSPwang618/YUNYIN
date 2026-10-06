@@ -1,0 +1,254 @@
+/*
+ * YUNYIN 的硬件 AAC 解码（SceAudiodec）。
+ *
+ * 下面几条是别人（wiliwili 的 `vitadec_audio.c`、`vita-hw-decoder` 的
+ * `src/internal/vita_aac_decoder.c`）用真机调试换来的经验，照抄不解释：
+ *
+ *  - MP4/M4A 给的是**裸** AAC 帧，所以 `isAdts = 0`：解码器不会去读帧头，
+ *    声道数和采样率必须由容器提供（也就是 `ym4a.c` 从 `esds` 解析出来的那些）。
+ *  - ES 与 PCM 缓冲区既要 0x100 对齐，又必须来自 4 KiB 对齐的内存块，
+ *    否则 sceAudiodecCreateDecoder 只会返回一个没头没脑的错误。
+ *    这里用 uncached 内存，因为硬件块是直接 DMA 进去的。
+ *  - `isSbr` 无法从帧里推出来；公开参考实现一律传 1。对普通 AAC-LC，
+ *    解码器每帧仍然吐 1024 个采样，所以它只是"能力提示"，不是强制上采样。
+ *  - 输出长度以解码器回报的 `outputPcmSize` 为准，绝不假设每帧 1024。
+ */
+
+#include "yaac.h"
+#include "host/yunyin_log.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#ifdef __vita__
+
+#include <psp2/audiodec.h>
+#include <psp2/kernel/sysmem.h>
+#include <psp2/sysmodule.h>
+
+static struct {
+  int ready;
+  int library_open;
+  int module_open;
+  int ch;
+  int rate;
+  int pcm_bytes;
+  int last_status;
+  SceUID es_uid;
+  SceUID pcm_uid;
+  unsigned char *es;
+  short *pcm;
+  SceAudiodecCtrl ctrl;
+  SceAudiodecInfo info;
+} a = {.es_uid = -1, .pcm_uid = -1};
+
+/* Round up to what sceKernelAllocMemBlock accepts (4 KiB) while keeping the
+ * sizes handed to the decoder logical. */
+static void *alloc_uncached(const char *name, int size, SceUID *uid) {
+  int block = (SCE_AUDIODEC_ROUND_UP(size) + 0xFFF) & ~0xFFF;
+  void *base = NULL;
+  SceUID mem = sceKernelAllocMemBlock(name, SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE,
+                                      block, NULL);
+  if (mem < 0) return NULL;
+  if (sceKernelGetMemBlockBase(mem, &base) < 0 || !base) {
+    sceKernelFreeMemBlock(mem);
+    return NULL;
+  }
+  memset(base, 0, (size_t)block);
+  *uid = mem;
+  return base;
+}
+
+static void free_es(void) {
+  if (a.es_uid >= 0) {
+    sceKernelFreeMemBlock(a.es_uid);
+    a.es_uid = -1;
+  }
+  a.es = NULL;
+}
+
+static void free_pcm(void) {
+  if (a.pcm_uid >= 0) {
+    sceKernelFreeMemBlock(a.pcm_uid);
+    a.pcm_uid = -1;
+  }
+  a.pcm = NULL;
+}
+
+void yaac_close(void) {
+  if (a.ready) {
+    sceAudiodecDeleteDecoder(&a.ctrl);
+    a.ready = 0;
+  }
+  free_es();
+  free_pcm();
+  if (a.library_open) {
+    sceAudiodecTermLibrary(SCE_AUDIODEC_TYPE_AAC);
+    a.library_open = 0;
+  }
+  /*
+   * **故意不卸载** AVCDEC 模块：真机日志里第一次打开 M4A 时
+   * `sceSysmoduleLoadModule(AVCDEC)` 那一瞬间，宿主那一帧渲染耗时 4475ms
+   * （画面卡死 4 秒多）。开一次关一次就要反复付这笔账 ——
+   * 模块挂着的那点内存，远比每次切 AAC 卡 4 秒值得。
+   */
+  a.ch = 0;
+  a.rate = 0;
+  a.pcm_bytes = 0;
+  a.last_status = 0;
+}
+
+/*
+ * 启动时先把 AVCDEC 挂上：第一次用 AAC 才加载的话，真机实测会让那一帧渲染
+ * 卡 4.5 秒（画面像死机）。挂在启动阶段用户看不到。
+ */
+int yaac_preload(void) {
+  int ret = sceSysmoduleLoadModule(SCE_SYSMODULE_AVCDEC);
+  if (ret >= 0) a.module_open = 1;
+  return ret;
+}
+
+int yaac_open(int channels, int rate, int is_adts, int is_sbr) {
+  SceAudiodecInitParam init;
+  int ret;
+  int es_size;
+  char msg[128];
+
+  yaac_close();
+  if (channels < 1 || channels > 2 || rate <= 0) return YAAC_ERR_STATE;
+  a.es_uid = -1;
+  a.pcm_uid = -1;
+  a.ch = channels;
+  a.rate = rate;
+
+  /* Best effort: the module is usually already up because the player itself
+   * was started through the same system codec path.  Its failure is not fatal,
+   * sceAudiodecInitLibrary below is the real judge. */
+  ret = sceSysmoduleLoadModule(SCE_SYSMODULE_AVCDEC);
+  if (ret >= 0) a.module_open = 1;
+  snprintf(msg, sizeof msg, "yaac: sceSysmoduleLoadModule(AVCDEC) -> 0x%08X\n",
+           (unsigned)ret);
+  yunyin_log(msg);
+
+  memset(&init, 0, sizeof init);
+  init.aac.size = sizeof init.aac;
+  init.aac.totalStreams = 1;
+  ret = sceAudiodecInitLibrary(SCE_AUDIODEC_TYPE_AAC, &init);
+  if (ret < 0) {
+    a.last_status = ret;
+    snprintf(msg, sizeof msg, "yaac: sceAudiodecInitLibrary -> 0x%08X\n",
+             (unsigned)ret);
+    yunyin_log(msg);
+    yaac_close();
+    return YAAC_ERR_INIT;
+  }
+  a.library_open = 1;
+
+  es_size = SCE_AUDIODEC_ROUND_UP(YAAC_ES_CAP);
+  a.es = (unsigned char *)alloc_uncached("YunyinAacEs", es_size, &a.es_uid);
+  if (!a.es) {
+    yunyin_log("yaac: ES buffer allocation failed\n");
+    yaac_close();
+    return YAAC_ERR_MEMORY;
+  }
+  a.pcm_bytes = SCE_AUDIODEC_ROUND_UP(channels * SCE_AUDIODEC_AAC_MAX_SAMPLES *
+                                      (int)sizeof(short));
+  a.pcm = (short *)alloc_uncached("YunyinAacPcm", a.pcm_bytes, &a.pcm_uid);
+  if (!a.pcm) {
+    yunyin_log("yaac: PCM buffer allocation failed\n");
+    yaac_close();
+    return YAAC_ERR_MEMORY;
+  }
+
+  memset(&a.info, 0, sizeof a.info);
+  a.info.aac.size = sizeof a.info.aac;
+  a.info.aac.isAdts = is_adts ? 1 : 0;
+  a.info.aac.ch = (SceUInt32)channels;
+  a.info.aac.samplingRate = (SceUInt32)rate;
+  a.info.aac.isSbr = is_sbr ? 1 : 0;
+
+  memset(&a.ctrl, 0, sizeof a.ctrl);
+  a.ctrl.size = sizeof a.ctrl;
+  a.ctrl.pEs = a.es;
+  a.ctrl.maxEsSize = (SceUInt32)es_size;
+  a.ctrl.pPcm = a.pcm;
+  a.ctrl.maxPcmSize = (SceUInt32)a.pcm_bytes;
+  a.ctrl.wordLength = SCE_AUDIODEC_WORD_LENGTH_16BITS;
+  a.ctrl.pInfo = &a.info;
+
+  ret = sceAudiodecCreateDecoder(&a.ctrl, SCE_AUDIODEC_TYPE_AAC);
+  if (ret < 0) {
+    a.last_status = ret;
+    snprintf(msg, sizeof msg, "yaac: sceAudiodecCreateDecoder -> 0x%08X\n",
+             (unsigned)ret);
+    yunyin_log(msg);
+    yaac_close();
+    return YAAC_ERR_INIT;
+  }
+  a.ready = 1;
+  snprintf(msg, sizeof msg,
+           "yaac: decoder ready ch=%d rate=%d adts=%d sbr=%d es=%d pcm=%d\n",
+           channels, rate, is_adts, is_sbr, es_size, a.pcm_bytes);
+  yunyin_log(msg);
+  return 0;
+}
+
+int yaac_decode(const unsigned char *au, int len, short *out, int out_cap_frames) {
+  int ret;
+  int frames;
+  if (!a.ready) return YAAC_ERR_STATE;
+  if (!au || len <= 0 || !out || out_cap_frames <= 0) return YAAC_ERR_STATE;
+  if (len > (int)a.ctrl.maxEsSize) {
+    yunyin_log("yaac: access unit exceeds the ES buffer\n");
+    return YAAC_ERR_TOO_BIG;
+  }
+  memcpy(a.es, au, (size_t)len);
+  a.ctrl.inputEsSize = (SceUInt32)len;
+  a.ctrl.outputPcmSize = 0;
+
+  ret = sceAudiodecDecode(&a.ctrl);
+  a.last_status = ret;
+  if (ret < 0) {
+    char msg[96];
+    snprintf(msg, sizeof msg, "yaac: sceAudiodecDecode -> 0x%08X\n",
+             (unsigned)ret);
+    yunyin_log(msg);
+    return YAAC_ERR_DECODE;
+  }
+  if (a.ctrl.outputPcmSize == 0) return 0;
+
+  frames = (int)(a.ctrl.outputPcmSize / (SceUInt32)(a.ch * (int)sizeof(short)));
+  if (frames > out_cap_frames) frames = out_cap_frames;
+  memcpy(out, a.pcm, (size_t)frames * (size_t)a.ch * sizeof(short));
+  return frames;
+}
+
+int yaac_ready(void) { return a.ready; }
+int yaac_channels(void) { return a.ch; }
+int yaac_rate(void) { return a.rate; }
+int yaac_last_status(void) { return a.last_status; }
+
+#else /* host build: no hardware decoder, stubs keep the sources linkable */
+
+void yaac_close(void) {}
+int yaac_open(int channels, int rate, int is_adts, int is_sbr) {
+  (void)channels;
+  (void)rate;
+  (void)is_adts;
+  (void)is_sbr;
+  return YAAC_ERR_INIT;
+}
+int yaac_decode(const unsigned char *au, int len, short *out,
+                int out_cap_frames) {
+  (void)au;
+  (void)len;
+  (void)out;
+  (void)out_cap_frames;
+  return YAAC_ERR_STATE;
+}
+int yaac_ready(void) { return 0; }
+int yaac_channels(void) { return 0; }
+int yaac_rate(void) { return 0; }
+int yaac_last_status(void) { return 0; }
+
+#endif
