@@ -13,6 +13,26 @@
 > 当前版本 **1.10**（`param.sfo` 里的 `APP_VER=01.10`）。
 > 安装包见 [Releases](../../releases)。
 
+## 界面
+
+> 真机截图（PS Vita，960 × 544）。
+
+**桌面气泡与启动画面** —— LiveArea 图与启动画面随包发布，装完就在桌面上：
+
+![桌面气泡](docs/img/livearea-home.jpg)
+
+![启动画面](docs/img/livearea-startup.jpg)
+
+**本地曲库** —— 左边是常驻播放器卡片（内嵌封面、进度、状态词、播放控制排），
+右边是列表（虚拟滚动 + 焦点指示，右下角 `9 / 55` 是当前清单进度）：
+
+![本地曲库](docs/img/local-library.jpg)
+
+**待机状态** —— 还没选歌时封面位显示占位图、状态是 `待定`、进度 `00:00`，
+从列表里选一首才开始播放：
+
+![待机状态](docs/img/player-idle.jpg)
+
 ## 上手（4 步）
 
 1. 用 VitaShell 装 `yunyin-main.vpk`。
@@ -120,7 +140,7 @@ POCKETJS_ROOT=/root/pocketjs013 YUNYIN_BARE_GRAPHICS=1 python3 scripts/build-vpk
 ├── scripts/      构建与检查：build-vpk.py + yunyin_build/ + gen-cjk-charset.py
 │   └── tools/    素材/曲库维护工具（不参与构建）
 ├── tests/        宿主侧 cargo 测试
-└── docs/         技术文档（只有两份）
+└── docs/         技术文档（只有两份）+ img/ 真机截图
 ```
 
 | 文档 | 内容 |
