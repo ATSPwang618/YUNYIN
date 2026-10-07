@@ -85,7 +85,7 @@ export function LyricsPage(props: {
     const slot = slotFromClass(pTxt("lyricCur"));
     const font = fontArchive();
     const usable =
-      mode === "stream" && !!font && (slot === 0 || slot === 7 || slot === 8);
+      mode === "stream" && !!font && (slot === 0 || slot === 7);
     dropPrefetch();
     if (!usable || !font) return;
     for (let i = idx + 2; i <= idx + 5 && i < ls.length; i += 1) {

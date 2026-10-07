@@ -445,8 +445,8 @@ export function scanLibrary(): Track[] {
 export const ONLINE_ALBUM = "在线歌曲";
 export const ONLINE_ARTIST = "在线";
 
-/* 从 URL 或 `netease:<id>` 条目里挑出 song id（没有就用序号），
- * 只为了让默认名字有点辨识度。 */
+/* 从 URL 或 `netease:<id>` 条目里挑出 song id。保留这个辅助函数给
+ * 播放/链接识别使用，但不再把内部 id 拼进用户可见的歌名。 */
 export function onlineIdHint(url: string): string {
   const m = /[?&]id=(\d+)/.exec(url) || /^netease:(\d+)$/.exec(url);
   return m ? m[1] : "";
@@ -458,9 +458,10 @@ export function buildOnlineTrack(
   index: number,
   playlist = "",
 ): Track {
-  const name =
-    (title || "").trim() ||
-    `[在线] ${onlineIdHint(url) || String(index + 1)}`;
+  /* 标题还没从 Rust catalog/netplay 元数据补回来时，只显示稳定的占位文本。
+   * 不能把网易云 id 当歌名：这会把元数据延迟伪装成真实标题，而且一旦被
+   * 某个缓存路径保留，后续刷新就可能长期展示 `[在线]xxx`。 */
+  const name = (title || "").trim() || "加载中…";
   const artist = ONLINE_ARTIST;
   const album = ONLINE_ALBUM;
   return {
@@ -524,4 +525,3 @@ export function scanOnlineTracks(): Track[] {
     buildOnlineTrack(e.url, e.title || "", i, (e.playlist || "").trim()),
   );
 }
-

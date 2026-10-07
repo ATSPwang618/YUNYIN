@@ -24,6 +24,8 @@ let summaryAt = 0;
 let frameCount = 0;
 let slowFrames = 0;
 let worstGapMs = 0;
+let frameSerial = 0;
+let activeFrame = 0;
 
 /*
  * 慢帧账本：这一帧里每个阶段各花了多久。
@@ -49,10 +51,11 @@ let ledger: string[] = [];
 function flushFrame(): void {
   if (frameBeginAt === 0) return;
   const dur = Date.now() - frameBeginAt;
+  const id = activeFrame;
   frameBeginAt = 0;
   if (dur >= SLOW_FRAME_MS) {
     logMsg(
-      `perf: JS 帧 ${dur}ms ← ${ledger.length > 0 ? ledger.join(" + ") : "（无具名操作：都在 JS 逻辑/组件重算里）"}`,
+      `perf: JS 帧 id=${id} ${dur}ms ← ${ledger.length > 0 ? ledger.join(" + ") : "（无具名操作：都在 JS 逻辑/组件重算里）"}`,
     );
   }
 }
@@ -60,6 +63,8 @@ function flushFrame(): void {
 /** 每帧最前面调一次：开一本新账（上一帧若忘了结算，这里兜底结算）。 */
 export function perfFrameBegin(): void {
   flushFrame();
+  frameSerial += 1;
+  activeFrame = frameSerial;
   frameBeginAt = Date.now();
   if (ledger.length > 0) ledger = [];
 }
@@ -89,7 +94,7 @@ export function perfFrame(): void {
   if (gap > worstGapMs) worstGapMs = gap;
   if (gap >= SLOW_FRAME_MS) {
     slowFrames += 1;
-    logMsg(`perf: 帧间隔 ${gap}ms（第 ${frameCount} 帧起）`);
+    logMsg(`perf: 帧间隔 id=${frameSerial} ${gap}ms（第 ${frameCount} 帧起）`);
     /* 一次掉帧就把汇总窗口重置，免得后面几十行都把同一段算进去 */
     if (gap >= 400) {
       summaryAt = now;
@@ -117,7 +122,7 @@ export function perfSpan<T>(name: string, body: () => T): T {
   const t0 = Date.now();
   const out = body();
   const dt = Date.now() - t0;
-  if (dt >= SLOW_SPAN_MS) logMsg(`perf: ${name} ${dt}ms`);
+  if (dt >= SLOW_SPAN_MS) logMsg(`perf: ${name} id=${activeFrame} ${dt}ms`);
   /* 顺手记进慢帧账本：慢帧时就能看出"是哪一段"和"哪一帧"是同一件事。 */
   perfNote(name, dt);
   return out;

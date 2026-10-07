@@ -574,8 +574,84 @@ def patch_host_present_diag():
     if not main.exists():
         return
     t = main.read_text()
-    if "YUNYIN_HOST_FRAME_DIAG" in t:
+    if "YUNYIN_HOST_PHASE_DIAG" in t:
         print("[build-vpk] host present diagnostics already patched")
+        return
+    # The staged PocketJS checkout is reused between builds.  After the first
+    # diagnostic build frame_skip.py may already have moved render/present into
+    # `if frame_changed()`.  Match that shape too; otherwise this diagnostic
+    # silently disappeared on the next build and the log lost the host-side
+    # phase that is needed to separate list/font work from GXM work.
+    old_changed = (
+        "        if let Some(guest) = runtime.as_mut() {\n"
+        "            guest.tick();\n"
+        "            pocketjs_vita::media::refresh_font_atlases();\n"
+        "            if pocketjs_vita::media::frame_changed() {\n"
+        "                guest.render();\n"
+        "                dev.overlay();\n"
+        "                graphics::present();\n"
+        "            }\n"
+        "        } else {\n"
+        "            graphics::begin_frame(0xff1c_1410);\n"
+        "            dev.overlay();\n"
+        "            graphics::present();\n"
+        "        }\n"
+    )
+    new_changed = (
+        "        if let Some(guest) = runtime.as_mut() {\n"
+        "            let yunyin_t0 = std::time::Instant::now(); /* YUNYIN_HOST_PHASE_DIAG */\n"
+        "            guest.tick();\n"
+        "            let yunyin_tms = yunyin_t0.elapsed().as_millis();\n"
+        "            let yunyin_f0 = std::time::Instant::now();\n"
+        "            pocketjs_vita::media::refresh_font_atlases();\n"
+        "            let yunyin_fms = yunyin_f0.elapsed().as_millis();\n"
+        "            let yunyin_c0 = std::time::Instant::now();\n"
+        "            let yunyin_changed = pocketjs_vita::media::frame_changed();\n"
+        "            let yunyin_cms = yunyin_c0.elapsed().as_millis();\n"
+        "            if yunyin_tms >= 8 {\n"
+        "                pocketjs_vita::media::log::append(&std::format!(\n"
+        '                    "perf: host_phase=guest_tick ms={yunyin_tms}"\n'
+        "                ));\n"
+        "            }\n"
+        "            if yunyin_fms >= 8 {\n"
+        "                pocketjs_vita::media::log::append(&std::format!(\n"
+        '                    "perf: host_phase=font_refresh ms={yunyin_fms}"\n'
+        "                ));\n"
+        "            }\n"
+        "            if yunyin_cms >= 8 {\n"
+        "                pocketjs_vita::media::log::append(&std::format!(\n"
+        '                    "perf: host_phase=frame_changed_draw ms={yunyin_cms} changed={}"\n'
+        "                    , yunyin_changed as u8\n"
+        "                ));\n"
+        "            }\n"
+        "            if yunyin_changed {\n"
+        "                let yunyin_r0 = std::time::Instant::now();\n"
+        "                guest.render();\n"
+        "                let yunyin_rms = yunyin_r0.elapsed().as_millis();\n"
+        "                dev.overlay();\n"
+        "                let yunyin_p0 = std::time::Instant::now();\n"
+        "                graphics::present();\n"
+        "                let yunyin_pms = yunyin_p0.elapsed().as_millis();\n"
+        "                if yunyin_rms >= 8 {\n"
+        "                    pocketjs_vita::media::log::append(&std::format!(\n"
+        '                        "perf: host_phase=render ms={yunyin_rms}"\n'
+        "                    ));\n"
+        "                }\n"
+        "                if yunyin_pms >= 8 {\n"
+        "                    pocketjs_vita::media::log::append(&std::format!(\n"
+        '                        "perf: host_phase=present ms={yunyin_pms}"\n'
+        "                    ));\n"
+        "                }\n"
+        "            }\n"
+        "        } else {\n"
+        "            graphics::begin_frame(0xff1c_1410);\n"
+        "            dev.overlay();\n"
+        "            graphics::present();\n"
+        "        }\n"
+    )
+    if old_changed in t:
+        main.write_text(t.replace(old_changed, new_changed, 1))
+        print("[build-vpk] patch: host phase diagnostics (tick/font/draw/render/present)")
         return
     old = (
         "        if let Some(guest) = runtime.as_mut() {\n"

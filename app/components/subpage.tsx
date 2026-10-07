@@ -2,6 +2,7 @@ import { createEffect, onMount } from "solid-js";
 import { Text, View } from "@pocketjs/framework/components";
 import type { NodeMirror } from "@pocketjs/framework/renderer";
 import { bgCls, pTxt } from "../core/theme";
+import { StreamText } from "../core/cjk";
 import { animate, jump } from "@pocketjs/framework/animation";
 import { pageEnter } from "../core/motion";
 
@@ -68,7 +69,7 @@ export function SubPage(props: {
           <View class={focused() ? bgCls("backBtnFocus") : bgCls("backBtn")}>
             <Text class={focused() ? pTxt("accent") : pTxt("pageTitle")}>←</Text>
           </View>
-          <Text class={pTxt("pageTitle")}>{props.title}</Text>
+          <StreamText class={pTxt("pageTitle")} text={props.title} />
         </View>
         {props.right ? (
           <Text class={pTxt("rowValue")}>{props.right}</Text>

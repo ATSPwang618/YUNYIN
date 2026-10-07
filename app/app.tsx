@@ -32,7 +32,15 @@ import {
   type CatalogSong,
 } from "./core/catalog";
 import { bgCls, nextTheme, setUiTheme } from "./core/theme";
-import { applyCjkMode, cjkMode, logCjkStats } from "./core/cjk";
+import {
+  applyCjkMode,
+  beginCjkWarmup,
+  cjkEpoch,
+  cjkMode,
+  logCjkStats,
+  pumpCjkPrepare,
+  type CjkWarmupTicket,
+} from "./core/cjk";
 import { setPsLockInfo } from "./core/ui-state";
 import { perfFrame, perfFrameBegin, perfFrameEnd, perfSpan } from "./core/perf";
 import type { NodeMirror } from "@pocketjs/framework/renderer";
@@ -267,6 +275,7 @@ export default function Music() {
 
   let frameCounter = 0;
   let lastFrameMs = 0;
+  let cjkPrepareFrame = 0;
   let cjkDbgFrames = 0;
 
   /* ---------------- 登录 ---------------- */
@@ -357,8 +366,42 @@ export default function Music() {
   const [catalogAccount, setCatalogAccount] = createSignal<CatalogPlaylist[]>([]);
   const [catalogPages, setCatalogPages] = createSignal<Record<string, CatalogPage>>({});
   const [catalogQueues, setCatalogQueues] = createSignal<Record<string, string[]>>({});
+  /* page 只是一扇窗口；歌曲元数据要按 id 合并保存，不能跟着当前窗口丢掉。 */
+  const [catalogMeta, setCatalogMeta] = createSignal<Record<string, CatalogSong>>({});
+  const CATALOG_FETCH_LIMIT = LIST_WINDOW + 2; /* 覆盖 Recycler 槽位的预加载行 */
   let lastCatalogVersion = "";
   const catalogPageRequests: Record<string, string> = {};
+  const catalogIdsQueued: Record<string, boolean> = {};
+  let deferredCatalogPage: { file: string; offset: number; dueFrame: number } | undefined;
+  let catalogTrace = 0;
+  let playlistWarmup: CjkWarmupTicket | undefined;
+  let playlistWarmupKey = "";
+  let playlistFontPrimedFile = "";
+  let playlistFontPrimedEpoch = -1;
+  const [playlistFontReady, setPlaylistFontReady] = createSignal(true);
+
+  const mergeCatalogMeta = (file: string, songs: CatalogSong[]): void => {
+    let changed = 0;
+    setCatalogMeta((prev) => {
+      let next = prev;
+      for (const song of songs) {
+        if (!song?.id) continue;
+        const old = prev[song.id];
+        if (
+          old?.title === song.title && old?.artists === song.artists &&
+          old?.album === song.album && old?.durationMs === song.durationMs &&
+          old?.off === song.off && old?.vip === song.vip && old?.fee === song.fee
+        ) continue;
+        if (next === prev) next = { ...prev };
+        next[song.id] = song;
+        changed += 1;
+      }
+      return next;
+    });
+    if (changed > 0 && logEnabled()) {
+      logMsg(`perf: list_meta_merge file=${file} rows=${songs.length} changed=${changed}`);
+    }
+  };
 
   const pullCatalog = () => {
     const version = catalogVersion();
@@ -383,7 +426,29 @@ export default function Music() {
       setCatalogAccount(accountRows);
     }
     const open = cloudOpen();
-    if (open.file) loadCatalogPage(open.file, start(), true);
+    if (open.file) queueCatalogPage(open.file, start(), 1);
+  };
+
+  const queueCatalogPage = (file: string, offset: number, delayFrames = 1): void => {
+    if (!file) return;
+    deferredCatalogPage = { file, offset, dueFrame: frameCounter + Math.max(1, delayFrames) };
+  };
+
+  const queueCatalogIds = (file: string): void => {
+    if (!file || catalogQueues()[file] || catalogIdsQueued[file]) return;
+    catalogIdsQueued[file] = true;
+  };
+
+  const pumpCatalogIds = (): void => {
+    const file = Object.keys(catalogIdsQueued).find((name) => catalogIdsQueued[name]);
+    if (!file) return;
+    delete catalogIdsQueued[file];
+    const idsT0 = Date.now();
+    const ids = perfSpan(`catalogIds ${file}`, () => catalogIds(file));
+    if (logEnabled()) {
+      logMsg(`perf: list_ids file=${file} count=${ids.length} bridge_ms=${Date.now() - idsT0} deferred=1`);
+    }
+    if (ids.length > 0) setCatalogQueues((prev) => ({ ...prev, [file]: ids }));
   };
 
   const loadCatalogPage = (
@@ -395,20 +460,100 @@ export default function Music() {
     const key = `${file}:${offset}`;
     const current = catalogPages()[file];
     if (!immediate && current?.state === "ready" && current.offset === offset) return current;
-    if (!immediate && catalogPageRequests[file] === key) return current;
+    /* state=loading 只是 native worker 当时还没 publish；不能把这个 key
+     * 当成永久完成。文件随后 publish_ok 后必须允许再次桥接读取。 */
+    if (!immediate && catalogPageRequests[file] === key && current?.state === "ready") return current;
     catalogPageRequests[file] = key;
-    const page = catalogPage(file, offset, LIST_WINDOW);
+    const trace = ++catalogTrace;
+    const t0 = Date.now();
+    if (logEnabled()) {
+      logMsg(
+        `perf: list_page_begin trace=${trace} file=${file} offset=${offset} ` +
+          `limit=${CATALOG_FETCH_LIMIT} immediate=${immediate ? 1 : 0}`,
+      );
+    }
+    const page = perfSpan(
+      `catalogPage ${file}@${offset}`,
+      () => catalogPage(file, offset, CATALOG_FETCH_LIMIT),
+    );
+    const pageMs = Date.now() - t0;
+    if (logEnabled()) {
+      logMsg(
+        `perf: list_page_end trace=${trace} file=${file} offset=${offset} ` +
+          `state=${page.state} total=${page.total} songs=${page.songs.length} ` +
+          `bridge_ms=${pageMs} name_len=${page.name.length}`,
+      );
+    }
     if (page.state === "ready") {
+      mergeCatalogMeta(file, page.songs);
       setCatalogPages((prev) => ({ ...prev, [file]: page }));
-      if (!catalogQueues()[file]) {
-        const ids = catalogIds(file);
-        if (ids.length > 0) setCatalogQueues((prev) => ({ ...prev, [file]: ids }));
-      }
+      /* 全量 IDs 只用于后续队列/播放导航，不应和首屏 page 共用一次同步桥接。 */
+      queueCatalogIds(file);
     }
     return page;
   };
 
   const pageData = (file: string): CatalogPage | undefined => catalogPages()[file];
+
+  /* 歌单首屏的字体门闩：只预热当前可见窗口和标题，等 pending leases
+   * 变成 ready/error 后再揭示 Recycler。这样冷启动的 prepare 不会和
+   * TrackListPage 的第一次 drawlist 构建叠在一起。 */
+  createEffect(() => {
+    const mode = cjkMode();
+    const epoch = cjkEpoch();
+    const currentSub = sub();
+    const open = cloudOpen();
+    const file = currentSub === "playlist" ? open.file : "";
+    const page = file ? pageData(file) : undefined;
+    if (mode !== "stream" || !file || page?.state !== "ready") {
+      playlistWarmup?.dispose();
+      playlistWarmup = undefined;
+      playlistWarmupKey = "";
+      if (!playlistFontReady()) setPlaylistFontReady(true);
+      /* 子页卸载后 TrackListPage 的 lease 会归零，菜单文本可能把这些
+       * 资源从共享 LRU 中挤掉。不能只在切换字库模式时清 primed 标记，
+       * 否则再次进入同一歌单会误以为字体仍在缓存，直接挂载所有 item，
+       * 然后让它们逐个显示“加载中”并触发一串刷新。重新进入歌单时
+       * 必须重新检查当前可见窗口；命中缓存时这一步是同步 ready 的。 */
+      playlistFontPrimedFile = "";
+      playlistFontPrimedEpoch = -1;
+      return;
+    }
+    /* 同一份歌单已经完成过首次字体准备：后续分页不再替换整个 list，
+     * 只让新进入的 item 自己显示 loading。 */
+    if (playlistFontPrimedFile === file && playlistFontPrimedEpoch === epoch) {
+      playlistWarmup?.dispose();
+      playlistWarmup = undefined;
+      playlistWarmupKey = "";
+      if (!playlistFontReady()) setPlaylistFontReady(true);
+      return;
+    }
+    /* 理论上可从非第一页开始，但那也属于分页语义，不能卡住整个列表。 */
+    if (page.offset !== 0) {
+      playlistWarmup?.dispose();
+      playlistWarmup = undefined;
+      playlistWarmupKey = "";
+      if (!playlistFontReady()) setPlaylistFontReady(true);
+      return;
+    }
+    const items = [
+      { text: open.name || page.name, slot: 7 },
+      ...page.songs.flatMap((song) => [
+        { text: song.title || "", slot: 0 },
+        { text: song.artists || "", slot: 0 },
+      ]),
+    ].filter((item) => item.text.length > 0);
+    const key = `${file}:${page.offset}:${items.map((item) => `${item.slot}:${item.text}`).join("|")}`;
+    if (key === playlistWarmupKey) return;
+    playlistWarmup?.dispose();
+    playlistWarmupKey = key;
+    playlistWarmup = beginCjkWarmup(items);
+    const ready = playlistWarmup.ready();
+    setPlaylistFontReady(ready);
+    if (logEnabled()) {
+      logMsg(`perf: cjk_warmup file=${file} offset=${page.offset} items=${items.length} pending=${playlistWarmup.pending()} ready=${ready ? 1 : 0}`);
+    }
+  });
 
   /*
    * ---------------- 云端条目的"按需物化" ----------------
@@ -421,32 +566,18 @@ export default function Music() {
    * 这些临时条目的 id 是 `nc:<网易云 id>`：队列、收藏、时长覆盖都按这个 id 走。
    */
   const cloudId = (nid: string) => "nc:" + nid;
+  const cloudPlaceholder = "加载中…";
+  const isCloudPlaceholder = (track: Track | undefined): boolean =>
+    !!track && track.title === cloudPlaceholder;
   /* 时长覆盖表：懒加载的条目不在曲库里，原生报回的真实时长只能记在这。 */
   const [cloudDur, setCloudDur] = createSignal<Record<string, number>>({});
 
-  /*
-   * 现在打开的那份清单：`nc:<id>` → 文件里的歌曲节点，**按需单查**。
-   *
-   * 以前这里是个 memo，一次把整份清单（527 首也照做）展开成一张 map ——
-   * 清单一大，每次更新都要重建整张表，而界面一屏只看得到 6 行。
-   * 现在只查"真的要渲染的那一条"，并把查过的记进小缓存；
-   * 单查是 O(n) 的线性扫描，但每帧最多 6 次、且命中缓存后是 O(1)，
-   * 比"每次重建 527 条"便宜得多（真机日志里那 900ms 级联就是它）。
-   */
-  /*
-   * 歌单元数据索引：**每个歌单只建一次**，之后 O(1) 查。
-   *
-   * 走过的弯路（真机黑屏现场）：
-   *   1) 最早是 memo，每次清单更新就把整份展开成 map（527 首 ⇒ 每 5 秒重建一次）；
-   *   2) 改成"按需线性扫描"后，看起来省了，但**起播/换歌时会遍历整份列表逐个查**
-   *      （`stepPlayable`/`getTrack` 每首一次）⇒ 527×527 次比较，一帧干 1~2 秒，
-   *      直接顶爆 PocketJS 的 2 秒预算 → 黑屏（health.json: time budget exceeded）。
-   * 正解是两头都要：**每个文件只建一次索引**，查的时候 O(1)；换歌单才重建。
-   */
+  /* page 返回的歌曲元数据已经在 loadCatalogPage() 中按网易云 id 合并到
+   * catalogMeta；这里 O(1) 查全局小索引，不再只认当前 6/8 条窗口。
+   * 这样 Recycler 槽位预加载到下一页时，也不会因为 page 切换丢失歌名。 */
   const cloudMetaFor = (id: string): ListSong | undefined => {
-    const file = cloudOpen().file ?? "";
-    const songs = file ? pageData(file)?.songs : undefined;
-    return songs?.find((song) => cloudId(song.id) === id);
+    if (!id.startsWith("nc:")) return undefined;
+    return catalogMeta()[id.slice(3)];
   };
 
   const buildCloudTrack = (id: string, meta: ListSong): Track => {
@@ -478,7 +609,14 @@ export default function Music() {
   const lazyKeep: Record<string, Track> = {};
   const lazyOrder: string[] = [];
   const keepLazy = (t: Track) => {
-    if (!t.id.startsWith("nc:") || lazyKeep[t.id]) return;
+    if (!t.id.startsWith("nc:")) return;
+    const old = lazyKeep[t.id];
+    if (old && !isCloudPlaceholder(old)) return;
+    if (old) {
+      /* 允许真实元数据替换之前的占位对象，但不重复占用 LRU 名额。 */
+      lazyKeep[t.id] = t;
+      return;
+    }
     lazyKeep[t.id] = t;
     lazyOrder.push(t.id);
     while (lazyOrder.length > 128) {
@@ -492,13 +630,22 @@ export default function Music() {
     const hit = trackById()[id];
     if (hit) return hit;
     const kept = lazyKeep[id];
-    if (kept) return kept;
     const meta = cloudMetaFor(id);
-    if (meta) {
-      const built = buildCloudTrack(id, meta);
+    const nid = id.startsWith("nc:") ? id.slice(3) : "";
+    const info = nid ? cloudInfo()[nid] : undefined;
+    if (meta || info) {
+      if (kept && !isCloudPlaceholder(kept)) return kept;
+      const built = buildCloudTrack(id, meta ?? {
+        id: nid,
+        title: info?.title || "",
+        artists: info?.artists || "",
+        album: info?.album || "",
+        durationMs: info?.durationMs || 0,
+      });
       keepLazy(built);
       return built;
     }
+    if (kept) return kept;
     /*
      * 最后一道：`nc:<id>` 的元数据可能来自"补回来的在线信息"（收藏页就是这条路）。
      * 补到之前先给一首**占位行**（歌名写 id），这样列表不会空着 —— 用户能看见
@@ -509,7 +656,7 @@ export default function Music() {
       const info = cloudInfo()[nid];
       const built = buildCloudTrack(id, {
         id: nid,
-        title: info?.title || `[在线] ${nid}`,
+        title: cloudPlaceholder,
         artists: info?.artists || "",
         album: info?.album || "",
         durationMs: info?.durationMs || 0,
@@ -517,7 +664,6 @@ export default function Music() {
         vip: 0,
         fee: 0,
       });
-      keepLazy(built);
       return built;
     }
     return undefined;
@@ -584,8 +730,21 @@ export default function Music() {
    * 四个页签的行：全部由这里组装，页面只负责画（MenuList）。
    * 数据来源：list/ 里的 JSON 文件（原生后台刷）+ 本地状态。
    * ------------------------------------------------------------------ */
+  let lastRowsPerfTrace = "";
   const rowsFor = createMemo<MenuRowData[]>(() => {
     const t = tabIndex();
+    const rowsStartedAt = Date.now();
+    const finishRows = (rows: MenuRowData[]): MenuRowData[] => {
+      const trace = `${t}:${rows.length}:${rows.map((row) => `${row.kind}/${row.name}`).join("|")}`;
+      if (trace !== lastRowsPerfTrace && logEnabled()) {
+        lastRowsPerfTrace = trace;
+        logMsg(
+          `perf: menu_rows tab=${t} rows=${rows.length} build_ms=${Date.now() - rowsStartedAt} ` +
+            `names=${rows.map((row) => row.name.slice(0, 20)).join("|")}`,
+        );
+      }
+      return rows;
+    };
 
     /* 发现：热门推荐（推荐歌单），点进去就是那张歌单 */
     if (t === 0) {
@@ -604,7 +763,7 @@ export default function Music() {
           file: `playlist_${p.id}.json`,
         });
       }
-      return rows;
+      return finishRows(rows);
     }
 
     /* 榜单：每日推荐 + 热歌榜/飙升榜/新歌榜/原创榜 */
@@ -629,7 +788,7 @@ export default function Music() {
           file: `playlist_${top.id}.json`,
         });
       }
-      return rows;
+      return finishRows(rows);
     }
 
     /* 歌单：在线歌曲（playlist.json 的全部）→ 我的歌单（账号）→ 我喜欢的 */
@@ -673,13 +832,13 @@ export default function Music() {
           file: `playlist_${p.id}.json`,
         });
       }
-      return rows;
+      return finishRows(rows);
     }
 
     /* 我的：固定几行 */
     const favLocal = favorites().filter((id) => !id.startsWith("nc:") && !!getTrack(id));
     const favOnline = favorites().filter((id) => id.startsWith("nc:"));
-    return [
+    return finishRows([
       { kind: "item", name: "账号", value: loginSnapshot().loggedIn ? "已登录" : "未登录" },
       { kind: "item", name: "我喜欢的（本地）", value: `${favLocal.length} 首` },
       { kind: "item", name: "我喜欢的（在线）", value: `${favOnline.length} 首` },
@@ -687,7 +846,7 @@ export default function Music() {
       { kind: "item", name: "本地音乐", value: `${localIds().length} 首` },
       { kind: "item", name: "专辑", value: `${albums().length} 张` },
       { kind: "item", name: "设置", value: "" },
-    ];
+    ]);
   });
 
   /* 当前子页的列表数据（本地/在线/收藏/专辑详情）。 */
@@ -712,6 +871,10 @@ export default function Music() {
     if (s === "album") return album()?.trackIds.length ?? 0;
     if (s === "playlist") {
       const file = cloudOpen().file;
+      const ids = file ? catalogQueues()[file] : undefined;
+      /* catalogIds 已由 Rust 侧一次解析并缓存；列表按索引直接取，
+       * 不再因为滚动去查当前 page 或扫描旧的曲库数组。 */
+      if (ids?.length) return ids.length;
       const page = file ? pageData(file) : undefined;
       if (page?.state === "ready") return page.total;
       const name = playlistName();
@@ -733,6 +896,8 @@ export default function Music() {
     if (s === "album") return album()?.trackIds[i] ?? "";
     if (s === "playlist") {
       const file = cloudOpen().file;
+      const ids = file ? catalogQueues()[file] : undefined;
+      if (ids?.[i]) return cloudId(ids[i]);
       const page = file ? pageData(file) : undefined;
       if (page?.state === "ready" && i >= page.offset && i < page.offset + page.songs.length) {
         const sid = page.songs[i - page.offset]?.id;
@@ -803,6 +968,30 @@ export default function Music() {
       return listCount();
     }
     return 0;
+  });
+
+  /* 只在列表窗口真正变化时打一行，记录分页后的数据状态；这和
+   * track_window / frame_skip 的 words 日志可以直接按时间顺序对照。 */
+  let lastListViewTrace = "";
+  createEffect(() => {
+    const currentSub = sub();
+    if (
+      currentSub !== "local" && currentSub !== "online" &&
+      currentSub !== "favorites" && currentSub !== "favoritesOnline" &&
+      currentSub !== "album" && currentSub !== "playlist"
+    ) return;
+    const file = currentSub === "playlist" ? cloudOpen().file : "";
+    const page = file ? pageData(file) : undefined;
+    const offset = start();
+    const total = listCount();
+    const trace = `${currentSub}:${file}:${offset}:${total}:${page?.state ?? "none"}:${page?.songs.length ?? 0}`;
+    if (trace === lastListViewTrace || !logEnabled()) return;
+    lastListViewTrace = trace;
+    logMsg(
+      `ui: list_view kind=${currentSub} file=${file} start=${offset} total=${total} ` +
+        `page_state=${page?.state ?? "none"} page_offset=${page?.offset ?? -1} ` +
+        `page_songs=${page?.songs.length ?? 0}`,
+    );
   });
 
   const subTitle = createMemo(() => {
@@ -1148,7 +1337,10 @@ export default function Music() {
       `ui: open_list_row kind=${row.kind} name=${row.name} id=${row.id ?? ""} file=${row.file ?? ""}`,
     );
     if (row.file) {
-      const page = loadCatalogPage(row.file, 0, true);
+      /* 先切到轻量 loading 页，再由下一帧读取清单。不要在按键回调里
+       * 同步 catalogPage/catalogIds，否则字体预热和首屏 drawlist 会被同一
+       * 次输入事件拖住。已有缓存只读，不做桥接。 */
+      const page = catalogPages()[row.file];
       if (page?.name) name = page.name;
       if (page?.state === "ready" && page.total > 0) {
         state = "ready";
@@ -1174,6 +1366,7 @@ export default function Music() {
       forceListSync();
     }
     openSub("playlist");
+    if (row.file) queueCatalogPage(row.file, 0, 1);
     refreshListIfStale();
   };
 
@@ -1430,25 +1623,8 @@ export default function Music() {
       setZone("content");
       return;
     }
-    /*
-     * 长歌单里"按回去要按酸手"（真机反馈）：△ 先在**歌曲列表子页**里
-     * 一跳回到第一首（光标 0 是顶部那个 ← ，第一首是 1）；
-     * 已经在最上面（光标 ≤1 或光标停在标题栏）时，再按 △ 才是返回。
-     * 也就是"△ 回顶，已在顶部时 △ 返回"。
-     */
-    const songListSub =
-      sub() === "local" ||
-      sub() === "online" ||
-      sub() === "favorites" ||
-      sub() === "favoritesOnline" ||
-      sub() === "album" ||
-      sub() === "playlist";
-    if (songListSub && !headerFocus() && cursor() > 1) {
-      setCursor(1);
-      setStart(0);
-      logMsg("list: △ 回到第一首");
-      return;
-    }
+    /* △ 在任意子页都直接退出。列表不再先把光标滚回第一首，否则用户
+     * 连按时会看到列表不断向上滚，且无法把按键当作明确的返回操作。 */
     if (sub() !== null) closeSub();
   }, { active: screenOn });
 
@@ -1491,6 +1667,14 @@ export default function Music() {
      * effect 放在同一帧。只在帧循环里一次性泵一个已排队的二维码。
      */
     pumpQrTexture();
+    /* 流式字体的 prepare 是主线程上的同步 bookkeeping，但不能把一屏
+     * 文本一次性塞进同一帧。每帧最多推进一个 lease；页面仍停在 loading
+     * 占位态时，drawlist 不会和冷启动字形收集重叠。 */
+    /* prepareText 单次可能占 30~60ms（日志已证实），即使每次只推进
+     * 一个也不应连续霸占每个 vblank。错开到每 4 帧一次，空闲帧给
+     * drawlist / 输入 / present 让路；页面 warmup 仍会继续轮询完成。 */
+    cjkPrepareFrame += 1;
+    if (cjkPrepareFrame % 4 === 1) perfSpan("cjkPrepare", () => pumpCjkPrepare(1));
     perfFrame(); /* 掉帧 / 帧率汇总（只在慢的时候写日志） */
     /* 音频泵也要入账：它是**原生调用**（SDL / sceAudioOutOutput），输出缓冲满时
      * 会按音频时钟阻塞 —— 那部分是"等音频"，不是卡顿，必须和 JS 逻辑分开看。 */
@@ -1510,6 +1694,24 @@ export default function Music() {
     }
     if (displayOff()) return;
     frameCounter += 1;
+
+    /* 页面已经显示 loading 后才读 native catalog；即使桥接本身偶尔较慢，
+     * 也不会和按键回调、列表第一次 mount、字体收集叠在同一个同步栈。 */
+    if (deferredCatalogPage && deferredCatalogPage.dueFrame <= frameCounter) {
+      const task = deferredCatalogPage;
+      deferredCatalogPage = undefined;
+      loadCatalogPage(task.file, task.offset);
+    }
+    if (playlistWarmup && !playlistFontReady() && playlistWarmup.ready()) {
+      playlistFontPrimedFile = cloudOpen().file;
+      playlistFontPrimedEpoch = cjkEpoch();
+      setPlaylistFontReady(true);
+      if (logEnabled()) {
+        logMsg(`perf: cjk_warmup_ready pending=0`);
+      }
+    }
+    /* catalogIds 只为后续播放队列服务，低优先级地一次处理一个文件。 */
+    if (frameCounter % 2 === 0) pumpCatalogIds();
 
     /* 登录状态：登录页开着时半秒一推（扫码要跟手），其它页面 2 秒一推。
      * 以前只有登录页才会刷新，于是"上次登录过、这次直接开应用"时，
@@ -1669,7 +1871,8 @@ export default function Music() {
       let name = open.name;
       let songs: ListSong[] | undefined;
       if (open.file) {
-        const page = loadCatalogPage(open.file, start());
+        queueCatalogPage(open.file, start(), 1);
+        const page = pageData(open.file);
         if (page?.name) name = page.name;
         if (page?.state === "ready") songs = page.songs;
       }
@@ -1841,6 +2044,7 @@ export default function Music() {
                    }
                  >
                     <TrackListPage
+                      debugName={sub() ?? "track"}
                       count={listCount}
                       idAt={listIdAt}
                       getTrack={getTrack}
@@ -1854,11 +2058,19 @@ export default function Music() {
                       网易云歌单要等接口，先显示"正在同步 / 同步失败"。 */}
                   <Show when={sub() === "playlist"}>
                     <Show
-                      when={cloudOpen().id === "" || cloudOpen().state === "ready" || listCount() > 0}
+                      when={
+                        (cloudOpen().id === "" || cloudOpen().state === "ready" || listCount() > 0) &&
+                        (cjkMode() !== "stream" || playlistFontReady() || start() !== 0)
+                      }
                       fallback={
                         <PlaceholderPage
                           text={
-                            cloudOpen().state === "failed"
+                            cjkMode() === "stream" &&
+                            (cloudOpen().state === "ready" || listCount() > 0) &&
+                            start() === 0 &&
+                            !playlistFontReady()
+                              ? `准备字体…${playlistWarmup?.pending() ? ` ${playlistWarmup.pending()}` : ""}`
+                              : cloudOpen().state === "failed"
                               ? cloudOpen().message || "同步失败（检查登录状态）"
                               : syncElapsed() > 45
                                 ? "同步超时（网络或登录）· 按 △ 返回"
@@ -1870,6 +2082,7 @@ export default function Music() {
                       }
                     >
                       <TrackListPage
+                        debugName="playlist"
                         count={listCount}
                         idAt={listIdAt}
                         getTrack={getTrack}
@@ -1924,6 +2137,7 @@ export default function Music() {
             />
             {/* 四个页签共用一套行驱动菜单：行数据由 rowsFor() 组装。 */}
             <MenuList
+              debugName={`tab-${tabIndex()}`}
               rows={rowsFor()}
               cursor={cursor}
               start={start}

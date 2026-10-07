@@ -39,12 +39,14 @@ pub fn frame_changed() -> bool {
             list.words.len()
         ));
     }
+    let hash_t0 = crate::media::platform::time::now_ms();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for word in &list.words {
         hash ^= *word as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash ^= revision.rotate_left(7);
+    let hash_ms = crate::media::platform::time::now_ms().saturating_sub(hash_t0);
     let seen = SEEN.swap(true, Ordering::AcqRel);
     let changed = !(seen && LAST_HASH.load(Ordering::Acquire) == hash);
     if changed {
@@ -56,8 +58,11 @@ pub fn frame_changed() -> bool {
         let tick = FRAME_TICKS.fetch_add(1, Ordering::AcqRel) + 1;
         if tick % 60 == 0 {
             log::append(&format!(
-                "frame: words={} present={}",
+                "frame: words={} draw_ms={} hash_ms={} raster_rev={} present={}",
                 list.words.len(),
+                draw_ms,
+                hash_ms,
+                revision,
                 if changed { 1 } else { 0 }
             ));
         }

@@ -247,7 +247,18 @@ unsafe extern "C" fn js_net_catalog_menu(
     argv: *mut JSValue,
 ) -> JSValue {
     let kind = arg_string(ctx, argc, argv, 0);
-    js_str(ctx, &crate::media::catalog::menu_json(&kind))
+    let t0 = crate::media::platform::time::now_ms();
+    let raw = crate::media::catalog::menu_json(&kind);
+    let ms = crate::media::platform::time::now_ms().saturating_sub(t0);
+    if log::enabled() && ms >= 2 {
+        log::append(&format!(
+            "perf: catalog_bridge kind={} op=menu ms={} bytes={}",
+            kind,
+            ms,
+            raw.len(),
+        ));
+    }
+    js_str(ctx, &raw)
 }
 
 /// Return one bounded visible window from a native-parsed list document.
@@ -262,7 +273,20 @@ unsafe extern "C" fn js_net_catalog_page(
     let name = arg_string(ctx, argc, argv, 0);
     let offset = arg_string(ctx, argc, argv, 1).parse::<usize>().unwrap_or(0);
     let limit = arg_string(ctx, argc, argv, 2).parse::<usize>().unwrap_or(6);
-    js_str(ctx, &crate::media::catalog::page_json(&name, offset, limit))
+    let t0 = crate::media::platform::time::now_ms();
+    let raw = crate::media::catalog::page_json(&name, offset, limit);
+    let ms = crate::media::platform::time::now_ms().saturating_sub(t0);
+    if log::enabled() && ms >= 2 {
+        log::append(&format!(
+            "perf: catalog_bridge kind={} op=page offset={} limit={} ms={} bytes={}",
+            name,
+            offset,
+            limit,
+            ms,
+            raw.len(),
+        ));
+    }
+    js_str(ctx, &raw)
 }
 
 /// Return only IDs for queue navigation.  Song metadata never crosses the
@@ -274,7 +298,18 @@ unsafe extern "C" fn js_net_catalog_ids(
     argv: *mut JSValue,
 ) -> JSValue {
     let name = arg_string(ctx, argc, argv, 0);
-    js_str(ctx, &crate::media::catalog::ids_json(&name))
+    let t0 = crate::media::platform::time::now_ms();
+    let raw = crate::media::catalog::ids_json(&name);
+    let ms = crate::media::platform::time::now_ms().saturating_sub(t0);
+    if log::enabled() && ms >= 2 {
+        log::append(&format!(
+            "perf: catalog_bridge kind={} op=ids ms={} bytes={}",
+            name,
+            ms,
+            raw.len(),
+        ));
+    }
+    js_str(ctx, &raw)
 }
 
 /// 触发一次后台清单同步。`listSync(1)` 跳过 10 分钟 TTL（登录成功后 /

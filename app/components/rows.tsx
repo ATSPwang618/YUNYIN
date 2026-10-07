@@ -13,12 +13,14 @@ export function MenuRow(props: {
 }) {
   return (
     <View class={props.focused ? bgCls("rowFocus") : bgCls("row")}>
-      <Text class={props.focused ? pTxt("accent") : pTxt("rowTitle")}>
-        {(props.focused ? "› " : "") + clipW(props.title, 26)}
-      </Text>
-      <Text class={props.focused ? pTxt("accent") : pTxt("rowValue")}>
-        {clipW(props.value, 12)}
-      </Text>
+      <StreamText
+        class={props.focused ? pTxt("accent") : pTxt("rowTitle")}
+        text={(props.focused ? "› " : "") + clipW(props.title, 26)}
+      />
+      <StreamText
+        class={props.focused ? pTxt("accent") : pTxt("rowValue")}
+        text={clipW(props.value, 12)}
+      />
     </View>
   );
 }
@@ -30,8 +32,8 @@ export function CardRow(props: {
 }) {
   return (
     <View class={props.focused ? bgCls("cardFocus") : bgCls("card")}>
-      <Text class={pTxt("cardTitle")}>{clipW(props.title, 36)}</Text>
-      <Text class={pTxt("cardSub")}>{clipW(props.sub, 38)}</Text>
+      <StreamText class={pTxt("cardTitle")} text={clipW(props.title, 36)} />
+      <StreamText class={pTxt("cardSub")} text={clipW(props.sub, 38)} />
     </View>
   );
 }

@@ -327,9 +327,14 @@ REFRESH_FONT_ATLAS_FN = r"""
 /// 时写过 —— 于是流式字形有字宽、没字墨（生僻字显示成空占位）。
 ///
 /// 这里只重写**这次真正变化**的那几个字形格子（dirty 由宿主给出），不重建纹理
-/// （Vita3K 的 GXM 模拟反复销毁纹理容易出问题），写之前等上一帧 GPU 画完。
+/// （Vita3K 的 GXM 模拟反复销毁纹理容易出问题）。宿主会在同一帧的多个
+/// slot 更新前统一等待一次，避免每个 slot 都触发一次 GPU 同步。
 /// 返回 false = 纹理不存在或几何对不上，调用方应改用 register_font_atlas()。
-pub fn refresh_font_atlas(slot: u8, atlas: &Atlas, dirty: i64) -> bool {
+pub fn wait_for_font_atlas_refresh() {
+    unsafe { vita2d_wait_rendering_done(); }
+}
+
+pub fn refresh_font_atlas(slot: u8, atlas: &Atlas, dirty: i64, wait: bool) -> bool {
     let coverage_w = atlas.coverage_width();
     let coverage_h = atlas.coverage_height();
     unsafe {
@@ -359,8 +364,11 @@ pub fn refresh_font_atlas(slot: u8, atlas: &Atlas, dirty: i64) -> bool {
             return true;
         }
         let to = to.min(font.glyph_count - 1);
-        /* 等上一帧 GPU 画完再改纹理内存：这些格子可能还在被采样。 */
-        vita2d_wait_rendering_done();
+        /* 这些格子可能还在被采样。调用方通常已经在批量更新前等待过；
+         * wait=true 只保留给单独调用此函数的兼容路径。 */
+        if wait {
+            vita2d_wait_rendering_done();
+        }
         let stride = vita2d_texture_get_stride(font.texture.ptr) as usize;
         let dst = vita2d_texture_get_datap(font.texture.ptr) as *mut u8;
         if dst.is_null() {
@@ -570,3 +578,369 @@ def patch_font_dirty():
         print("[build-vpk] patch: Ui::take_font_stream_dirty")
     else:
         raise SystemExit("[build-vpk] lib.rs font_atlas_revision anchor not found")
+
+
+def patch_font_cache():
+    """Reduce stream-font allocation churn and coalesce invalidation per frame.
+
+    The upstream stream protocol is kept intact.  Admission reuses the sorted
+    wanted vector instead of cloning/sorting a new union for every TextResource,
+    and several glyph commits in one Ui frame share one raster invalidation.
+    """
+    fs = PKJ / "engine/core/src/font_stream.rs"
+    t = fs.read_text()
+    old_union = (
+        "            let mut union = s.wanted.clone();\n"
+        "            union.extend_from_slice(&scalars);\n"
+        "            union.sort_unstable();\n"
+        "            union.dedup();\n"
+        "            if union.len() > s.entries.len() {\n"
+        "                return -2;\n"
+        "            }\n"
+        "            let s = self.stream.as_mut().unwrap();\n"
+        "            s.wanted = union;\n"
+        "            s.leases.push(Lease { id, scalars });\n"
+    )
+    new_union = (
+        "            /* Keep wanted sorted in place.  The old clone + sort path\n"
+        "             * allocated a full union for every visible text node. */\n"
+        "            let additional = scalars\n"
+        "                .iter()\n"
+        "                .filter(|cp| s.wanted.binary_search(cp).is_err())\n"
+        "                .count();\n"
+        "            if s.wanted.len() + additional > s.entries.len() {\n"
+        "                return -2;\n"
+        "            }\n"
+        "            let s = self.stream.as_mut().unwrap();\n"
+        "            for cp in &scalars {\n"
+        "                if let Err(at) = s.wanted.binary_search(cp) {\n"
+        "                    s.wanted.insert(at, *cp);\n"
+        "                }\n"
+        "            }\n"
+        "            s.leases.push(Lease { id, scalars });\n"
+    )
+    if "Keep wanted sorted in place" in t:
+        print("[build-vpk] font stream wanted-vector reuse already patched")
+    elif old_union in t:
+        t = t.replace(old_union, new_union, 1)
+        print("[build-vpk] patch: font stream wanted-vector reuse")
+    else:
+        raise SystemExit("[build-vpk] font stream wanted union anchor not found")
+
+    old_init = (
+        "            wanted: Vec::new(),\n"
+        "            leases: Vec::new(),\n"
+    )
+    new_init = (
+        "            wanted: Vec::with_capacity(capacity),\n"
+        "            leases: Vec::with_capacity(MAX_LEASES),\n"
+    )
+    if "wanted: Vec::with_capacity(capacity)" in t:
+        print("[build-vpk] font stream cache reserve already patched")
+    elif old_init in t:
+        t = t.replace(old_init, new_init, 1)
+        print("[build-vpk] patch: font stream cache reserve")
+    else:
+        raise SystemExit("[build-vpk] font stream cache init anchor not found")
+    fs.write_text(t)
+
+    lib = PKJ / "engine/core/src/lib.rs"
+    l = lib.read_text()
+    old_field = "    font_revisions: [u64; spec::MAX_FONT_SLOTS],\n"
+    new_field = old_field + (
+        "    /// Last frame that already invalidated raster output for streamed glyph commits.\n"
+        "    font_stream_raster_frame: u64,\n"
+    )
+    if "font_stream_raster_frame" not in l:
+        if old_field not in l:
+            raise SystemExit("[build-vpk] Ui font revision field anchor not found")
+        l = l.replace(old_field, new_field, 1)
+        old_init_field = "            font_revisions: [0; spec::MAX_FONT_SLOTS],\n"
+        new_init_field = old_init_field + "            font_stream_raster_frame: u64::MAX,\n"
+        if old_init_field not in l:
+            raise SystemExit("[build-vpk] Ui font revision init anchor not found")
+        l = l.replace(old_init_field, new_init_field, 1)
+        print("[build-vpk] patch: coalesced font raster invalidation")
+    else:
+        print("[build-vpk] coalesced font raster invalidation already patched")
+
+    old_commit = (
+        "        if n > 0 {\n"
+        "            self.font_revisions[slot as usize] = self.font_revisions[slot as usize].wrapping_add(1);\n"
+        "            self.mark_layout_dirty();\n"
+        "            self.bump_raster_revision();\n"
+        "        }\n"
+    )
+    new_commit = (
+        "        if n > 0 {\n"
+        "            self.font_revisions[slot as usize] = self.font_revisions[slot as usize].wrapping_add(1);\n"
+        "            self.mark_layout_dirty();\n"
+        "            /* Several offload replies may land in one guest frame.\n"
+        "             * Layout is already dirty; invalidate raster output once. */\n"
+        "            if self.font_stream_raster_frame != self.frame {\n"
+        "                self.font_stream_raster_frame = self.frame;\n"
+        "                self.bump_raster_revision();\n"
+        "            }\n"
+        "        }\n"
+    )
+    if "Several offload replies may land in one guest frame" in t:
+        print("[build-vpk] font raster invalidation coalescing already patched")
+    elif old_commit in t:
+        t = t.replace(old_commit, new_commit, 1)
+        print("[build-vpk] patch: font raster invalidation coalescing")
+    else:
+        raise SystemExit("[build-vpk] font stream commit anchor not found")
+    fs.write_text(t)
+    lib.write_text(l)
+
+
+def patch_stream_font_paging():
+    """把一次字体预取扩大成 16 个字符的逻辑页，并按协议拆成小页提交。
+
+    offload v1 的单条记录上限仍只能容纳 5 个 26x36 字形（返回值是 hex），
+    所以这里不冒险放大所有 IO 缓冲，而是把 16 个 miss 先固定成一个逻辑页，
+    再切成最多 5 个字形的 wire page。这样可以减少需求扫描和 UI 变更次数，
+    同时保留现有 companion/local provider 的协议兼容性。
+    """
+    f = PKJ / "framework/src/fonts.ts"
+    t = f.read_text()
+    if "const LOGICAL_PAGE_SIZE = 16;" in t:
+        print("[build-vpk] streamed font logical paging already patched")
+        return
+
+    old_decl = (
+        "  const batches = new Set<Batch>(), requests = new Set<number>(), inflight = new Set<string>(),\n"
+        "    retries = new Map<string, { frame: number; attempts: number }>();\n"
+    )
+    new_decl = (
+        "  type GlyphPage = { slot: number; scalars: number[]; keys: string[] };\n"
+        "  const LOGICAL_PAGE_SIZE = 16;\n"
+        "  const batches = new Set<Batch>(), requests = new Set<number>(), inflight = new Set<string>(),\n"
+        "    queued = new Set<string>(), pageQueue: GlyphPage[] = [],\n"
+        "    retries = new Map<string, { frame: number; attempts: number }>();\n"
+    )
+    if old_decl not in t:
+        raise SystemExit("[build-vpk] fonts.ts paging declaration anchor not found")
+    t = t.replace(old_decl, new_decl, 1)
+
+    old_reset = "    requests.clear(); inflight.clear(); retries.clear(); opening = false;\n"
+    new_reset = (
+        "    requests.clear(); inflight.clear(); queued.clear(); pageQueue.length = 0;\n"
+        "    retries.clear(); opening = false;\n"
+    )
+    if old_reset not in t:
+        raise SystemExit("[build-vpk] fonts.ts paging reset anchor not found")
+    t = t.replace(old_reset, new_reset, 1)
+
+    start = t.index("  const step = () => {")
+    end = t.index("  // Validate configuration", start)
+    new_step = r'''  const step = () => {
+    if (dead) return;
+    frame++;
+    const current = client.session();
+    if (current !== session) { session = current; reset(); }
+    if (!face) {
+      if (status.state !== "error" && !opening) open(); // offload supplies a bounded unavailable timeout
+      return;
+    }
+    let loading = false;
+    for (const b of batches) {
+      if (status.state === "ready") admit(b);
+      loading ||= b.admitted && b.state.status === "pending";
+    }
+    if ((!loading && !pageQueue.length) || status.paused || status.state === "error") return;
+
+    /* One logical page covers the visible window. The wire protocol still uses
+     * F.maxBatch-sized pages so a glyph reply stays within the 4096-byte record. */
+    if (!pageQueue.length) {
+      if (requests.size >= 2) return;
+      const demand = JSON.parse(host.fontStreamRequests!()) as number[][];
+      const available = demand.filter(([g, s, cp]) => g === face!.generation && slots.includes(s) &&
+        !inflight.has(`${s}:${cp}`) && !queued.has(`${s}:${cp}`) &&
+        (retries.get(`${s}:${cp}`)?.frame ?? 0) <= frame);
+      if (!available.length) return;
+      const slot = [...new Set(available.map(r => r[1]))].sort((a, b) => a - b).find(s => s > lastSlot) ?? available[0][1];
+      lastSlot = slot;
+      const scalars = available.filter(r => r[1] === slot).slice(0, LOGICAL_PAGE_SIZE).map(r => r[2]);
+      const strike = face.strikes.find(s => s.slot === slot)!;
+      const packed = Math.ceil(strike.width * strike.height / 4), stride = 8 + packed;
+      const wireCount = Math.min(F.maxBatch, Math.floor((1250 - 12) / stride));
+      for (let i = 0; i < scalars.length; i += wireCount) {
+        const pageScalars = scalars.slice(i, i + wireCount);
+        const keys = pageScalars.map(cp => `${slot}:${cp}`);
+        pageQueue.push({ slot, scalars: pageScalars, keys });
+        keys.forEach(k => queued.add(k));
+      }
+    }
+    if (requests.size >= 2 || !pageQueue.length) return;
+    const page = pageQueue.shift()!;
+    const { slot, scalars, keys } = page;
+    const strike = face.strikes.find(s => s.slot === slot)!;
+    const packed = Math.ceil(strike.width * strike.height / 4), stride = 8 + packed;
+    const token = serial;
+    keys.forEach(k => { queued.delete(k); inflight.add(k); });
+    const id = client.request("font.glyphs", JSON.stringify({ generation: face.generation, slot, scalars }), result => {
+      requests.delete(id);
+      if (token !== serial) return;
+      keys.forEach(k => inflight.delete(k));
+      let error = "";
+      try {
+        if (!result.ok) throw new Error(result.error);
+        const bytes = decodeHex(result.value), v = new DataView(bytes.buffer);
+        if (bytes.length !== 12 + scalars.length * stride || v.getUint32(0, true) !== F.glyphMagic ||
+            v.getUint32(4, true) !== face!.generation || bytes[8] !== slot || bytes[9] !== scalars.length ||
+            bytes[10] !== strike.width || bytes[11] !== strike.height || scalars.some((cp, i) =>
+              v.getUint32(12 + i * stride, true) !== cp || bytes[17 + i * stride] > strike.width ||
+              bytes[18 + i * stride] > 1 || bytes[19 + i * stride] !== 0))
+          throw new Error("Font reply does not match the requested batch");
+        status.loaded += host.fontStreamCommit!(bytes);
+        status.error = "";
+      } catch (e) { error = String(e); status.error = error; }
+      for (let i = 0; i < keys.length; i++) {
+        const key = keys[i], cp = scalars[i];
+        if (!error) { retries.delete(key); continue; }
+        const waiting = [...batches].filter(b => b.value.slot === slot && b.state.status === "pending" && b.scalars.includes(cp));
+        if (!waiting.length) { retries.delete(key); continue; }
+        const attempts = (retries.get(key)?.attempts ?? 0) + 1;
+        if (attempts >= 3) {
+          for (const b of waiting) publish(b, failed(new Error(error || "Glyph commit failed")));
+          retries.delete(key);
+        } else retries.set(key, { frame: frame + 30 * attempts, attempts });
+      }
+      /* One notification per wire page; Rust coalesces same-frame raster
+       * invalidation and the next step drains the remaining pages. */
+      refresh();
+    });
+    if (id) { requests.add(id); status.requests++; }
+    else keys.forEach(k => inflight.delete(k));
+  };
+'''
+    t = t[:start] + new_step + t[end:]
+    f.write_text(t)
+    print("[build-vpk] patch: streamed font logical page=16, wire pages=5")
+
+
+def patch_stream_font_batch_limit():
+    """把一次字体 offload 的 wire batch 从 4 扩到 5 个字形。
+
+    Vita 当前 13x18 的 2-bit 字模每个字形占 234 字节，5 个字形编码后
+    是 2444 个 hex 字符，仍在 offload 的 2500 字符上限内。原来的 4
+    是按更保守的 1250 字节上限固定下来的，导致每个回复都更早触发一次
+    host font atlas refresh；扩大到 5 可以减少刷新次数，同时仍由
+    `wireCount` 按实际 strike 尺寸重新计算，遇到更大字模会自动退回。
+    """
+    fs = PKJ / "engine/core/src/font_stream.rs"
+    t = fs.read_text()
+    old = "pub const MAX_BATCH: usize = 4;"
+    new = "pub const MAX_BATCH: usize = 5;"
+    if old in t:
+        t = t.replace(old, new, 1)
+        print("[build-vpk] patch: streamed font MAX_BATCH=5")
+    elif new in t:
+        print("[build-vpk] streamed font MAX_BATCH=5 already patched")
+    else:
+        raise SystemExit("[build-vpk] font_stream MAX_BATCH anchor not found")
+    fs.write_text(t)
+
+    spec = PKJ / "contracts/spec/font-archive.ts"
+    t = spec.read_text()
+    old = "  maxBatch: 4,"
+    new = "  maxBatch: 5,"
+    if old in t:
+        t = t.replace(old, new, 1)
+        print("[build-vpk] patch: font archive maxBatch=5")
+    elif new in t:
+        print("[build-vpk] font archive maxBatch=5 already patched")
+    else:
+        raise SystemExit("[build-vpk] font archive maxBatch anchor not found")
+    spec.write_text(t)
+
+    fonts = PKJ / "framework/src/fonts.ts"
+    t = fonts.read_text()
+    old = "      const wireCount = Math.min(F.maxBatch, Math.floor((1250 - 12) / stride));"
+    new = (
+        "      /* The reply is hex encoded: keep the binary batch under the "
+        "2500-char payload limit. */\n"
+        "      const wireCount = Math.min(F.maxBatch, Math.floor((2500 / 2 - 12) / stride));"
+    )
+    if old in t:
+        t = t.replace(old, new, 1)
+        print("[build-vpk] patch: streamed font wire budget uses payload limit")
+    elif "2500 / 2 - 12" in t:
+        print("[build-vpk] streamed font wire budget already patched")
+    else:
+        raise SystemExit("[build-vpk] fonts.ts wire budget anchor not found")
+    fonts.write_text(t)
+
+    host = PKJ / "hosts/vita/src/media/ui/cjk_host.rs"
+    t = host.read_text()
+    old = "count > 0 && count <= 4 && slot < 24"
+    new = "count > 0 && count <= 5 && slot < 24"
+    if old in t:
+        t = t.replace(old, new, 1)
+        print("[build-vpk] patch: Vita font request count=5")
+    elif new in t:
+        print("[build-vpk] Vita font request count=5 already patched")
+    else:
+        raise SystemExit("[build-vpk] Vita font request count anchor not found")
+    host.write_text(t)
+
+    local = PKJ / "hosts/vita/src/media/ui/offload_local.rs"
+    t = local.read_text()
+    if "pub cps: [u32; 4]" in t or "cps: [0; 4]" in t:
+        t = t.replace("pub cps: [u32; 4]", "pub cps: [u32; 5]")
+        t = t.replace("cps: [0; 4]", "cps: [0; 5]")
+        print("[build-vpk] patch: Vita local glyph request storage=5")
+    elif "pub cps: [u32; 5]" in t and "cps: [0; 5]" in t:
+        print("[build-vpk] Vita local glyph request storage=5 already patched")
+    else:
+        raise SystemExit("[build-vpk] Vita local glyph request storage anchor not found")
+    local.write_text(t)
+
+
+def patch_stream_layout_cache():
+    """让 core 也缓存 streamed glyph 的布局结果。
+
+    原始 draw path 为了防止字形补齐后显示旧 gid，直接禁止 stream atlas
+    使用布局缓存；但 `font_revisions[slot]` 已经在每次提交时递增，revision
+    本身就是可靠的失效键。允许带缺字占位的布局先进入 LRU，字形提交后由
+    revision 让它自然重算，避免列表每帧重新收集/排版整段 CJK 文本。
+    """
+    draw = PKJ / "engine/core/src/draw.rs"
+    t = draw.read_text()
+    old_lookup = (
+        "        let mut cached = atlas.stream.is_none() && layouts.get(&node_slot)\n"
+        "            .is_some_and(|entry| entry.key == key && entry.text == run);\n"
+    )
+    new_lookup = (
+        "        /* font_revisions includes streamed glyph commits.  A stream atlas\n"
+        "         * can therefore use the same node-local layout LRU: a pending\n"
+        "         * tofu layout is invalidated as soon as the glyph arrives. */\n"
+        "        let mut cached = layouts.get(&node_slot)\n"
+        "            .is_some_and(|entry| entry.key == key && entry.text == run);\n"
+    )
+    if "font_revisions includes streamed glyph commits" in t:
+        print("[build-vpk] streamed text layout cache already patched")
+    elif old_lookup not in t:
+        raise SystemExit("[build-vpk] draw.rs streamed layout lookup anchor not found")
+    else:
+        t = t.replace(old_lookup, new_lookup, 1)
+        print("[build-vpk] patch: streamed text layout lookup cache")
+
+    old_insert = (
+        "            if atlas.stream.is_none() && self.fonts.misses.get() == misses &&\n"
+        "                run.capacity() <= 256 && scratch.capacity() <= 256 {\n"
+    )
+    new_insert = (
+        "            let stream_layout = atlas.stream.is_some();\n"
+        "            if (stream_layout || self.fonts.misses.get() == misses) &&\n"
+        "                run.capacity() <= 256 && scratch.capacity() <= 256 {\n"
+    )
+    if "let stream_layout = atlas.stream.is_some();" in t:
+        print("[build-vpk] streamed text layout insert cache already patched")
+    elif old_insert not in t:
+        raise SystemExit("[build-vpk] draw.rs streamed layout insert anchor not found")
+    else:
+        t = t.replace(old_insert, new_insert, 1)
+        print("[build-vpk] patch: streamed text layout insert cache")
+    draw.write_text(t)

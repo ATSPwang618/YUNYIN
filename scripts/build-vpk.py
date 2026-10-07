@@ -69,6 +69,10 @@ def apply_host_patches(*, diagnostics: bool = True) -> None:
     if not config.BARE_GRAPHICS:
         patches_graphics.patch_graphics_glyph()
     patches_graphics.patch_font_dirty()
+    patches_graphics.patch_font_cache()
+    patches_graphics.patch_stream_font_paging()
+    patches_graphics.patch_stream_font_batch_limit()
+    patches_graphics.patch_stream_layout_cache()
 
 
 def build_and_pack() -> None:

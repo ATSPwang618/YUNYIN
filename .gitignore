@@ -32,6 +32,7 @@ scripts/tools/*.exe
 tag-report.csv
 music-to-fix.m3u8
 *.log
+!docs/perf/*.log
 
 # ── OS / 编辑器 ──────────────────────────────────────────────────
 .DS_Store
