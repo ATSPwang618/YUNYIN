@@ -13,14 +13,18 @@ export function MenuRow(props: {
 }) {
   return (
     <View class={props.focused ? bgCls("rowFocus") : bgCls("row")}>
-      <StreamText
-        class={props.focused ? pTxt("accent") : pTxt("rowTitle")}
-        text={(props.focused ? "› " : "") + clipW(props.title, 26)}
-      />
-      <StreamText
-        class={props.focused ? pTxt("accent") : pTxt("rowValue")}
-        text={clipW(props.value, 12)}
-      />
+      <View class="flex-1 min-w-0">
+        <StreamText
+          class={props.focused ? pTxt("accent") : pTxt("rowTitle")}
+          text={(props.focused ? "› " : "") + clipW(props.title, 26)}
+        />
+      </View>
+      <View class="shrink-0">
+        <StreamText
+          class={props.focused ? pTxt("accent") : pTxt("rowValue")}
+          text={clipW(props.value, 12)}
+        />
+      </View>
     </View>
   );
 }
@@ -73,11 +77,11 @@ export function TrackRow(props: {
     /* 曲目行**永远是"普通行"样式**：焦点由父级指示器表达（评审 §8）。
      * 这样上下移动时行本身不换 class、不换文字，一次按键只动指示器一个节点。 */
     <View class={bgCls("row")}>
-      <View class="flex-row items-center gap-2 overflow-hidden">
-        <Text class={pTxt("index")}>
-          {String(props.index)}
-        </Text>
-        <View class="flex-col overflow-hidden">
+      <View class="flex-1 min-w-0 flex-row items-center gap-2 overflow-hidden">
+        <View class="shrink-0">
+          <Text class={pTxt("index")}>{String(props.index)}</Text>
+        </View>
+        <View class="flex-1 min-w-0 flex-col overflow-hidden">
           <StreamText
             class={blocked() ? pTxt("hint") : pTxt("listTitle")}
             text={clipW(props.title, 26)}
@@ -85,9 +89,11 @@ export function TrackRow(props: {
           <StreamText class={pTxt("listSub")} text={clipW(props.artist, 30)} />
         </View>
       </View>
-      <Text class={blocked() || !props.current ? pTxt("rowValue") : pTxt("accent")}>
-        {label()}
-      </Text>
+      <View class="shrink-0">
+        <Text class={blocked() || !props.current ? pTxt("rowValue") : pTxt("accent")}>
+          {label()}
+        </Text>
+      </View>
     </View>
   );
 }
@@ -101,16 +107,18 @@ export function AlbumRow(props: {
 }) {
   return (
     <View class={props.focused ? bgCls("rowFocus") : bgCls("row")}>
-      <View class="flex-col overflow-hidden">
+      <View class="flex-1 min-w-0 flex-col overflow-hidden">
         <StreamText
           class={props.focused ? pTxt("accent") : pTxt("listTitle")}
           text={props.title}
         />
         <StreamText class={pTxt("listSub")} text={props.artist} />
       </View>
-      <Text class={props.focused ? pTxt("accent") : pTxt("rowValue")}>
-        {props.count} 首
-      </Text>
+      <View class="shrink-0">
+        <Text class={props.focused ? pTxt("accent") : pTxt("rowValue")}>
+          {props.count} 首
+        </Text>
+      </View>
     </View>
   );
 }

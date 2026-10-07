@@ -3,8 +3,7 @@
 
 import re
 
-from . import patches_graphics
-from .config import APP_NAME, CATCH_HANG, FORCE_CJK_BAKED, NO_COVER, PKJ
+from .config import APP_NAME, CATCH_HANG, NO_COVER, PKJ
 from .patching import patch
 
 
@@ -54,17 +53,20 @@ def patch_host():
     # stale block simply broke the next build; comparing against every file we
     # ship keeps the two in step.
     needs_cc = (
-        "host/yunyin_listdir.c" not in b
-        or "audio/yplayer.c" not in b
-        or "audio/yp_io_file.c" not in b
-        or "audio/ym4a.c" not in b
-        or "audio/yaac.c" not in b
-        or "net/yhttp.c" not in b
-        or 'join("yhttp.c")' in b  # the abandoned flat-path block
+        not ("host/yunyin_listdir.c" in b or 'host.join("yunyin_listdir.c")' in b)
+        or not ("audio/yplayer.c" in b or 'audio.join("yplayer.c")' in b)
+        or not ("audio/yp_io_file.c" in b or 'audio.join("yp_io_file.c")' in b)
+        or not ("audio/ym4a.c" in b or 'audio.join("ym4a.c")' in b)
+        or not ("audio/yaac.c" in b or 'audio.join("yaac.c")' in b)
+        or not ("net/yhttp.c" in b or 'net.join("yhttp.c")' in b)
+        or 'native.join("yhttp.c")' in b  # the abandoned flat-path block
         or "yunyin_shellsvc_stub.S" in b
         or "empva_bridge" in b
         or "taihen_loader" in b
         or 'cargo:rustc-link-lib=mpg123' not in b
+        or 'cargo:rustc-link-lib=freetype' not in b
+        or 'cargo:rustc-link-lib=png' not in b
+        or 'cargo:rustc-link-lib=bz2' not in b
         or 'cargo:rustc-link-lib=curl_yunyin' not in b
     )
     if needs_cc:
@@ -116,6 +118,12 @@ def patch_host():
             '\n      println!("cargo:rustc-link-lib=ogg");'
             '\n      println!("cargo:rustc-link-lib=opusfile");'
             '\n      println!("cargo:rustc-link-lib=opus");'
+            # vita2d-sys bundles the FreeType-backed TTF implementation, but
+            # the host must link its dependency explicitly when TEXT_RUN is
+            # reachable from the binary.
+            '\n      println!("cargo:rustc-link-lib=freetype");'
+            '\n      println!("cargo:rustc-link-lib=png");'
+            '\n      println!("cargo:rustc-link-lib=bz2");'
             # Use the YUNYIN-built libcurl/OpenSSL transport rather than the
             # firmware-dependent SceHttp/SceSsl handshake. The stock 2026.08
             # SDK curl archive was built against a different OpenSSL package;
@@ -140,8 +148,303 @@ def patch_host():
             raise SystemExit("[build-vpk] build.rs POCKETJS_CAPTURE_DIR marker not found")
         b = b.replace(marker, blocks + "\n" + marker)
     build.write_text(b)
-    patches_graphics.patch_streamed_cjk()
     print("[build-vpk] host patched (v0.12.0 anchors, no SceShellSvc)")
+
+
+def patch_host_native_text():
+    """Make Vita2D the only runtime text renderer.
+
+    PocketJS still owns the DrawList ABI, but the Vita host consumes TEXT_RUN
+    directly.  The old atlas upload call and GLYPH_RUN draw arm are removed
+    from the staged host so a build cannot silently mix the two pipelines.
+    """
+    ffi = PKJ / "hosts/vita/src/ffi.rs"
+    t = ffi.read_text()
+    marker = "YUNYIN_NATIVE_TEXT_INSTALL"
+    if marker not in t:
+        anchor = "    UI = Some(instance);\n"
+        hook = (
+            "    /* YUNYIN_NATIVE_TEXT_INSTALL: Vita2D measures/draws plain text "
+            "outside the PJFA atlas. */\n"
+            "    if let Some(measure) = crate::media::native_text::install() {\n"
+            "        instance.set_text_measure(Some(measure));\n"
+            "    }\n"
+        )
+        if anchor not in t:
+            raise SystemExit("[build-vpk] ffi.rs native text anchor not found")
+        t = t.replace(anchor, hook + anchor, 1)
+        ffi.write_text(t)
+        print("[build-vpk] patch: install Vita2D native text provider")
+    else:
+        print("[build-vpk] Vita2D native text provider already patched")
+
+    # The staged PocketJS checkout is intentionally reused between builds.
+    # Remove the old CJK offload hook even when it was injected by an earlier
+    # build, otherwise deleting the Rust module in this repository leaves a
+    # compile-time reference behind in hosts/vita/src/lib.rs.
+    lib = PKJ / "hosts/vita/src/lib.rs"
+    if lib.exists():
+        s = lib.read_text()
+        old_offload = (
+            "        /* YUNYIN_OFFLOAD_FRAME: 流式字形 / 本地 offload 通道的每帧闸门\n"
+            "         * （PSP 宿主有这一步，Vita 宿主漏了 → 第二条请求永远发不出去）。 */\n"
+            "        crate::media::offload_local::frame();\n"
+        )
+        if old_offload in s:
+            lib.write_text(s.replace(old_offload, "", 1))
+            print("[build-vpk] patch: remove stale CJK offload frame hook")
+
+    # The core still accepts atlas blobs for ABI compatibility, but native text
+    # must not mirror them into Vita GPU textures.  Loading the blob is harmless
+    # for layout metadata; registering it would revive the old PJFA upload path.
+    for path in (
+        PKJ / "hosts/vita/src/ffi.rs",
+        PKJ / "hosts/vita/src/pak.rs",
+    ):
+        if not path.exists():
+            continue
+        s = path.read_text()
+        old = (
+            "        if let Some(atlas) = ui().font_atlas(slot) {\n"
+            "            crate::graphics::register_font_atlas(slot, atlas);\n"
+            "        }\n"
+        )
+        new = (
+            "        /* YUNYIN_NATIVE_TEXT_ONLY_ATLAS: keep core metadata for ABI,\n"
+            "         * but never upload the legacy PJFA atlas to Vita GPU. */\n"
+        )
+        if old in s:
+            s = s.replace(old, new, 1)
+            path.write_text(s)
+            print(f"[build-vpk] patch: disable legacy font atlas upload ({path.name})")
+        if path.name == "ffi.rs":
+            s2 = s.replace(
+                "        let slot = bytes.get(12).copied().unwrap_or(0);\n"
+                "        /* YUNYIN_NATIVE_TEXT_ONLY_ATLAS:",
+                "        /* YUNYIN_NATIVE_TEXT_ONLY_ATLAS:",
+                1,
+            )
+            if s2 != s:
+                path.write_text(s2)
+                print("[build-vpk] patch: remove unused legacy atlas slot")
+        elif "YUNYIN_NATIVE_TEXT_ONLY_ATLAS" not in s and path.name == "pak.rs":
+            # pak.rs has an else branch around the same operation.
+            old_pak = (
+                "                let slot = blob.get(12).copied().unwrap_or(0);\n"
+                "                if let Some(atlas) = ui.font_atlas(slot) {\n"
+                "                    crate::graphics::register_font_atlas(slot, atlas);\n"
+                "                }\n"
+            )
+            new_pak = (
+                "                /* YUNYIN_NATIVE_TEXT_ONLY_ATLAS: no legacy GPU upload. */\n"
+            )
+            if old_pak in s:
+                path.write_text(s.replace(old_pak, new_pak, 1))
+                print("[build-vpk] patch: disable legacy font atlas upload (pak.rs)")
+
+    graphics = PKJ / "hosts/vita/src/graphics.rs"
+    t = graphics.read_text()
+    marker = "YUNYIN_NATIVE_TEXT_RUN"
+    changed = False
+    if marker not in t:
+        anchor = "            spec::draw_op::GLYPH_RUN if i + 3 <= words.len() => {\n"
+        arm = (
+            "            spec::draw_op::TEXT_RUN if i + 8 <= words.len() => {\n"
+            "                /* YUNYIN_NATIVE_TEXT_RUN: the core packs the UTF-8 payload\n"
+            "                 * directly into the DrawList; decode it on the render side. */\n"
+            "                let meta = words[i + 1];\n"
+            "                let slot = (meta & 0xff) as u8;\n"
+            "                let align = ((meta >> 8) & 0xff) as u8;\n"
+            "                let byte_len = words[i + 7] as usize;\n"
+            "                let payload_words = byte_len.div_ceil(4);\n"
+            "                let next = i.saturating_add(8).saturating_add(payload_words);\n"
+            "                if next > words.len() {\n"
+            "                    break;\n"
+            "                }\n"
+            "                let mut bytes = Vec::with_capacity(byte_len);\n"
+            "                for word in &words[i + 8..next] {\n"
+            "                    bytes.extend_from_slice(&word.to_le_bytes());\n"
+            "                }\n"
+            "                bytes.truncate(byte_len);\n"
+            "                let text = String::from_utf8_lossy(&bytes);\n"
+            "                crate::media::native_text::record_text_run(byte_len);\n"
+            "                crate::media::native_text::draw_text(\n"
+            "                    slot,\n"
+            "                    f32::from_bits(words[i + 2]),\n"
+            "                    f32::from_bits(words[i + 3]),\n"
+            "                    f32::from_bits(words[i + 4]),\n"
+            "                    f32::from_bits(words[i + 5]),\n"
+            "                    align,\n"
+            "                    words[i + 6],\n"
+            "                    &text,\n"
+            "                );\n"
+            "                i = next;\n"
+            "            }\n"
+        )
+        if anchor not in t:
+            raise SystemExit("[build-vpk] graphics.rs GLYPH_RUN anchor not found")
+        t = t.replace(anchor, arm + anchor, 1)
+        changed = True
+        print("[build-vpk] patch: Vita2D TEXT_RUN draw handler")
+    else:
+        print("[build-vpk] Vita2D TEXT_RUN handler already patched")
+
+    # Keep the DrawList parser synchronized if an old GLYPH_RUN is ever
+    # emitted, but never draw it through the legacy atlas.  Restrict the
+    # replacement to render_over; the capture/validation parser later in the
+    # file is not a rendering path and can keep its size accounting.
+    skip_marker = "YUNYIN_NATIVE_TEXT_ONLY_GLYPH_SKIP"
+    if skip_marker not in t:
+        start = t.find("pub unsafe fn render_over")
+        glyph = t.find("            spec::draw_op::GLYPH_RUN if i + 3 <= words.len() => {", start)
+        tex = t.find("            spec::draw_op::TEX_QUAD", glyph)
+        if start < 0 or glyph < 0 or tex < 0:
+            raise SystemExit("[build-vpk] graphics.rs render_over GLYPH_RUN block not found")
+        old = t[glyph:tex]
+        new = (
+            "            spec::draw_op::GLYPH_RUN if i + 3 <= words.len() => {\n"
+            "                /* YUNYIN_NATIVE_TEXT_ONLY_GLYPH_SKIP: the native\n"
+            "                 * provider owns all text; consume legacy records only\n"
+            "                 * to keep the parser aligned. */\n"
+            "                let count = (words[i + 1] >> 16) as usize;\n"
+            "                let next = i.saturating_add(3).saturating_add(count.saturating_mul(2));\n"
+            "                if next > words.len() {\n"
+            "                    break;\n"
+            "                }\n"
+            "                crate::media::native_text::record_legacy_glyph_op();\n"
+            "                i = next;\n"
+            "            }\n"
+        )
+        t = t[:glyph] + new + t[tex:]
+        changed = True
+        print("[build-vpk] patch: disable legacy GLYPH_RUN renderer")
+
+    # Remove the now-unreachable Vita atlas implementation itself, not just
+    # its call sites.  Keeping it around makes dead code look like a supported
+    # renderer and caused old capture checks to pull the PJFA path back in.
+    graphics_only_marker = "YUNYIN_NATIVE_TEXT_ONLY_GRAPHICS"
+    if graphics_only_marker not in t:
+        t = t.replace(
+            "use pocketjs_core::{spec, text::Atlas, Ui};",
+            "use pocketjs_core::{spec, Ui};",
+            1,
+        )
+        t = t.replace(
+            "const VITA_FONT_TEXTURE_MAX_DIM: u32 = 2048;\n",
+            "",
+            1,
+        )
+        t, _ = re.subn(
+            r"\n#\[inline\]\nfn next_pow2\(mut value: u32\) -> u32 \{.*?\n\}\n",
+            "\n",
+            t,
+            count=1,
+            flags=re.S,
+        )
+        font_start = t.find("#[derive(Clone, Copy)]\nstruct FontTexture")
+        font_static = t.find("static mut INITIALIZED", font_start)
+        fonts_fn = t.find("unsafe fn fonts()")
+        clip_fn = t.find("unsafe fn clip_stack()", fonts_fn)
+        font_grid = t.find("fn font_grid(")
+        xy_start = t.find("#[inline]\nfn xy", font_grid)
+        if min(font_start, font_static, fonts_fn, clip_fn, font_grid, xy_start) < 0:
+            raise SystemExit("[build-vpk] graphics.rs legacy FontTexture block not found")
+        # FontTexture declaration sits immediately before the generic texture
+        # state; remove only that declaration.
+        t = t[:font_start] + t[font_static:]
+        t = t.replace("static mut FONTS: Option<HashMap<u8, FontTexture>> = None;\n", "", 1)
+        t = t.replace(
+            "    if let Some(guest_fonts) = FONTS.take() {\n"
+            "        for font in guest_fonts.into_values() {\n"
+            "            recycle_texture(font.texture);\n"
+            "        }\n"
+            "    }\n",
+            "",
+            1,
+        )
+        # Remove the font map accessor, preserving clip/texture helpers.
+        fonts_fn = t.find("unsafe fn fonts()")
+        clip_fn = t.find("unsafe fn clip_stack()", fonts_fn)
+        t = t[:fonts_fn] + t[clip_fn:]
+        # Remove atlas geometry/registration, preserving the generic texture
+        # helpers and the DrawList coordinate helpers.
+        font_grid = t.find("fn font_grid(")
+        xy_start = t.find("#[inline]\nfn xy", font_grid)
+        t = t[:font_grid] + t[xy_start:]
+        stream_start = t.find("/// 流式字形（CJK STREAM）提交后")
+        if stream_start >= 0:
+            t = t[:stream_start]
+
+        # capture validation remains useful for textures, but native text has
+        # no GPU atlas residency to validate.  Consume a legacy record only to
+        # keep the diagnostic parser aligned if an old DrawList is supplied.
+        validate_start = t.find("fn validate_texture_residency")
+        glyph = t.find("            spec::draw_op::GLYPH_RUN if i + 2 < words.len() => {", validate_start)
+        tex = t.find("            spec::draw_op::TEX_QUAD", glyph)
+        if validate_start >= 0 and glyph >= 0 and tex >= 0:
+            t = t[:glyph] + (
+                "            spec::draw_op::GLYPH_RUN if i + 2 < words.len() => {\n"
+                "                let count = (words[i + 1] >> 16) as usize;\n"
+                "                i.checked_add(3 + count.saturating_mul(2))\n"
+                "            }\n"
+            ) + t[tex:]
+        t = "/* YUNYIN_NATIVE_TEXT_ONLY_GRAPHICS */\n" + t
+        changed = True
+        print("[build-vpk] patch: remove legacy Vita font atlas implementation")
+
+    if changed:
+        graphics.write_text(t)
+
+    # The old frame hook only existed to refresh the PJFA atlas.  Remove both
+    # the call and its phase timer from whichever diagnostic/frame-loop variant
+    # was staged before this function runs.
+    main = PKJ / "hosts/vita/src/main.rs"
+    if main.exists():
+        s = main.read_text()
+        main_changed = False
+        s, removed_calls = re.subn(
+            r"^[ \t]*pocketjs_vita::media::refresh_font_atlases\(\);\n",
+            "",
+            s,
+            flags=re.M,
+        )
+        main_changed = removed_calls > 0
+        # Remove the timer generated by the old atlas refresh diagnostics,
+        # leaving guest_tick/frame_changed/render/present timing intact.
+        s, removed_timer = re.subn(
+            r"\n\s*let yunyin_f0 = std::time::Instant::now\(\);\n"
+            r"\s*let yunyin_fms = yunyin_f0\.elapsed\(\)\.as_millis\(\);\n"
+            r"\s*if yunyin_fms >= 8 \{.*?\n\s*\}\n",
+            "\n",
+            s,
+            count=1,
+            flags=re.S,
+        )
+        # Older staged variants left an empty font-refresh timer behind after
+        # the refresh call was removed.  Do not ship a dead metric that looks
+        # like an active renderer phase.
+        s, removed_font_timer = re.subn(
+            r"\n\s*let yunyin_f0 = std::time::Instant::now\(\);\n"
+            r"\s*let yunyin_fms = yunyin_f0\.elapsed\(\)\.as_millis\(\);\n",
+            "\n",
+            s,
+            count=1,
+        )
+        s, removed_font_log = re.subn(
+            r"\n\s*if yunyin_fms >= 8 \{.*?\n\s*\}\n",
+            "\n",
+            s,
+            count=1,
+            flags=re.S,
+        )
+        main_changed = main_changed or removed_timer > 0 or removed_font_timer > 0 or removed_font_log > 0
+        if main_changed:
+            if "YUNYIN_NATIVE_TEXT_ONLY_FRAME" not in s:
+                s = "/* YUNYIN_NATIVE_TEXT_ONLY_FRAME */\n" + s
+            main.write_text(s)
+            print("[build-vpk] patch: remove legacy PJFA refresh from frame loop")
+        else:
+            print("[build-vpk] native-only frame loop already patched")
 
 
 def patch_host_defer_dynamic_texture_gpu():
@@ -198,53 +501,8 @@ def patch_host_defer_dynamic_texture_gpu():
     print("[build-vpk] dynamic texture GPU upload deferred to render")
 
 
-def patch_host_offload_frames():
-    """流式字库的本地 io.offload 通道**每帧必须复位一次** —— PSP 宿主有这一步，
-    Vita 宿主漏了（本补丁把它补上）。
-
-    为什么这条是"流式字库全是空白"的根因：`offload_local` 用两个"每帧一次"的
-    闸门控制与 JS 的往来 ——
-
-      * `SENT`  —— 一帧只允许提交一条请求（`submit()` 看到它就返回 false）；
-      * `TAKEN` —— 一帧只允许取回一条应答（`take()` 看到它就返回 None）。
-
-    两盏灯都靠 `offload_local::frame()` 熄灭。PSP 宿主在帧循环里调它
-    （hosts/psp/src/main.rs），Vita 宿主从头到尾没调过：
-
-      * `font.open`（第一条请求）能成功 —— 所以字库显示 ready；
-      * 之后每一条 `font.glyphs` 都提交不出去 → 到点在 JS 侧超时 →
-        `Error: Provider unavailable`；就算宿主真去取，答复也永远取不回来。
-
-    真机/Vita3K 日志里的样子：
-        cjk: mode=stream status=ready host={... "resident":0,"inked":0 ...}
-             js={state:ready,req:63,loaded:0,err:Error: Provider unavailable}
-    屏幕上的样子：歌词/列表一片空白（字形还在"等待"态，画的是透明占位）。
-
-    所以这里在 guest 帧入口（`call_frame`，所有帧路径的唯一入口）调用一次，
-    和 PSP 宿主同一位置、同一语义。
-    """
-    lib = PKJ / "hosts/vita/src/lib.rs"
-    if not lib.exists():
-        return
-    t = lib.read_text()
-    if "YUNYIN_OFFLOAD_FRAME" in t:
-        print("[build-vpk] offload_local per-frame reset already patched")
-        return
-    anchor = "    unsafe fn call_frame(&mut self, values: &mut [JSValue]) -> Result<(), String> {\n"
-    hook = (
-        "        /* YUNYIN_OFFLOAD_FRAME: 流式字形 / 本地 offload 通道的每帧闸门\n"
-        "         * （PSP 宿主有这一步，Vita 宿主漏了 → 第二条请求永远发不出去）。 */\n"
-        "        crate::media::offload_local::frame();\n"
-    )
-    if anchor in t:
-        lib.write_text(t.replace(anchor, anchor + hook, 1))
-        print("[build-vpk] patch: offload_local per-frame reset (streamed CJK fix)")
-    else:
-        print("[build-vpk] WARN: lib.rs call_frame anchor not found; offload frame hook skipped")
-
-
 def patch_host_frame_loop():
-    """帧循环补丁：刷字形钩子 + "画面没变就跳过 render/present"。
+    """帧循环补丁：画面没变就跳过 render/present。
 
     这一步和图形管线无关，所以 **BARE_GRAPHICS=1 也要打**：
     以前它被塞在 patch_font_gpu() 里，正式包一开 bare 就跟着丢 ——
@@ -258,31 +516,6 @@ def patch_host_frame_loop():
     m = PKJ / "hosts/vita/src/main.rs"
     s = m.read_text()
     changed = False
-
-    if "refresh_font_atlases()" not in s:
-        # 0.12：runtime.tick()；0.13：帧循环变成 if let Some(guest) { guest.tick(); ... }。
-        # 两种都认，谁在就用谁。
-        for old_tick, new_tick in (
-            (
-                "        runtime.tick();\n",
-                "        runtime.tick();\n"
-                "        pocketjs_vita::media::refresh_font_atlases();\n",
-            ),
-            (
-                "            guest.tick();\n",
-                "            guest.tick();\n"
-                "            pocketjs_vita::media::refresh_font_atlases();\n",
-            ),
-        ):
-            if old_tick in s:
-                s = s.replace(old_tick, new_tick, 1)
-                changed = True
-                print("[build-vpk] patch: main.rs refresh_font_atlases()")
-                break
-        else:
-            raise SystemExit("[build-vpk] main.rs tick anchor not found")
-    else:
-        print("[build-vpk] main.rs refresh_font_atlases already patched")
 
     # 三种可能的现场，按"最新→最旧"依次匹配：
     #   A. 已带帧诊断计时（patch_host_frame_diag / present_diag 先跑过）—— 现在的正式流水线
@@ -338,11 +571,10 @@ def patch_host_frame_loop():
         "            graphics::present();\n"
         "        }\n"
     )
-    # B. 0.13 原始帧循环：if let Some(guest) { tick; refresh; render } else { begin_frame }
+    # B. 0.13 原始帧循环：if let Some(guest) { tick; render } else { begin_frame }
     #    dev.overlay(); present();
     oldB = (
         "            guest.tick();\n"
-        "            pocketjs_vita::media::refresh_font_atlases();\n"
         "            guest.render();\n"
         "        } else {\n"
         "            graphics::begin_frame(0xff1c_1410);\n"
@@ -352,7 +584,6 @@ def patch_host_frame_loop():
     )
     newB = (
         "            guest.tick();\n"
-        "            pocketjs_vita::media::refresh_font_atlases();\n"
         "            if pocketjs_vita::media::frame_changed() {\n"
         "                guest.render();\n"
         "                dev.overlay();\n"
@@ -364,14 +595,12 @@ def patch_host_frame_loop():
         "            graphics::present();\n"
         "        }\n"
     )
-    # C. 0.12 原始帧循环：refresh 钩子 + runtime.render() + present()
+    # C. 0.12 原始帧循环：runtime.render() + present()
     oldC = (
-        "        pocketjs_vita::media::refresh_font_atlases();\n"
         "        runtime.render();\n"
         "        graphics::present();\n"
     )
     newC = (
-        "        pocketjs_vita::media::refresh_font_atlases();\n"
         "        if pocketjs_vita::media::frame_changed() {\n"
         "            runtime.render();\n"
         "            graphics::present();\n"
@@ -543,14 +772,14 @@ def patch_host_frame_diag():
         "            let yunyin_ms = yunyin_frame_t0.elapsed().as_millis();\n"
         "            /* 阈值 120ms：以前是 800ms，那个粒度只能抓死机，抓不到「卡一下」。 */\n"
         "            if yunyin_ms > 120 {\n"
-        "                crate::media::platform::log::append(&std::format!(\n"
+        "                crate::media::log::append(&std::format!(\n"
         '                    "HOST: guest 帧耗时 {yunyin_ms}ms（含原生调用）"\n'
         "                ));\n"
         "            }\n"
         "        }\n"
         "        if JS_IsException(result) {\n"
         "            let yunyin_err = exception_string(self.ctx);\n"
-        "            crate::media::platform::log::append(&std::format!(\n"
+        "            crate::media::log::append(&std::format!(\n"
         '                "HOST: guest 帧异常 -> {yunyin_err}"\n'
         "            ));\n"
         "            return Err(yunyin_err);\n"
@@ -585,7 +814,6 @@ def patch_host_present_diag():
     old_changed = (
         "        if let Some(guest) = runtime.as_mut() {\n"
         "            guest.tick();\n"
-        "            pocketjs_vita::media::refresh_font_atlases();\n"
         "            if pocketjs_vita::media::frame_changed() {\n"
         "                guest.render();\n"
         "                dev.overlay();\n"
@@ -602,20 +830,12 @@ def patch_host_present_diag():
         "            let yunyin_t0 = std::time::Instant::now(); /* YUNYIN_HOST_PHASE_DIAG */\n"
         "            guest.tick();\n"
         "            let yunyin_tms = yunyin_t0.elapsed().as_millis();\n"
-        "            let yunyin_f0 = std::time::Instant::now();\n"
-        "            pocketjs_vita::media::refresh_font_atlases();\n"
-        "            let yunyin_fms = yunyin_f0.elapsed().as_millis();\n"
         "            let yunyin_c0 = std::time::Instant::now();\n"
         "            let yunyin_changed = pocketjs_vita::media::frame_changed();\n"
         "            let yunyin_cms = yunyin_c0.elapsed().as_millis();\n"
         "            if yunyin_tms >= 8 {\n"
         "                pocketjs_vita::media::log::append(&std::format!(\n"
         '                    "perf: host_phase=guest_tick ms={yunyin_tms}"\n'
-        "                ));\n"
-        "            }\n"
-        "            if yunyin_fms >= 8 {\n"
-        "                pocketjs_vita::media::log::append(&std::format!(\n"
-        '                    "perf: host_phase=font_refresh ms={yunyin_fms}"\n'
         "                ));\n"
         "            }\n"
         "            if yunyin_cms >= 8 {\n"
@@ -656,7 +876,6 @@ def patch_host_present_diag():
     old = (
         "        if let Some(guest) = runtime.as_mut() {\n"
         "            guest.tick();\n"
-        "            pocketjs_vita::media::refresh_font_atlases();\n"
         "            guest.render();\n"
         "        } else {\n"
         "            graphics::begin_frame(0xff1c_1410);\n"
@@ -667,7 +886,6 @@ def patch_host_present_diag():
     new = (
         "        if let Some(guest) = runtime.as_mut() {\n"
         "            guest.tick();\n"
-        "            pocketjs_vita::media::refresh_font_atlases();\n"
         "            let yunyin_r0 = std::time::Instant::now(); /* YUNYIN_HOST_FRAME_DIAG */\n"
         "            guest.render();\n"
         "            let yunyin_rms = yunyin_r0.elapsed().as_millis();\n"
@@ -696,29 +914,6 @@ def patch_host_present_diag():
         print("[build-vpk] patch: host render/present diagnostics")
     else:
         print("[build-vpk] WARN: main.rs render/present anchor not found; present diagnostics skipped")
-
-
-def patch_force_cjk_baked():
-    """诊断构建：强制曲目/歌词走烘焙字库，绕开流式 CJK 的图集就地刷新路径。
-
-    0.13 黑屏排查用：专辑页一口气画很多 StreamText、切歌又换一批字形，
-    都会触发"运行时更新字体图集"。强制 baked 后这条路径完全不跑 ——
-    如果黑屏消失，就说明是我们那套图集补丁和 0.13 的渲染模型不相容。
-    """
-    if not FORCE_CJK_BAKED:
-        return
-    cjk = PKJ / "apps" / APP_NAME / "core" / "cjk.tsx"
-    if not cjk.exists():
-        return
-    t = cjk.read_text()
-    marker = "YUNYIN_FORCE_CJK_BAKED"
-    old = 'media()?.store_get?.("cjkMode") === "stream" ? "stream" : "baked"'
-    new = f'false /* {marker} 诊断构建强制 baked */ ? "stream" : "baked"'
-    if marker in t:
-        print("[build-vpk] cjk 已强制 baked（诊断构建）")
-    elif old in t:
-        cjk.write_text(t.replace(old, new, 1))
-        print("[build-vpk] 诊断：强制 cjk=baked")
 
 
 def patch_no_cover():

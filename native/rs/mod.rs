@@ -10,7 +10,7 @@
 //! bgm.rs decoder.rs bridge.rs tags.rs  播放器本体（音频线程 / FFI / JS 绑定 / 标签）
 //! source/ net/ provider/               引擎接缝（见 docs/架构.md）
 //! platform/                            电源、PS 键锁、文件、日志、设置
-//! ui/                                  流式 CJK、字体图集、跳帧
+//! ui/                                  Vita2D 原生字体、跳帧
 //! ```
 
 use alloc::string::String;
@@ -30,8 +30,8 @@ mod ui;
 /* Explicit re-exports: the PocketJS host calls these by name, and the rest of
  * the tree keeps using the short paths (`log`, `ps_lock`, ...) it always did. */
 pub use platform::{fs, log, power, ps_lock, store};
-pub use ui::{cjk_host, font_gpu, frame_skip, offload_local};
-pub use ui::font_gpu::refresh_font_atlases;
+pub use ui::frame_skip;
+pub use ui::native_text;
 pub use ui::frame_skip::frame_changed;
 
 pub(crate) const COVER_PX: u32 = 256;
@@ -60,6 +60,7 @@ pub(crate) fn json_escape(s: &str) -> String {
 /// Same realm, render thread, once per guest.
 pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_sys::JSValue) {
     log::init();
+    native_text::log_status();
     /*
      * 版本号写进日志：真机排障时第一件事就是确认"跑的是哪一版"。
      * 以前只能靠行为猜，白花了整整一轮往返。
@@ -103,7 +104,6 @@ pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_s
     catalog::start();
     log::append("yunyin: 启动 3/4 装桥接");
     bridge::install(ctx, global);
-    cjk_host::install(ctx, global);
     log::append("yunyin: 启动 4/4 桥接完成，进入正常帧循环");
     /*
      * Phase 0 probe is diagnostic only. Do not start it from the normal

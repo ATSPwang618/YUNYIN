@@ -65,6 +65,7 @@ pub fn frame_changed() -> bool {
                 revision,
                 if changed { 1 } else { 0 }
             ));
+            crate::media::native_text::log_window();
         }
     }
     changed

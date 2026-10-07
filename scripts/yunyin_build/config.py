@@ -38,16 +38,12 @@ APP_TITLE = "云音"                             # param.sfo TITLE（LiveArea �
 APP_VER = os.environ.get("YUNYIN_APP_VER", "01.10")
 
 
-# 诊断开关：YUNYIN_FORCE_CJK_BAKED=1 时强制烘焙字库（排查 0.13 黑屏用）。
-FORCE_CJK_BAKED = os.environ.get("YUNYIN_FORCE_CJK_BAKED") == "1"
-
-
 # 诊断开关：YUNYIN_NO_COVER=1 时跳过内嵌封面贴图上传（排查 0.13 灰屏用）。
 NO_COVER = os.environ.get("YUNYIN_NO_COVER") == "1"
 
 
-# 诊断开关：YUNYIN_BARE_GRAPHICS=1 时跳过我们打的两组"宿主图形补丁"
-# （字形内缩 + 字体图集 baked），只保留核心侧的字体流补丁以保持编译兼容。
+# 诊断开关：YUNYIN_BARE_GRAPHICS=1 时跳过额外的宿主图形补丁；原生文字
+# 后端仍然保留，因为它是 Vita2D TEXT_RUN 的实际渲染入口。
 BARE_GRAPHICS = os.environ.get("YUNYIN_BARE_GRAPHICS") == "1"
 
 
@@ -68,7 +64,7 @@ TITLE_ID = os.environ.get("YUNYIN_TITLE_ID", "")  # 留空 = 用 app/catalog.ts 
 THEME = os.environ.get("YUNYIN_THEME", "dark")  # 皮肤主题：light / dark / pure / anime
 
 
-# 默认 Noto Sans SC。日文曲库才切 MSMINCHO：YUNYIN_FONT=japanese
+# 默认思源黑体 SC Bold。日文曲库才切 MSMINCHO：YUNYIN_FONT=japanese
 # dark/anime 以前绑日文字体会让简体 UI（首页/专辑/设置）变成 □□□。
 FONT_BY_THEME = {"light": "chinese", "dark": "chinese", "pure": "chinese", "anime": "chinese"}
 
@@ -82,5 +78,4 @@ DENSITY = 2                                    # see note in build_vpk()
 PAD_SIZE = 0x1000                              # VitaSDK SCE-header layout pad (auto-adjusted)
 
 
-FONT_NAMES = ("NotoSansSC-Medium.ttf", "NotoSansSC-Regular.ttf", "MSMINCHO.TTF",
-              "font.ttf")
+FONT_NAMES = ("SourceHanSansSC-Bold.otf", "MSMINCHO.TTF", "font.ttf")

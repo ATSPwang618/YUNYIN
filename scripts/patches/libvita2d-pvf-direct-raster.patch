@@ -1,0 +1,128 @@
+--- a/libvita2d/source/vita2d_pvf.c
++++ b/libvita2d/source/vita2d_pvf.c
+@@ -13,8 +13,8 @@
+ #include "utils.h"
+ #include "shared.h"
+ 
+-#define ATLAS_DEFAULT_W 512
+-#define ATLAS_DEFAULT_H 512
++#define ATLAS_DEFAULT_W 2048
++#define ATLAS_DEFAULT_H 2048
+ 
+ #define PVF_GLYPH_MARGIN 2
+ 
+@@ -30,6 +30,8 @@
+ 	texture_atlas *atlas;
+ 	SceKernelLwMutexWork mutex;
+ 	float vsize;
++	unsigned int glyph_count;
++	unsigned int glyph_failures;
+ } vita2d_pvf;
+ 
+ static void *pvf_alloc_func(void *userdata, unsigned int size)
+@@ -59,13 +61,6 @@
+ 	font->atlas = texture_atlas_create(ATLAS_DEFAULT_W, ATLAS_DEFAULT_H,
+ 		SCE_GXM_TEXTURE_FORMAT_U8_R111);
+ 
+-	/* YUNYIN: PVF glyphs are rasterized before drawing.  Keep the glyph
+-	 * atlas point-sampled when vita2d magnifies it, otherwise the default
+-	 * linear magnification makes small UI text visibly blurry. */
+-	vita2d_texture_set_filters(font->atlas->texture,
+-		SCE_GXM_TEXTURE_FILTER_POINT,
+-		SCE_GXM_TEXTURE_FILTER_POINT);
+-
+ 	sceKernelCreateLwMutex(&font->mutex, "vita2d_pvf_mutex", 2, 0, NULL);
+ }
+ 
+@@ -207,6 +202,37 @@
+ 	return font;
+ }
+ 
++int vita2d_pvf_set_char_size(vita2d_pvf *font, float size)
++{
++	if (!font || size <= 0.0f)
++		return -1;
++
++	vita2d_pvf_font_handle *tmp = font->font_handle_list;
++	while (tmp) {
++		if (scePvfSetCharSize(tmp->font_handle, size, size) < 0)
++			return -1;
++		tmp = tmp->next;
++	}
++
++	/* generic_pvf_draw_text uses vsize for line advances and dimensions. */
++	font->vsize = size;
++	return 0;
++}
++
++void vita2d_pvf_get_glyph_stats(vita2d_pvf *font, unsigned int *glyphs,
++					unsigned int *failures)
++{
++	if (!font)
++		return;
++
++	sceKernelLockLwMutex(&font->mutex, 1, NULL);
++	if (glyphs)
++		*glyphs = font->glyph_count;
++	if (failures)
++		*failures = font->glyph_failures;
++	sceKernelUnlockLwMutex(&font->mutex, 1);
++}
++
+ void vita2d_free_pvf(vita2d_pvf *font)
+ {
+ 	if (font) {
+@@ -249,11 +275,15 @@
+ 	void *texture_data;
+ 	vita2d_texture *tex = font->atlas->texture;
+ 
+-	if (scePvfGetCharInfo(font_handle, character, &char_info) < 0)
++	if (scePvfGetCharInfo(font_handle, character, &char_info) < 0) {
++		font->glyph_failures++;
+ 		return 0;
++	}
+ 
+-	if (scePvfGetCharImageRect(font_handle, character, &char_image_rect) < 0)
++	if (scePvfGetCharImageRect(font_handle, character, &char_image_rect) < 0) {
++		font->glyph_failures++;
+ 		return 0;
++	}
+ 
+ 	bp2d_size size = {
+ 		char_image_rect.width + 2 * PVF_GLYPH_MARGIN,
+@@ -269,8 +299,10 @@
+ 	};
+ 
+ 	if (!texture_atlas_insert(font->atlas, character, &size, &data,
+-				  &position))
++				  &position)) {
++		font->glyph_failures++;
+ 			return 0;
++	}
+ 
+ 	texture_data = vita2d_texture_get_datap(tex);
+ 
+@@ -284,7 +316,12 @@
+ 	glyph_image.reserved = 0;
+ 	glyph_image.buffer = (ScePvfU8 *)texture_data;
+ 
+-	return scePvfGetCharGlyphImage(font_handle, character, &glyph_image) == 0;
++	if (scePvfGetCharGlyphImage(font_handle, character, &glyph_image) < 0) {
++		font->glyph_failures++;
++		return 0;
++	}
++	font->glyph_count++;
++	return 1;
+ }
+ 
+ int generic_pvf_draw_text(vita2d_pvf *font, int draw, int *height,
+--- a/libvita2d/include/vita2d.h
++++ b/libvita2d/include/vita2d.h
+@@ -175,5 +175,7 @@
+ vita2d_pvf *vita2d_load_system_pvf(int numFonts, const vita2d_system_pvf_config *configs);
+ vita2d_pvf *vita2d_load_default_pvf();
+ vita2d_pvf *vita2d_load_custom_pvf(const char *path);
++int vita2d_pvf_set_char_size(vita2d_pvf *font, float size);
++void vita2d_pvf_get_glyph_stats(vita2d_pvf *font, unsigned int *glyphs, unsigned int *failures);
+ void vita2d_free_pvf(vita2d_pvf *font);
+ int vita2d_pvf_draw_text(vita2d_pvf *font, int x, int y, unsigned int color, float scale, const char *text);

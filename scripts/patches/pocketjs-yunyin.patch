@@ -1,0 +1,1234 @@
+diff --git a/contracts/spec/font-archive.ts b/contracts/spec/font-archive.ts
+index 54b9e09..2b4e092 100644
+--- a/contracts/spec/font-archive.ts
++++ b/contracts/spec/font-archive.ts
+@@ -13,7 +13,7 @@ export const FONT_ARCHIVE = Object.freeze({
+   entryBytes: 12,
+   maxStrikes: 24,
+   maxPixels: 4096,
+-  maxBatch: 4,
++  maxBatch: 5,
+   maxGlyphs: 65535,
+   maxBytes: 128 * 1024 * 1024,
+   // PFS1 config: u16 capacity at 16, reserved zero at 18.
+@@ -76,7 +76,7 @@ export function decodeArchiveFace(text: string): ArchiveFace {
+       lineHeight > 255 ||
+       advance < 1 ||
+       advance > 255 ||
+-      density !== 1 ||
++      (density !== 1 && density !== 2) ||
+       count < 1 ||
+       count > 65535
+     )
+diff --git a/contracts/spec/platforms.ts b/contracts/spec/platforms.ts
+index 73527f2..6c3f9b4 100644
+--- a/contracts/spec/platforms.ts
++++ b/contracts/spec/platforms.ts
+@@ -288,7 +288,9 @@ export const POCKET_TARGETS = defineTargetRegistry<PocketCapabilityId, {
+       "input.buttons",
+       "input.cursor",
+       "input.touch",
++      "io.offload",
+       "text.glyphs.baked",
++      "text.glyphs.streamed",
+     ],
+   },
+   // PocketBook e-readers (inkview): hosts/pocketbook reuses the backend-
+diff --git a/engine/core/src/draw.rs b/engine/core/src/draw.rs
+index 35ade7b..6eeee29 100644
+--- a/engine/core/src/draw.rs
++++ b/engine/core/src/draw.rs
+@@ -2826,7 +2826,10 @@ impl<'a> Walker<'a> {
+         let mut layouts = core::mem::take(&mut self.paint_cache.layouts);
+         let key = [slot as u64, self.font_revisions[slot as usize], r.tracking.to_bits() as u64,
+             r.line_height.to_bits() as u64, r.text_align as u64, box_w.to_bits() as u64];
+-        let mut cached = atlas.stream.is_none() && layouts.get(&node_slot)
++        /* font_revisions includes streamed glyph commits.  A stream atlas
++         * can therefore use the same node-local layout LRU: a pending
++         * tofu layout is invalidated as soon as the glyph arrives. */
++        let mut cached = layouts.get(&node_slot)
+             .is_some_and(|entry| entry.key == key && entry.text == run);
+         if !cached {
+             layouts.remove(&node_slot);
+@@ -2834,7 +2837,8 @@ impl<'a> Walker<'a> {
+             let misses = self.fonts.misses.get();
+             self.fonts.layout_run(&run, slot, r.tracking, r.line_height, r.text_align, box_w, &mut scratch);
+             if scratch.len() <= 256 && scratch.capacity() > 256 { scratch.shrink_to_fit(); }
+-            if atlas.stream.is_none() && self.fonts.misses.get() == misses &&
++            let stream_layout = atlas.stream.is_some();
++            if (stream_layout || self.fonts.misses.get() == misses) &&
+                 run.capacity() <= 256 && scratch.capacity() <= 256 {
+                 // At most 256 strings (64 KiB) and 16,384 placements (256 KiB),
+                 // plus entry metadata. Streamed/missing glyphs bypass caching.
+diff --git a/engine/core/src/font_archive.rs b/engine/core/src/font_archive.rs
+index b7773a5..11e2e1d 100644
+--- a/engine/core/src/font_archive.rs
++++ b/engine/core/src/font_archive.rs
+@@ -145,7 +145,7 @@ impl<R: ReadAt> Archive<R> {
+                 || mask & (1 << s.slot) != 0
+                 || pixels == 0
+                 || pixels > MAX_PIXELS
+-                || s.density != 1
++                || (s.density != 1 && s.density != 2)
+                 || s.advance == 0
+                 || s.baseline > s.height
+                 || s.line_height == 0
+diff --git a/engine/core/src/font_stream.rs b/engine/core/src/font_stream.rs
+index 72109f7..0982a52 100644
+--- a/engine/core/src/font_stream.rs
++++ b/engine/core/src/font_stream.rs
+@@ -14,7 +14,7 @@ pub const BATCH_MAGIC: u32 = 0x31424650; // PFB1
+ pub const MAX_LEASES: usize = 32;
+ pub const MAX_PIXELS: usize = 4096;
+ pub const MAX_BYTES: usize = 2 * 1024 * 1024;
+-pub const MAX_BATCH: usize = 4;
++pub const MAX_BATCH: usize = 5;
+ 
+ pub(crate) struct Entry {
+     cp: u32,
+@@ -42,6 +42,9 @@ pub(crate) struct Stream {
+     pub advance: u8,
+     evictions: u64,
+     rejected: u64,
++    /// 上次被宿主取走的、发生变化的最小/最大 entry 下标。
++    pub(crate) dirty_lo: Cell<usize>,
++    pub(crate) dirty_hi: Cell<usize>,
+ }
+ fn u32_at(b: &[u8], at: usize) -> Option<u32> {
+     Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
+@@ -97,15 +100,21 @@ impl Atlas {
+             }
+             scalars.sort_unstable();
+             scalars.dedup();
+-            let mut union = s.wanted.clone();
+-            union.extend_from_slice(&scalars);
+-            union.sort_unstable();
+-            union.dedup();
+-            if union.len() > s.entries.len() {
++            /* Keep wanted sorted in place.  The old clone + sort path
++             * allocated a full union for every visible text node. */
++            let additional = scalars
++                .iter()
++                .filter(|cp| s.wanted.binary_search(cp).is_err())
++                .count();
++            if s.wanted.len() + additional > s.entries.len() {
+                 return -2;
+             }
+             let s = self.stream.as_mut().unwrap();
+-            s.wanted = union;
++            for cp in &scalars {
++                if let Err(at) = s.wanted.binary_search(cp) {
++                    s.wanted.insert(at, *cp);
++                }
++            }
+             s.leases.push(Lease { id, scalars });
+         } else if b.len() != 16 {
+             return -3;
+@@ -190,30 +199,36 @@ impl Atlas {
+             || b[11] as u32 != self.baseline
+             || b[12] as u32 != self.line_height
+             || b[14] != self.raster_density
+-            || b[14] != 1
+             || b[13] == 0
+         {
+             return false;
+         }
+         let old_w = self.cell_w as usize;
+         let old_h = self.cell_h as usize;
+-        let cw = w.max(old_w);
+-        let ch = h.max(old_h);
+-        if cw * ch > MAX_PIXELS {
++        let d = self.raster_density as usize;
++        if d == 0 || w % d != 0 || h % d != 0 {
+             return false;
+         }
+-        let mut pixels = vec![0; (base as usize + capacity) * cw * ch];
++        let old_cov_w = old_w * d;
++        let old_cov_h = old_h * d;
++        let new_w = (w / d).max(old_w);
++        let new_h = (h / d).max(old_h);
++        let new_cov_w = new_w * d;
++        let new_cov_h = new_h * d;
++        if new_cov_w * new_cov_h > MAX_PIXELS {
++            return false;
++        }
++        let mut pixels = vec![0; (base as usize + capacity) * new_cov_w * new_cov_h];
+         for g in 0..base as usize {
+-            for y in 0..old_h {
+-                pixels[g * cw * ch + y * cw..g * cw * ch + y * cw + old_w].copy_from_slice(
+-                    &self.bitmap
+-                        [g * old_w * old_h + y * old_w..g * old_w * old_h + (y + 1) * old_w],
+-                );
++            for y in 0..old_cov_h {
++                let from = g * old_cov_w * old_cov_h + y * old_cov_w;
++                let to = g * new_cov_w * new_cov_h + y * new_cov_w;
++                pixels[to..to + old_cov_w].copy_from_slice(&self.bitmap[from..from + old_cov_w]);
+             }
+         }
+         self.bitmap = pixels;
+-        self.cell_w = cw as u32;
+-        self.cell_h = ch as u32;
++        self.cell_w = new_w as u32;
++        self.cell_h = new_h as u32;
+         self.glyph_count = base + capacity as u16;
+         self.cmap.retain(|e| e.gid < base);
+         self.cmap.reserve(capacity);
+@@ -231,8 +246,8 @@ impl Atlas {
+                     ink_width: 0,
+                 })
+                 .collect(),
+-            wanted: Vec::new(),
+-            leases: Vec::new(),
++            wanted: Vec::with_capacity(capacity),
++            leases: Vec::with_capacity(MAX_LEASES),
+             absent: Vec::with_capacity(capacity),
+             epoch: Cell::new(1),
+             request_cursor: Cell::new(0),
+@@ -241,6 +256,8 @@ impl Atlas {
+             advance: b[13],
+             evictions: 0,
+             rejected: 0,
++            dirty_lo: Cell::new(usize::MAX),
++            dirty_hi: Cell::new(0),
+         });
+         true
+     }
+@@ -310,15 +327,18 @@ impl Atlas {
+             entry.cp = cp;
+             entry.seen.set(s.epoch.get());
+             let gid = s.base + index as u16;
+-            let dest_cell = (self.cell_w * self.cell_h) as usize;
++            let dest_w = self.cell_w as usize * self.raster_density as usize;
++            let dest_cell = dest_w * self.cell_h as usize * self.raster_density as usize;
+             let dest = &mut self.bitmap[gid as usize * dest_cell..(gid as usize + 1) * dest_cell];
+             dest.fill(0);
+             entry.ink_width = 0;
+             for p in 0..cell {
+                 let alpha = ((b[at + 8 + p / 4] >> (6 - 2 * (p % 4))) & 3) * 85;
+-                dest[p / s.width * self.cell_w as usize + p % s.width] = alpha;
++                dest[p / s.width * dest_w + p % s.width] = alpha;
+                 if alpha != 0 {
+-                    entry.ink_width = entry.ink_width.max((p % s.width + 1) as u32);
++                    entry.ink_width = entry.ink_width.max(
++                        ((p % s.width) / self.raster_density as usize + 1) as u32,
++                    );
+                 }
+             }
+             let point = self
+@@ -334,6 +354,13 @@ impl Atlas {
+                     xoff: b[at + 5],
+                 },
+             );
++            /* 记下这次真正写了哪个字形：宿主只上传这一段。 */
++            if index < s.dirty_lo.get() {
++                s.dirty_lo.set(index);
++            }
++            if index > s.dirty_hi.get() {
++                s.dirty_hi.set(index);
++            }
+             changed += 1;
+         }
+         self.texture_cell_w = s
+@@ -378,8 +405,9 @@ impl Ui {
+             .filter_map(|i| self.fonts.atlas(i as u8))
+             .map(Atlas::stream_bytes)
+             .sum();
+-        if other + capacity * (a.cell_w.max(b[9] as u32) * a.cell_h.max(b[10] as u32)) as usize
+-            > MAX_BYTES
++        let cov_w = a.coverage_width().max(b[9] as u32);
++        let cov_h = a.coverage_height().max(b[10] as u32);
++        if other + capacity * (cov_w as usize) * (cov_h as usize) > MAX_BYTES
+         {
+             return false;
+         }
+@@ -467,16 +495,36 @@ impl Ui {
+         if n > 0 {
+             self.font_revisions[slot as usize] = self.font_revisions[slot as usize].wrapping_add(1);
+             self.mark_layout_dirty();
+-            self.bump_raster_revision();
++            /* Several offload replies may land in one guest frame.
++             * Layout is already dirty; invalidate raster output once. */
++            if self.font_stream_raster_frame != self.frame {
++                self.font_stream_raster_frame = self.frame;
++                self.bump_raster_revision();
++            }
+         }
+         n
+     }
+     pub fn font_stream_stats(&self) -> String {
+-        let (mut resident, mut bytes, mut pending, mut evictions, mut rejected, mut absent) =
+-            (0, 0, 0, 0, 0, 0);
++        let (mut resident, mut bytes, mut pending, mut evictions, mut rejected, mut absent, mut inked) =
++            (0, 0, 0, 0, 0, 0, 0);
++        let (mut cell_w, mut cell_h, mut tex_cell_w, mut density, mut base, mut capacity) =
++            (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+         for slot in 0..crate::spec::MAX_FONT_SLOTS {
+             if let Some(a) = self.fonts.atlas(slot as u8) {
+                 if let Some(s) = &a.stream {
++                    let d = a.raster_density as usize;
++                    let cell = (a.cell_w as usize * d) * (a.cell_h as usize * d);
++                    if cell > 0 {
++                        for (i, e) in s.entries.iter().enumerate() {
++                            if e.cp == u32::MAX {
++                                continue;
++                            }
++                            let from = (s.base as usize + i) * cell;
++                            if a.bitmap.get(from..from + cell).map_or(false, |c| c.iter().any(|v| *v != 0)) {
++                                inked += 1;
++                            }
++                        }
++                    }
+                     resident += s.entries.iter().filter(|e| e.cp != u32::MAX).count();
+                     bytes += a.stream_bytes();
+                     pending += s
+@@ -487,9 +535,15 @@ impl Ui {
+                     evictions += s.evictions;
+                     rejected += s.rejected;
+                     absent += s.absent.len();
++                    cell_w = a.cell_w;
++                    cell_h = a.cell_h;
++                    tex_cell_w = a.texture_cell_w;
++                    density = a.raster_density as u32;
++                    base = s.base as u32;
++                    capacity = s.entries.len() as u32;
+                 }
+             }
+         }
+-        format!("{{\"resident\":{},\"bytes\":{},\"pending\":{},\"evictions\":{},\"rejected\":{},\"unsupported\":{}}}",resident,bytes,pending,evictions,rejected,absent)
++        format!("{{\"resident\":{},\"bytes\":{},\"pending\":{},\"evictions\":{},\"rejected\":{},\"unsupported\":{},\"inked\":{},\"cellW\":{},\"cellH\":{},\"texCellW\":{},\"density\":{},\"base\":{},\"capacity\":{}}}",resident,bytes,pending,evictions,rejected,absent,inked,cell_w,cell_h,tex_cell_w,density,base,capacity)
+     }
+ }
+diff --git a/engine/core/src/lib.rs b/engine/core/src/lib.rs
+index f565902..c3b628d 100644
+--- a/engine/core/src/lib.rs
++++ b/engine/core/src/lib.rs
+@@ -251,6 +251,8 @@ pub struct Ui {
+     styles: style::StyleTable,
+     fonts: text::Fonts,
+     font_revisions: [u64; spec::MAX_FONT_SLOTS],
++    /// Last frame that already invalidated raster output for streamed glyph commits.
++    font_stream_raster_frame: u64,
+     anims: anim::Anims,
+     timelines: Vec<TimelineInst>,
+     layout: layout::LayoutEngine,
+@@ -341,6 +343,7 @@ impl Ui {
+             styles: style::StyleTable::new(),
+             fonts: text::Fonts::new(),
+             font_revisions: [0; spec::MAX_FONT_SLOTS],
++            font_stream_raster_frame: u64::MAX,
+             anims: anim::Anims::new(),
+             timelines: Vec::new(),
+             layout: layout::LayoutEngine::new(),
+@@ -1803,6 +1806,23 @@ impl Ui {
+         self.font_revisions.get(slot as usize).copied().unwrap_or(0)
+     }
+ 
++    /// 取走某个槽自上次调用以来变化的流式字形下标范围（entry 下标，闭区间，
++    /// 返回值 (lo << 16) | hi）。没有变化返回 -1；查询即清除。
++    pub fn take_font_stream_dirty(&mut self, slot: u8) -> i64 {
++        let Some(atlas) = self.fonts.atlas_mut(slot) else {
++            return -1;
++        };
++        let Some(stream) = atlas.stream.as_mut() else {
++            return -1;
++        };
++        let lo = stream.dirty_lo.replace(usize::MAX);
++        let hi = stream.dirty_hi.replace(0);
++        if lo == usize::MAX || hi < lo {
++            return -1;
++        }
++        ((lo as i64) << 16) | (hi as i64)
++    }
++
+     /// Share a generation-checked coverage page between GLYPH_RUN consumers
+     /// and transformed TEX_QUAD text. Only requested pages become resident.
+     /// The returned descriptor must be revalidated after any resource mutation.
+diff --git a/framework/src/fonts.ts b/framework/src/fonts.ts
+index c0573e7..1f81a37 100644
+--- a/framework/src/fonts.ts
++++ b/framework/src/fonts.ts
+@@ -68,7 +68,10 @@ export function createFontArchive(options: FontArchiveOptions, host: HostOps, cl
+   const status: FontArchiveStatus = { state: "opening", identity: "", error: "", requests: 0, loaded: 0, paused: false };
+   type Batch = { id: number; value: PreparedText; scalars: number[]; common: boolean; admitted: boolean;
+     state: ResourceState<PreparedText>; listeners: Set<() => void>; descriptor: Uint8Array };
++  type GlyphPage = { slot: number; scalars: number[]; keys: string[] };
++  const LOGICAL_PAGE_SIZE = 16;
+   const batches = new Set<Batch>(), requests = new Set<number>(), inflight = new Set<string>(),
++    queued = new Set<string>(), pageQueue: GlyphPage[] = [],
+     retries = new Map<string, { frame: number; attempts: number }>();
+   let face: ArchiveFace | undefined, configured: ArchiveStrike[] = [], frame = 0, serial = 0,
+     nextId = 1, opening = false, session = client.session(), lastSlot = -1, dead = false;
+@@ -146,7 +149,8 @@ export function createFontArchive(options: FontArchiveOptions, host: HostOps, cl
+   const reset = () => {
+     serial++;
+     for (const id of requests) client.cancel(id);
+-    requests.clear(); inflight.clear(); retries.clear(); opening = false;
++    requests.clear(); inflight.clear(); queued.clear(); pageQueue.length = 0;
++    retries.clear(); opening = false;
+     for (const b of batches) { b.admitted = false; publish(b, pending()); }
+     for (const s of configured) host.fontStreamConfigure!(config(s, 0, 0));
+     configured = []; face = undefined;
+@@ -205,18 +209,38 @@ export function createFontArchive(options: FontArchiveOptions, host: HostOps, cl
+       if (status.state === "ready") admit(b);
+       loading ||= b.admitted && b.state.status === "pending";
+     }
+-    if (!loading || status.paused || requests.size >= 2 || status.state === "error") return;
+-    const demand = JSON.parse(host.fontStreamRequests!()) as number[][];
+-    const available = demand.filter(([g, s, cp]) => g === face!.generation && slots.includes(s) &&
+-      !inflight.has(`${s}:${cp}`) && (retries.get(`${s}:${cp}`)?.frame ?? 0) <= frame);
+-    if (!available.length) return;
+-    const slot = [...new Set(available.map(r => r[1]))].sort((a, b) => a - b).find(s => s > lastSlot) ?? available[0][1];
+-    lastSlot = slot;
++    if ((!loading && !pageQueue.length) || status.paused || status.state === "error") return;
++
++    /* One logical page covers the visible window. The wire protocol still uses
++     * F.maxBatch-sized pages so a glyph reply stays within the 4096-byte record. */
++    if (!pageQueue.length) {
++      if (requests.size >= 2) return;
++      const demand = JSON.parse(host.fontStreamRequests!()) as number[][];
++      const available = demand.filter(([g, s, cp]) => g === face!.generation && slots.includes(s) &&
++        !inflight.has(`${s}:${cp}`) && !queued.has(`${s}:${cp}`) &&
++        (retries.get(`${s}:${cp}`)?.frame ?? 0) <= frame);
++      if (!available.length) return;
++      const slot = [...new Set(available.map(r => r[1]))].sort((a, b) => a - b).find(s => s > lastSlot) ?? available[0][1];
++      lastSlot = slot;
++      const scalars = available.filter(r => r[1] === slot).slice(0, LOGICAL_PAGE_SIZE).map(r => r[2]);
++      const strike = face.strikes.find(s => s.slot === slot)!;
++      const packed = Math.ceil(strike.width * strike.height / 4), stride = 8 + packed;
++      /* The reply is hex encoded: keep the binary batch under the 2500-char payload limit. */
++      const wireCount = Math.min(F.maxBatch, Math.floor((2500 / 2 - 12) / stride));
++      for (let i = 0; i < scalars.length; i += wireCount) {
++        const pageScalars = scalars.slice(i, i + wireCount);
++        const keys = pageScalars.map(cp => `${slot}:${cp}`);
++        pageQueue.push({ slot, scalars: pageScalars, keys });
++        keys.forEach(k => queued.add(k));
++      }
++    }
++    if (requests.size >= 2 || !pageQueue.length) return;
++    const page = pageQueue.shift()!;
++    const { slot, scalars, keys } = page;
+     const strike = face.strikes.find(s => s.slot === slot)!;
+     const packed = Math.ceil(strike.width * strike.height / 4), stride = 8 + packed;
+-    const count = Math.min(F.maxBatch, Math.floor((1250 - 12) / stride));
+-    const scalars = available.filter(r => r[1] === slot).slice(0, count).map(r => r[2]);
+-    const keys = scalars.map(cp => `${slot}:${cp}`), token = serial;
++    const token = serial;
++    keys.forEach(k => { queued.delete(k); inflight.add(k); });
+     const id = client.request("font.glyphs", JSON.stringify({ generation: face.generation, slot, scalars }), result => {
+       requests.delete(id);
+       if (token !== serial) return;
+@@ -234,7 +258,6 @@ export function createFontArchive(options: FontArchiveOptions, host: HostOps, cl
+         status.loaded += host.fontStreamCommit!(bytes);
+         status.error = "";
+       } catch (e) { error = String(e); status.error = error; }
+-      refresh();
+       for (let i = 0; i < keys.length; i++) {
+         const key = keys[i], cp = scalars[i];
+         if (!error) { retries.delete(key); continue; }
+@@ -246,9 +269,12 @@ export function createFontArchive(options: FontArchiveOptions, host: HostOps, cl
+           retries.delete(key);
+         } else retries.set(key, { frame: frame + 30 * attempts, attempts });
+       }
++      /* One notification per wire page; Rust coalesces same-frame raster
++       * invalidation and the next step drains the remaining pages. */
+       refresh();
+     });
+-    if (id) { requests.add(id); keys.forEach(k => inflight.add(k)); status.requests++; }
++    if (id) { requests.add(id); status.requests++; }
++    else keys.forEach(k => inflight.delete(k));
+   };
+   // Validate configuration before registering the pump or starting any I/O.
+   for (const r of options.resident ?? []) prepare(r.text, r.slot, true);
+diff --git a/hosts/vita/Cargo.lock b/hosts/vita/Cargo.lock
+index 6231873..41a697f 100644
+--- a/hosts/vita/Cargo.lock
++++ b/hosts/vita/Cargo.lock
+@@ -78,6 +78,7 @@ dependencies = [
+ name = "pocketjs-vita"
+ version = "0.1.0"
+ dependencies = [
++ "cc",
+  "libquickjs-sys",
+  "pocketjs-core",
+  "serde",
+diff --git a/hosts/vita/Cargo.toml b/hosts/vita/Cargo.toml
+index 46500ef..a6ce2d2 100644
+--- a/hosts/vita/Cargo.toml
++++ b/hosts/vita/Cargo.toml
+@@ -6,7 +6,7 @@ edition = "2021"
+ [dependencies]
+ # Vita dependencies. vita2d ships precompiled GXM shaders, so VPKs remain
+ # self-contained and do not require a separately extracted libshacccg.suprx.
+-vitasdk-sys = { version = "0.3.3", features = ["SceAudio_stub", "SceCtrl_stub", "SceGxm_stub", "SceKernelModulemgr_stub", "SceKernelThreadMgr_stub", "SceLibKernel_stub", "SceNet_stub", "SceNetCtl_stub", "SceSysmodule_stub", "SceTouch_stub"] }
++vitasdk-sys = { version = "0.3.3", features = ["SceSsl_stub", "SceHttp_stub", "SceSysmem_stub", "SceAudiodec_stub", "SceShellSvc_stub", "SceAppMgr_stub", "ScePower_stub", "SceAudio_stub", "SceCtrl_stub", "SceGxm_stub", "SceKernelModulemgr_stub", "SceKernelThreadMgr_stub", "SceLibKernel_stub", "SceNet_stub", "SceNetCtl_stub", "SceSysmodule_stub", "SceTouch_stub"] }
+ vita2d-sys = "0.1.1"
+ 
+ libquickjs-sys = { git = "https://github.com/pocket-stack/quickjs-rs.git", rev = "ba5bdd0dc013518768e76cd9e05cd30ed53dd35b" }
+@@ -33,3 +33,6 @@ title_name = "PocketJS"
+ # back to Vita's 4 KiB stack, which is too small for QuickJS.
+ [package.metadata.vita.profile.release]
+ strip_symbols = false
++
++[build-dependencies]
++cc = "1"
+diff --git a/hosts/vita/build.rs b/hosts/vita/build.rs
+index 7cd8f1a..f97cd0c 100644
+--- a/hosts/vita/build.rs
++++ b/hosts/vita/build.rs
+@@ -312,5 +312,260 @@ fn main() {
+     println!("cargo:rerun-if-env-changed=POCKETJS_RASTER_DENSITY");
+     println!("cargo:rerun-if-env-changed=POCKETJS_CAPTURE_INPUT");
+     println!("cargo:rerun-if-env-changed=POCKETJS_CAPTURE_FRAMES");
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++    { let native = Path::new("native");
++      let audio = native.join("audio");
++      let host = native.join("host");
++      cc::Build::new().file(audio.join("yplayer.c")).include(native).include(&audio).include(&host).define("YPLAYER", None).compile("yplayer");
++      cc::Build::new().file(audio.join("yp_io_file.c")).include(native).include(&audio).include(&host).compile("yp_io_file");
++      cc::Build::new().file(audio.join("ym4a.c")).include(native).include(&audio).include(&host).compile("ym4a");
++      cc::Build::new().file(audio.join("yaac.c")).include(native).include(&audio).include(&host).compile("yaac");
++      cc::Build::new().file(host.join("yunyin_image.c")).include(native).include(&host).define("STBI_NO_STDIO", None).compile("yunyin_image");
++      cc::Build::new().file(host.join("yunyin_listdir.c")).include(native).include(&host).compile("yunyin_listdir");
++      let net = native.join("net");
++      cc::Build::new().file(net.join("yhttp.c")).include(native).include(&net).include(&host).compile("yhttp");
++      println!("cargo:rustc-link-lib=mpg123");
++      println!("cargo:rustc-link-lib=vorbisfile");
++      println!("cargo:rustc-link-lib=vorbis");
++      println!("cargo:rustc-link-lib=ogg");
++      println!("cargo:rustc-link-lib=opusfile");
++      println!("cargo:rustc-link-lib=opus");
++      println!("cargo:rustc-link-lib=freetype");
++      println!("cargo:rustc-link-lib=png");
++      println!("cargo:rustc-link-lib=bz2");
++      println!("cargo:rustc-link-lib=curl_yunyin");
++      println!("cargo:rustc-link-lib=ssl");
++      println!("cargo:rustc-link-lib=crypto");
++      println!("cargo:rustc-link-lib=z");
++      println!("cargo:rustc-link-lib=zstd");
++      println!("cargo:rustc-link-lib=pthread");
++      println!("cargo:rustc-link-search=native/libs");
++      println!("cargo:rerun-if-changed=native/audio");
++      println!("cargo:rerun-if-changed=native/host");
++      println!("cargo:rerun-if-changed=native/net");
++      println!("cargo:rerun-if-changed=native/vendor");
++    }
+     println!("cargo:rerun-if-env-changed=POCKETJS_CAPTURE_DIR");
+ }
+diff --git a/hosts/vita/src/devmenu.rs b/hosts/vita/src/devmenu.rs
+index 873d04b..592ef4a 100644
+--- a/hosts/vita/src/devmenu.rs
++++ b/hosts/vita/src/devmenu.rs
+@@ -9,6 +9,11 @@ static mut FONT: *mut vita2d_pgf = std::ptr::null_mut();
+ 
+ /// Called inside the host's open scene. Font is retained for the process lifetime.
+ pub unsafe fn draw(lines: &[String]) {
++    /* YUNYIN: 正式包不画 dev 叠层（vita2d 与 GXM 混用会崩） */
++    let _ = lines;
++    if true {
++        return;
++    }
+     if FONT.is_null() {
+         FONT = vita2d_load_default_pgf();
+     }
+diff --git a/hosts/vita/src/ffi.rs b/hosts/vita/src/ffi.rs
+index 50d19ad..c9d8cf6 100644
+--- a/hosts/vita/src/ffi.rs
++++ b/hosts/vita/src/ffi.rs
+@@ -37,6 +37,10 @@ pub unsafe fn init_ui() -> &'static mut Ui {
+         crate::graphics::LOGICAL_W as f32,
+         crate::graphics::LOGICAL_H as f32,
+     );
++    /* YUNYIN_NATIVE_TEXT_INSTALL: Vita2D measures/draws plain text outside the PJFA atlas. */
++    if let Some(measure) = crate::media::native_text::install() {
++        instance.set_text_measure(Some(measure));
++    }
+     UI = Some(instance);
+     ui()
+ }
+@@ -294,11 +298,9 @@ unsafe extern "C" fn js_upload_texture(
+     let psm = arg_i32(ctx, argc, argv, 3);
+     let bytes = core::slice::from_raw_parts(p, len);
+     let handle = ui().upload_texture(bytes, w as u32, h as u32, psm as u32);
+-    if handle >= 0 {
+-        // GE samples RAM: write the core's aligned copy (pixels + CLUT) back
+-        // once at upload.
+-        crate::graphics::register_texture(ui(), handle);
+-    }
++    /* YUNYIN_DEFER_DYNAMIC_TEXTURE_GPU: graphics::resolve_texture() registers
++     * this handle during render, after begin_frame() has made GXM idle.
++     * Doing it here runs inside QuickJS and can stall input/guest frames. */
+     JS_NewInt32(ctx, handle)
+ }
+ 
+@@ -538,10 +540,8 @@ unsafe extern "C" fn js_load_font_atlas(
+     let bytes = core::slice::from_raw_parts(p, len);
+     let ok = ui().load_font_atlas(bytes);
+     if ok {
+-        let slot = bytes.get(12).copied().unwrap_or(0);
+-        if let Some(atlas) = ui().font_atlas(slot) {
+-            crate::graphics::register_font_atlas(slot, atlas);
+-        }
++        /* YUNYIN_NATIVE_TEXT_ONLY_ATLAS: keep core metadata for ABI,
++         * but never upload the legacy PJFA atlas to Vita GPU. */
+     }
+     JS_NewBool(ctx, ok)
+ }
+diff --git a/hosts/vita/src/graphics.rs b/hosts/vita/src/graphics.rs
+index d577dbe..ebb455c 100644
+--- a/hosts/vita/src/graphics.rs
++++ b/hosts/vita/src/graphics.rs
+@@ -1,3 +1,4 @@
++/* YUNYIN_NATIVE_TEXT_ONLY_GRAPHICS */
+ //! vita2d/GXM DrawList backend shared by PocketJS apps and games.
+ //!
+ //! The core stays at its deterministic 480x272 logical viewport. Geometry is
+@@ -12,7 +13,7 @@ use std::io;
+ #[cfg(feature = "capture")]
+ use std::path::Path;
+ 
+-use pocketjs_core::{spec, text::Atlas, Ui};
++use pocketjs_core::{spec, Ui};
+ use vita2d_sys::*;
+ 
+ mod build_plan {
+@@ -30,7 +31,6 @@ pub const DEFAULT_POOL_BYTES: u32 = 2 * 1024 * 1024;
+ const RECYCLED_TEXTURE_BUDGET: usize = 16 * 1024 * 1024;
+ /// Conservative GXM font-atlas limit. App textures keep the portable 512px
+ /// contract, but density-2 ASCII at the 36px slot needs a 1024x1024 atlas.
+-const VITA_FONT_TEXTURE_MAX_DIM: u32 = 2048;
+ 
+ #[derive(Clone, Copy)]
+ struct Texture {
+@@ -46,24 +46,9 @@ struct RetiredTexture {
+     reusable_in_scene: bool,
+ }
+ 
+-#[derive(Clone, Copy)]
+-struct FontTexture {
+-    texture: Texture,
+-    glyph_count: u16,
+-    /// Source coverage-cell dimensions in GXM texels.
+-    coverage_w: u32,
+-    coverage_h: u32,
+-    /// Destination dimensions before the logical-to-physical scale.
+-    logical_w: u32,
+-    logical_h: u32,
+-    raster_density: u8,
+-    cols: u32,
+-}
+-
+ static mut INITIALIZED: bool = false;
+ static mut TEXTURES: Option<HashMap<i32, Texture>> = None;
+ static mut RECYCLED_TEXTURES: Option<Vec<RetiredTexture>> = None;
+-static mut FONTS: Option<HashMap<u8, FontTexture>> = None;
+ static mut CLIP_STACK: Option<Vec<(i32, i32, i32, i32)>> = None;
+ 
+ unsafe fn textures() -> &'static mut HashMap<i32, Texture> {
+@@ -134,11 +119,6 @@ pub unsafe fn reset_guest() {
+             recycle_texture(texture);
+         }
+     }
+-    if let Some(guest_fonts) = FONTS.take() {
+-        for font in guest_fonts.into_values() {
+-            recycle_texture(font.texture);
+-        }
+-    }
+     CLIP_STACK = None;
+ 
+     let recycled = RECYCLED_TEXTURES.get_or_insert_with(Vec::new);
+@@ -153,13 +133,6 @@ pub unsafe fn reset_guest() {
+     }
+ }
+ 
+-unsafe fn fonts() -> &'static mut HashMap<u8, FontTexture> {
+-    if FONTS.is_none() {
+-        FONTS = Some(HashMap::new());
+-    }
+-    FONTS.as_mut().unwrap()
+-}
+-
+ unsafe fn clip_stack() -> &'static mut Vec<(i32, i32, i32, i32)> {
+     CLIP_STACK.get_or_insert_with(Vec::new)
+ }
+@@ -395,127 +368,6 @@ pub fn free_texture(handle: i32) {
+     }
+ }
+ 
+-#[inline]
+-fn next_pow2(mut value: u32) -> u32 {
+-    if value <= 1 {
+-        return 1;
+-    }
+-    value -= 1;
+-    value |= value >> 1;
+-    value |= value >> 2;
+-    value |= value >> 4;
+-    value |= value >> 8;
+-    value |= value >> 16;
+-    value + 1
+-}
+-
+-fn font_grid(glyphs: u32, cell_w: u32, cell_h: u32) -> Option<(u32, u32, u32)> {
+-    if glyphs == 0
+-        || cell_w == 0
+-        || cell_h == 0
+-        || cell_w > VITA_FONT_TEXTURE_MAX_DIM
+-        || cell_h > VITA_FONT_TEXTURE_MAX_DIM
+-    {
+-        return None;
+-    }
+-    let max_cols = VITA_FONT_TEXTURE_MAX_DIM / cell_w;
+-    let mut cols = 1u32;
+-    while cols < max_cols && cols.saturating_mul(cols) < glyphs {
+-        cols += 1;
+-    }
+-    let dimensions = |cols: u32| -> Option<(u32, u32)> {
+-        let rows = glyphs.div_ceil(cols);
+-        let width = next_pow2(cols.checked_mul(cell_w)?);
+-        let height = next_pow2(rows.checked_mul(cell_h)?);
+-        Some((width, height))
+-    };
+-    let (mut tex_w, mut tex_h) = dimensions(cols)?;
+-    // A square-ish grid can overflow one axis after pow2 padding. Retry with
+-    // the maximum legal column count before rejecting the atlas.
+-    if tex_w > VITA_FONT_TEXTURE_MAX_DIM || tex_h > VITA_FONT_TEXTURE_MAX_DIM {
+-        cols = max_cols;
+-        (tex_w, tex_h) = dimensions(cols)?;
+-    }
+-    if tex_w > VITA_FONT_TEXTURE_MAX_DIM || tex_h > VITA_FONT_TEXTURE_MAX_DIM {
+-        return None;
+-    }
+-    Some((cols, tex_w, tex_h))
+-}
+-
+-fn evict_font(slot: u8) {
+-    unsafe {
+-        if let Some(old) = fonts().remove(&slot) {
+-            recycle_texture(old.texture);
+-        }
+-    }
+-}
+-
+-pub fn register_font_atlas(slot: u8, atlas: &Atlas) {
+-    let coverage_w = atlas.coverage_width();
+-    let coverage_h = atlas.coverage_height();
+-    let Some((cols, tex_w, tex_h)) = font_grid(atlas.glyph_count as u32, coverage_w, coverage_h)
+-    else {
+-        evict_font(slot);
+-        crate::vita_log(format_args!(
+-            "[PocketJS Vita] font atlas slot {slot} rejected: {} glyphs, logical {}x{}, coverage {}x{} at density {}, max texture {}",
+-            atlas.glyph_count,
+-            atlas.cell_w,
+-            atlas.cell_h,
+-            coverage_w,
+-            coverage_h,
+-            atlas.raster_density,
+-            VITA_FONT_TEXTURE_MAX_DIM,
+-        ));
+-        return;
+-    };
+-    let Some(rgba_len) = (tex_w as usize)
+-        .checked_mul(tex_h as usize)
+-        .and_then(|pixels| pixels.checked_mul(4))
+-    else {
+-        evict_font(slot);
+-        crate::vita_log(format_args!(
+-            "[PocketJS Vita] font atlas slot {slot} rejected: {tex_w}x{tex_h} RGBA size overflow"
+-        ));
+-        return;
+-    };
+-    let mut rgba = vec![0u8; rgba_len];
+-    for gid in 0..atlas.glyph_count {
+-        let src = atlas.glyph_rows(gid);
+-        let gx = (gid as u32 % cols) * coverage_w;
+-        let gy = (gid as u32 / cols) * coverage_h;
+-        for y in 0..coverage_h as usize {
+-            for x in 0..coverage_w as usize {
+-                let dst = ((gy as usize + y) * tex_w as usize + gx as usize + x) * 4;
+-                rgba[dst] = 255;
+-                rgba[dst + 1] = 255;
+-                rgba[dst + 2] = 255;
+-                rgba[dst + 3] = src[y * atlas.bytes_per_row() + x];
+-            }
+-        }
+-    }
+-    unsafe {
+-        let Some(texture) = upload_rgba(tex_w, tex_h, &rgba, false) else {
+-            evict_font(slot);
+-            crate::vita_log(format_args!(
+-                "[PocketJS Vita] font atlas slot {slot} GPU upload failed: {tex_w}x{tex_h}"
+-            ));
+-            return;
+-        };
+-        let font = FontTexture {
+-            texture,
+-            glyph_count: atlas.glyph_count,
+-            coverage_w,
+-            coverage_h,
+-            logical_w: atlas.cell_w,
+-            logical_h: atlas.cell_h,
+-            raster_density: atlas.raster_density,
+-            cols,
+-        };
+-        if let Some(old) = fonts().insert(slot, font) {
+-            recycle_texture(old.texture);
+-        }
+-    }
+-}
+ 
+ #[inline]
+ fn xy(word: u32) -> (f32, f32) {
+@@ -646,51 +498,47 @@ pub unsafe fn render_over(ui: &Ui, words: &[u32]) {
+                 color_vertices(&vertices, SceGxmPrimitiveType_SCE_GXM_PRIMITIVE_TRIANGLES);
+                 i += 7;
+             }
+-            spec::draw_op::GLYPH_RUN if i + 3 <= words.len() => {
++            spec::draw_op::TEXT_RUN if i + 8 <= words.len() => {
++                /* YUNYIN_NATIVE_TEXT_RUN: the core packs the UTF-8 payload
++                 * directly into the DrawList; decode it on the render side. */
+                 let meta = words[i + 1];
+                 let slot = (meta & 0xff) as u8;
+-                let count = (meta >> 16) as usize;
+-                let next = i + 3 + count * 2;
++                let align = ((meta >> 8) & 0xff) as u8;
++                let byte_len = words[i + 7] as usize;
++                let payload_words = byte_len.div_ceil(4);
++                let next = i.saturating_add(8).saturating_add(payload_words);
+                 if next > words.len() {
+                     break;
+                 }
+-                if let Some(&font) = fonts().get(&slot) {
+-                    let color = words[i + 2];
+-                    for k in 0..count {
+-                        let (x, y) = xy(words[i + 3 + k * 2]);
+-                        let gid = words[i + 4 + k * 2] & 0xffff;
+-                        if gid >= font.glyph_count as u32 {
+-                            continue;
+-                        }
+-                        let sx = (gid % font.cols) * font.coverage_w;
+-                        let sy = (gid / font.cols) * font.coverage_h;
+-                        // DrawList geometry remains logical. Source coverage is
+-                        // density-scaled, while the destination is always the
+-                        // logical cell multiplied by Vita's presentation scale.
+-                        // With density=2 and SCALE=2 these factors are exactly 1.
+-                        debug_assert_eq!(
+-                            font.coverage_w,
+-                            font.logical_w * font.raster_density as u32
+-                        );
+-                        debug_assert_eq!(
+-                            font.coverage_h,
+-                            font.logical_h * font.raster_density as u32
+-                        );
+-                        let coverage_scale = SCALE / font.raster_density as f32;
+-                        vita2d_draw_texture_tint_part_scale(
+-                            font.texture.ptr,
+-                            x,
+-                            y,
+-                            sx as f32,
+-                            sy as f32,
+-                            font.coverage_w as f32,
+-                            font.coverage_h as f32,
+-                            coverage_scale,
+-                            coverage_scale,
+-                            color,
+-                        );
+-                    }
++                let mut bytes = Vec::with_capacity(byte_len);
++                for word in &words[i + 8..next] {
++                    bytes.extend_from_slice(&word.to_le_bytes());
+                 }
++                bytes.truncate(byte_len);
++                let text = String::from_utf8_lossy(&bytes);
++                crate::media::native_text::record_text_run(byte_len);
++                crate::media::native_text::draw_text(
++                    slot,
++                    f32::from_bits(words[i + 2]),
++                    f32::from_bits(words[i + 3]),
++                    f32::from_bits(words[i + 4]),
++                    f32::from_bits(words[i + 5]),
++                    align,
++                    words[i + 6],
++                    &text,
++                );
++                i = next;
++            }
++            spec::draw_op::GLYPH_RUN if i + 3 <= words.len() => {
++                /* YUNYIN_NATIVE_TEXT_ONLY_GLYPH_SKIP: the native
++                 * provider owns all text; consume legacy records only
++                 * to keep the parser aligned. */
++                let count = (words[i + 1] >> 16) as usize;
++                let next = i.saturating_add(3).saturating_add(count.saturating_mul(2));
++                if next > words.len() {
++                    break;
++                }
++                crate::media::native_text::record_legacy_glyph_op();
+                 i = next;
+             }
+             spec::draw_op::TEX_QUAD if i + 9 <= words.len() => {
+@@ -787,19 +635,6 @@ fn validate_texture_residency(ui: &Ui, words: &[u32]) -> io::Result<()> {
+             spec::draw_op::GRAD_RECT => i.checked_add(6),
+             spec::draw_op::TRI => i.checked_add(7),
+             spec::draw_op::GLYPH_RUN if i + 2 < words.len() => {
+-                let slot = (words[i + 1] & 0xff) as u8;
+-                if ui.font_atlas(slot).is_none() {
+-                    return Err(io::Error::new(
+-                        io::ErrorKind::InvalidData,
+-                        format!("DrawList references missing font atlas slot {slot}"),
+-                    ));
+-                }
+-                let resident = unsafe { fonts().contains_key(&slot) };
+-                if !resident {
+-                    return Err(io::Error::other(format!(
+-                        "Vita GPU font atlas slot {slot} was not resident after production rendering"
+-                    )));
+-                }
+                 let count = (words[i + 1] >> 16) as usize;
+                 i.checked_add(3 + count.saturating_mul(2))
+             }
+diff --git a/hosts/vita/src/lib.rs b/hosts/vita/src/lib.rs
+index 3a9471b..e9c7acd 100644
+--- a/hosts/vita/src/lib.rs
++++ b/hosts/vita/src/lib.rs
+@@ -25,6 +25,7 @@ pub mod stats;
+ pub mod svc;
+ pub mod switch;
+ pub mod vid;
++pub mod media;
+ 
+ static mut INPUT_INITIALIZED: bool = false;
+ /// A plain `Drop` is allowed to happen inside an external host's open scene, so
+@@ -144,6 +145,7 @@ impl Runtime {
+             );
+         }
+         ffi::register(ctx, global, &textures, &sprites);
++        media::register(ctx, global);
+         if !app_pak.is_empty() {
+             let ptr = app_pak.as_ptr() as *mut u8;
+             let buffer = JS_NewArrayBuffer(ctx, ptr, app_pak.len(), None, ptr as *mut c_void, 0);
+@@ -232,6 +234,7 @@ impl Runtime {
+ 
+     unsafe fn call_frame(&mut self, values: &mut [JSValue]) -> Result<(), String> {
+         *self.deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
++        let yunyin_frame_t0 = std::time::Instant::now(); /* YUNYIN_HOST_FRAME_DIAG */
+         let result = JS_Call(
+             self.ctx,
+             self.frame_fn,
+@@ -239,8 +242,21 @@ impl Runtime {
+             values.len() as i32,
+             values.as_mut_ptr(),
+         );
++        {
++            let yunyin_ms = yunyin_frame_t0.elapsed().as_millis();
++            /* 阈值 120ms：以前是 800ms，那个粒度只能抓死机，抓不到「卡一下」。 */
++            if yunyin_ms > 120 {
++                crate::media::log::append(&std::format!(
++                    "HOST: guest 帧耗时 {yunyin_ms}ms（含原生调用）"
++                ));
++            }
++        }
+         if JS_IsException(result) {
+-            return Err(exception_string(self.ctx));
++            let yunyin_err = exception_string(self.ctx);
++            crate::media::log::append(&std::format!(
++                "HOST: guest 帧异常 -> {yunyin_err}"
++            ));
++            return Err(yunyin_err);
+         }
+         JS_FreeValue(self.ctx, result);
+         self.drain_jobs()
+@@ -326,9 +342,7 @@ impl Runtime {
+     /// Call only on the runtime's owning thread.
+     pub unsafe fn drain_jobs(&mut self) -> Result<(), String> {
+         loop {
+-            if cfg!(feature = "usb-debug") && std::time::Instant::now() > *self.deadline {
+-                return Err("guest JavaScript time budget exceeded".into());
+-            }
++            /* YUNYIN: 正式包关闭 drain_jobs 看门狗；长帧不能杀 guest。 */
+             let mut pending_ctx: *mut JSContext = core::ptr::null_mut();
+             let result = JS_ExecutePendingJob(self.rt, &mut pending_ctx);
+             if result > 0 {
+@@ -437,7 +451,7 @@ impl Runtime {
+ }
+ 
+ unsafe extern "C" fn guest_interrupt(_rt: *mut JSRuntime, opaque: *mut c_void) -> i32 {
+-    (std::time::Instant::now() > *opaque.cast::<std::time::Instant>()) as i32
++    { let _ = opaque; 0 } /* YUNYIN: 正式包不打断 guest */
+ }
+ 
+ impl Drop for Runtime {
+diff --git a/hosts/vita/src/main.rs b/hosts/vita/src/main.rs
+index d4bb21d..739dec5 100644
+--- a/hosts/vita/src/main.rs
++++ b/hosts/vita/src/main.rs
+@@ -226,12 +226,30 @@ unsafe fn run_guest(app_index: usize, dev: &mut dev::Host) -> usize {
+         }
+         if let Some(guest) = runtime.as_mut() {
+             guest.tick();
+-            guest.render();
++            let yunyin_r0 = std::time::Instant::now(); /* YUNYIN_HOST_FRAME_DIAG */
++            if pocketjs_vita::media::frame_changed() {
++                guest.render();
++                let yunyin_rms = yunyin_r0.elapsed().as_millis();
++                if yunyin_rms > 800 {
++                    pocketjs_vita::media::log::append(&std::format!(
++                        "HOST: render 耗时 {yunyin_rms}ms"
++                    ));
++                }
++                dev.overlay();
++                let yunyin_p0 = std::time::Instant::now(); /* YUNYIN_HOST_FRAME_DIAG */
++                graphics::present();
++                let yunyin_pms = yunyin_p0.elapsed().as_millis();
++                if yunyin_pms > 800 {
++                    pocketjs_vita::media::log::append(&std::format!(
++                        "HOST: present 耗时 {yunyin_pms}ms"
++                    ));
++                }
++            }
+         } else {
+             graphics::begin_frame(0xff1c_1410);
++            dev.overlay();
++            graphics::present();
+         }
+-        dev.overlay();
+-        graphics::present();
+         if pending.is_some() {
+             vita2d_sys::vita2d_wait_rendering_done();
+         }
+diff --git a/hosts/vita/src/pak.rs b/hosts/vita/src/pak.rs
+index 17071c4..81cfa0b 100644
+--- a/hosts/vita/src/pak.rs
++++ b/hosts/vita/src/pak.rs
+@@ -138,10 +138,7 @@ pub fn feed(ui: &mut Ui, pak: &[u8]) -> (Vec<(String, i32)>, Vec<SpriteReg>) {
+             if !ui.load_font_atlas(blob) {
+                 crate::vita_log(format_args!("[PocketJS pak] bad font atlas {}", key));
+             } else {
+-                let slot = blob.get(12).copied().unwrap_or(0);
+-                if let Some(atlas) = ui.font_atlas(slot) {
+-                    crate::graphics::register_font_atlas(slot, atlas);
+-                }
++                /* YUNYIN_NATIVE_TEXT_ONLY_ATLAS: no legacy GPU upload. */
+             }
+         } else if let Some(name) = key.strip_prefix("ui:img.") {
+             // IMG entry: 8-byte header {u16 w, u16 h, u8 psm, u8 flags,

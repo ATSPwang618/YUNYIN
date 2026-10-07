@@ -1,11 +1,10 @@
-import { createEffect, createMemo, onCleanup } from "solid-js";
+import { createEffect, createMemo } from "solid-js";
 import { View, type NodeMirror } from "@pocketjs/framework/components";
 import { animate, jump } from "@pocketjs/framework/animation";
-import { type TextResource } from "@pocketjs/framework/fonts";
 import { type Track, type LyricLine } from "../core/types";
 import { clipW } from "../core/util";
 import { pTxt } from "../core/theme";
-import { cjkEpoch, cjkMode, fontArchive, slotFromClass, StreamText } from "../core/cjk";
+import { StreamText } from "../core/cjk";
 
 /* 歌词页（子页）：三行居中，当前行红色。骨架/预取逻辑沿用旧版（性能相关）。 */
 
@@ -70,35 +69,6 @@ export function LyricsPage(props: {
     const ls = props.lines();
     return idx < ls.length ? ls[idx]?.text ?? "" : "";
   });
-
-  /* 预取后面几行的字形（只在 STREAM 模式生效，其它情况零开销）。 */
-  let prefetched: TextResource[] = [];
-  const dropPrefetch = () => {
-    for (const r of prefetched) r.dispose();
-    prefetched = [];
-  };
-  createEffect(() => {
-    const mode = cjkMode();
-    void cjkEpoch();
-    const idx = active();
-    const ls = props.lines();
-    const slot = slotFromClass(pTxt("lyricCur"));
-    const font = fontArchive();
-    const usable =
-      mode === "stream" && !!font && (slot === 0 || slot === 7);
-    dropPrefetch();
-    if (!usable || !font) return;
-    for (let i = idx + 2; i <= idx + 5 && i < ls.length; i += 1) {
-      const text = clipW(ls[i]?.text ?? "", 40).trim();
-      if (!text) continue;
-      try {
-        prefetched.push(font.prepareText(text, { slot }));
-      } catch {
-        /* 超出预算就算了，不影响正常显示 */
-      }
-    }
-  });
-  onCleanup(dropPrefetch);
 
   return (
     <View class="grow w-full flex-col items-center justify-center overflow-hidden">

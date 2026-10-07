@@ -10,10 +10,10 @@ import { logEnabled, logMsg } from "../core/media";
 /* 通用曲目列表（本地音乐 / 在线歌曲 / 我喜欢的 / 专辑详情 共用）。
  * 只渲染可见的 5 行 + 一行计数；焦点行由上层 cursor/active 决定。 */
 
-/* 一屏显示几行（行高 30 + 行距 4）：内容区 256 高，
- * 6 行 = 180，加上页签行 / 子页头 / 计数行刚好不溢出。 */
+/* 一屏显示几行（行高 32 + 行距 2）：内容区 256 高，
+ * 6 行 = 192，加上页签行 / 子页头 / 计数行刚好不溢出。 */
 export const LIST_WINDOW = 6;
-/* 行高 30 + 行距 4（容器 gap-1）：焦点指示器每次移动的步长。 */
+/* 行高 32 + 行距 2：焦点指示器每次移动的步长。 */
 const ROW_PITCH = 34;
 /* 多留一行前后缓冲。槽位本身固定不变，滚动一行只把离开窗口的槽位
  * 重新绑定到新进入的索引，和 RecyclerView 的 ViewHolder 回收一致。 */
@@ -41,7 +41,10 @@ function RecycledTrackSlot(props: {
   });
 
   return (
-    <Show when={entry()}>
+    /* A recycled holder represents a new row identity. Keying this local
+       subtree refreshes just the entering holder and prevents a stale native
+       TEXT_RUN from surviving after the previous song is released. */
+    <Show when={entry()} keyed>
       {(value) => (
         <View
           style={{
@@ -49,17 +52,17 @@ function RecycledTrackSlot(props: {
             insetT: (props.slot.index() - props.start()) * ROW_PITCH,
             insetL: 0,
             insetR: 0,
-            height: 30,
+            height: 32,
           }}
         >
           <TrackRow
-            index={value().index + 1}
-            title={clipW(value().song.title, 26)}
-            artist={clipW(value().song.artist, 30)}
-            current={props.currentId() === value().id}
-            off={value().song.off}
-            vip={value().song.vip}
-            vipped={value().song.fee === 1}
+            index={value.index + 1}
+            title={clipW(value.song.title, 26)}
+            artist={clipW(value.song.artist, 30)}
+            current={props.currentId() === value.id}
+            off={value.song.off}
+            vip={value.song.vip}
+            vipped={value.song.fee === 1}
           />
         </View>
       )}
@@ -99,6 +102,9 @@ export function TrackListPage(props: {
       const leaving = step > 0 ? lastStart : lastStart + RECYCLE_POOL - 1;
       const entering = step > 0 ? from + RECYCLE_POOL - 1 : from;
       const slot = slots.find((candidate) => untrack(candidate.index) === leaving);
+      /* Keep the logical index even when the entering row is just outside
+       * the list.  Clearing it to -1 loses the holder at the list end, so a
+       * reverse scroll cannot find that slot and the top row stays blank. */
       if (slot) slot.setIndex(entering);
     } else if (from !== lastStart || total !== lastTotal) {
       for (let i = 0; i < slots.length; i += 1) {

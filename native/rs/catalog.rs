@@ -32,14 +32,26 @@ struct Document {
     root: Json,
 }
 
+#[derive(Clone)]
+struct PageCache {
+    name: String,
+    stamp: String,
+    offset: usize,
+    limit: usize,
+    raw: String,
+}
+
 enum Command {
     Refresh(String),
+    Page(String, usize, usize),
 }
 
 static START: Once = Once::new();
 static COMMANDS: Mutex<Option<Sender<Command>>> = Mutex::new(None);
 static WATCHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static DOCUMENTS: Mutex<Vec<Document>> = Mutex::new(Vec::new());
+static PAGE_CACHE: Mutex<Vec<PageCache>> = Mutex::new(Vec::new());
+static PAGE_PENDING: Mutex<Vec<(String, usize, usize)>> = Mutex::new(Vec::new());
 static VERSION: AtomicU64 = AtomicU64::new(0);
 
 fn valid_name(name: &str) -> bool {
@@ -75,6 +87,7 @@ fn parse_document(name: &str, body: &str) -> Option<Document> {
 }
 
 fn replace_document(document: Document) {
+    let name = document.name.clone();
     let Ok(mut docs) = DOCUMENTS.lock() else {
         return;
     };
@@ -85,6 +98,10 @@ fn replace_document(document: Document) {
         *old = document;
     } else {
         docs.push(document);
+    }
+    drop(docs);
+    if let Ok(mut pages) = PAGE_CACHE.lock() {
+        pages.retain(|page| page.name != name);
     }
     VERSION.fetch_add(1, Ordering::AcqRel);
 }
@@ -116,6 +133,64 @@ fn worker(rx: Receiver<Command>) {
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(Command::Refresh(name)) => refresh_one(&name),
+            Ok(Command::Page(name, offset, limit)) => {
+                /* Scrolling can enqueue several windows before the worker gets
+                 * CPU time.  Only the newest window for this file matters.
+                 *
+                 * The old code treated *any* other pending window as proof
+                 * that this command was stale.  That was not enough: it then
+                 * left the current command in PAGE_PENDING and continued.
+                 * A fast 0 -> 16 -> 32 turn could therefore discard every
+                 * command while leaving the last key permanently pending;
+                 * every later read of that page would return loading forever.
+                 *
+                 * The channel is FIFO, so a command is stale only when a
+                 * newer request for the same file appears after its own key in
+                 * PAGE_PENDING.  Always remove the current key before either
+                 * continuing or processing it. */
+                let current_key = (name.clone(), offset, limit);
+                let stale = PAGE_PENDING
+                    .lock()
+                    .map(|pending| {
+                        let Some(index) = pending.iter().position(|item| item == &current_key)
+                        else {
+                            return false;
+                        };
+                        pending[index + 1..]
+                            .iter()
+                            .any(|(file, _, _)| file == &name)
+                    })
+                    .unwrap_or(false);
+                if let Ok(mut pending) = PAGE_PENDING.lock() {
+                    pending.retain(|item| item != &current_key);
+                }
+                if stale {
+                    continue;
+                }
+                refresh_one(&name);
+                if let Some(doc) = document(&name) {
+                    let raw = page_json_from_document(&doc, offset, limit);
+                    if let Ok(mut pages) = PAGE_CACHE.lock() {
+                        if let Some(old) = pages.iter_mut().find(|page| {
+                            page.name == doc.name && page.offset == offset && page.limit == limit
+                        }) {
+                            old.stamp = doc.stamp;
+                            old.raw = raw;
+                        } else {
+                            pages.push(PageCache {
+                                name: doc.name,
+                                stamp: doc.stamp,
+                                offset,
+                                limit,
+                                raw,
+                            });
+                        }
+                        while pages.len() > 32 {
+                            pages.remove(0);
+                        }
+                    }
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
@@ -192,6 +267,32 @@ pub fn request(name: &str) {
     }
 }
 
+fn request_page(name: &str, offset: usize, limit: usize) {
+    start();
+    if !valid_name(name) {
+        return;
+    }
+    remember_watch(name);
+    let safe_limit = limit.min(16);
+    let key = (String::from(name), offset, safe_limit);
+    if let Ok(mut pending) = PAGE_PENDING.lock() {
+        if pending.iter().any(|item| item == &key) {
+            return;
+        }
+        pending.push(key.clone());
+    }
+    if let Some(tx) = command_sender() {
+        if tx
+            .send(Command::Page(String::from(name), offset, safe_limit))
+            .is_err()
+        {
+            if let Ok(mut pending) = PAGE_PENDING.lock() {
+                pending.retain(|item| item != &key);
+            }
+        }
+    }
+}
+
 pub fn version() -> u64 {
     start();
     VERSION.load(Ordering::Acquire)
@@ -202,6 +303,24 @@ fn document(name: &str) -> Option<Document> {
         .lock()
         .ok()
         .and_then(|docs| docs.iter().find(|d| d.name == name).cloned())
+}
+
+fn page_cache(name: &str, offset: usize, limit: usize) -> Option<String> {
+    let doc_stamp = document(name)?.stamp;
+    PAGE_CACHE
+        .lock()
+        .ok()
+        .and_then(|pages| {
+            pages
+                .iter()
+                .find(|page| {
+                    page.name == name
+                        && page.stamp == doc_stamp
+                        && page.offset == offset
+                        && page.limit == limit
+                })
+                .map(|page| page.raw.clone())
+        })
 }
 
 fn string_field(root: &Json, key: &str) -> String {
@@ -272,20 +391,15 @@ fn fallback_name(name: &str) -> &'static str {
         .unwrap_or("")
 }
 
-/// Return at most `limit` songs.  The full document never crosses the bridge.
-pub fn page_json(file_name: &str, offset: usize, limit: usize) -> String {
-    request(file_name);
-    let Some(doc) = document(file_name) else {
-        return String::from("{\"state\":\"loading\",\"name\":\"\",\"total\":0,\"songs\":[]}");
-    };
+fn page_json_from_document(doc: &Document, offset: usize, limit: usize) -> String {
     let all = songs(&doc.root);
-    let safe_limit = limit.min(8);
+    let safe_limit = limit.min(16);
     let mut out = format!(
         "{{\"state\":\"ready\",\"name\":\"{}\",\"total\":{},\"songs\":[",
         crate::media::json_escape(&{
             let title = string_field(&doc.root, "name");
             if title.is_empty() {
-                String::from(fallback_name(file_name))
+                String::from(fallback_name(&doc.name))
             } else {
                 title
             }
@@ -304,6 +418,26 @@ pub fn page_json(file_name: &str, offset: usize, limit: usize) -> String {
     }
     out.push_str("]}");
     out
+}
+
+/// Return at most `limit` songs.  The full document never crosses the bridge.
+///
+/// If the document is already parsed, this returns a bounded window directly;
+/// otherwise it queues the file for the native worker and returns `loading`.
+pub fn page_json(file_name: &str, offset: usize, limit: usize) -> String {
+    let safe_limit = limit.min(16);
+    if let Some(raw) = page_cache(file_name, offset, safe_limit) {
+        return raw;
+    }
+    /* Once the document is already parsed, producing at most 16 bounded song
+     * records is cheap and deterministic.  Do it here instead of waiting for
+     * a queued worker command: page turns must not remain loading behind old
+     * windows.  Full file IO and JSON parsing still stay on the worker. */
+    if let Some(doc) = document(file_name) {
+        return page_json_from_document(&doc, offset, safe_limit);
+    }
+    request_page(file_name, offset, safe_limit);
+    String::from("{\"state\":\"loading\",\"name\":\"\",\"total\":0,\"songs\":[]}")
 }
 
 /// Return only ids for queue navigation.  Metadata remains native-owned and

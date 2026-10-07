@@ -4,7 +4,7 @@
 //!   上下移动 → 只把指示器的 `translateY` 补间到目标 → native core 推进。
 //! 行本身不再换 class、不再换文字，所以一次按键的 UI 更新量是**一个属性**。
 //!
-//! 两种高度：普通行 30px（`rowIndicator`）/ 卡片行 44px（`cardIndicator`）；
+//! 两种高度：普通行 32px（`rowIndicator`）/ 卡片行 44px（`cardIndicator`）；
 //! 焦点不在列表里时切到 `*Off`（同一个框 + `opacity-0` + `transition-opacity`），
 //! 避免"两个光标"（真机踩过）。
 

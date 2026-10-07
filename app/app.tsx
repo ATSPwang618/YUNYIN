@@ -32,15 +32,6 @@ import {
   type CatalogSong,
 } from "./core/catalog";
 import { bgCls, nextTheme, setUiTheme } from "./core/theme";
-import {
-  applyCjkMode,
-  beginCjkWarmup,
-  cjkEpoch,
-  cjkMode,
-  logCjkStats,
-  pumpCjkPrepare,
-  type CjkWarmupTicket,
-} from "./core/cjk";
 import { setPsLockInfo } from "./core/ui-state";
 import { perfFrame, perfFrameBegin, perfFrameEnd, perfSpan } from "./core/perf";
 import type { NodeMirror } from "@pocketjs/framework/renderer";
@@ -275,8 +266,6 @@ export default function Music() {
 
   let frameCounter = 0;
   let lastFrameMs = 0;
-  let cjkPrepareFrame = 0;
-  let cjkDbgFrames = 0;
 
   /* ---------------- 登录 ---------------- */
   const [loginSnapshot, setLoginSnapshot] = createSignal<LoginSnapshot>({
@@ -368,17 +357,11 @@ export default function Music() {
   const [catalogQueues, setCatalogQueues] = createSignal<Record<string, string[]>>({});
   /* page 只是一扇窗口；歌曲元数据要按 id 合并保存，不能跟着当前窗口丢掉。 */
   const [catalogMeta, setCatalogMeta] = createSignal<Record<string, CatalogSong>>({});
-  const CATALOG_FETCH_LIMIT = LIST_WINDOW + 2; /* 覆盖 Recycler 槽位的预加载行 */
+  const CATALOG_FETCH_LIMIT = 16; /* 对齐窗口：滚动时复用同一批元数据，避免一行一请求 */
   let lastCatalogVersion = "";
-  const catalogPageRequests: Record<string, string> = {};
   const catalogIdsQueued: Record<string, boolean> = {};
   let deferredCatalogPage: { file: string; offset: number; dueFrame: number } | undefined;
   let catalogTrace = 0;
-  let playlistWarmup: CjkWarmupTicket | undefined;
-  let playlistWarmupKey = "";
-  let playlistFontPrimedFile = "";
-  let playlistFontPrimedEpoch = -1;
-  const [playlistFontReady, setPlaylistFontReady] = createSignal(true);
 
   const mergeCatalogMeta = (file: string, songs: CatalogSong[]): void => {
     let changed = 0;
@@ -454,35 +437,39 @@ export default function Music() {
   const loadCatalogPage = (
     file: string,
     offset: number,
-    immediate = false,
   ): CatalogPage | undefined => {
     if (!file) return undefined;
-    const key = `${file}:${offset}`;
+    const pageOffset = Math.floor(Math.max(0, offset) / CATALOG_FETCH_LIMIT) * CATALOG_FETCH_LIMIT;
     const current = catalogPages()[file];
-    if (!immediate && current?.state === "ready" && current.offset === offset) return current;
+    if (current?.state === "ready" && current.offset === pageOffset) return current;
     /* state=loading 只是 native worker 当时还没 publish；不能把这个 key
      * 当成永久完成。文件随后 publish_ok 后必须允许再次桥接读取。 */
-    if (!immediate && catalogPageRequests[file] === key && current?.state === "ready") return current;
-    catalogPageRequests[file] = key;
     const trace = ++catalogTrace;
     const t0 = Date.now();
     if (logEnabled()) {
       logMsg(
         `perf: list_page_begin trace=${trace} file=${file} offset=${offset} ` +
-          `limit=${CATALOG_FETCH_LIMIT} immediate=${immediate ? 1 : 0}`,
+          `limit=${CATALOG_FETCH_LIMIT}`,
       );
     }
     const page = perfSpan(
-      `catalogPage ${file}@${offset}`,
-      () => catalogPage(file, offset, CATALOG_FETCH_LIMIT),
+      `catalogPage ${file}@${pageOffset}`,
+      () => catalogPage(file, pageOffset, CATALOG_FETCH_LIMIT),
     );
     const pageMs = Date.now() - t0;
     if (logEnabled()) {
       logMsg(
-        `perf: list_page_end trace=${trace} file=${file} offset=${offset} ` +
+        `perf: list_page_end trace=${trace} file=${file} offset=${offset} page_offset=${pageOffset} ` +
           `state=${page.state} total=${page.total} songs=${page.songs.length} ` +
           `bridge_ms=${pageMs} name_len=${page.name.length}`,
       );
+    }
+    /* If the document is not parsed yet, netCatalogPage queues it on the
+     * native worker and returns loading. Poll the same window a few frames
+     * later instead of keeping a synchronous bridge call in this frame. */
+    if (page.state === "loading") {
+      queueCatalogPage(file, pageOffset, 3);
+      return page;
     }
     if (page.state === "ready") {
       mergeCatalogMeta(file, page.songs);
@@ -494,66 +481,6 @@ export default function Music() {
   };
 
   const pageData = (file: string): CatalogPage | undefined => catalogPages()[file];
-
-  /* 歌单首屏的字体门闩：只预热当前可见窗口和标题，等 pending leases
-   * 变成 ready/error 后再揭示 Recycler。这样冷启动的 prepare 不会和
-   * TrackListPage 的第一次 drawlist 构建叠在一起。 */
-  createEffect(() => {
-    const mode = cjkMode();
-    const epoch = cjkEpoch();
-    const currentSub = sub();
-    const open = cloudOpen();
-    const file = currentSub === "playlist" ? open.file : "";
-    const page = file ? pageData(file) : undefined;
-    if (mode !== "stream" || !file || page?.state !== "ready") {
-      playlistWarmup?.dispose();
-      playlistWarmup = undefined;
-      playlistWarmupKey = "";
-      if (!playlistFontReady()) setPlaylistFontReady(true);
-      /* 子页卸载后 TrackListPage 的 lease 会归零，菜单文本可能把这些
-       * 资源从共享 LRU 中挤掉。不能只在切换字库模式时清 primed 标记，
-       * 否则再次进入同一歌单会误以为字体仍在缓存，直接挂载所有 item，
-       * 然后让它们逐个显示“加载中”并触发一串刷新。重新进入歌单时
-       * 必须重新检查当前可见窗口；命中缓存时这一步是同步 ready 的。 */
-      playlistFontPrimedFile = "";
-      playlistFontPrimedEpoch = -1;
-      return;
-    }
-    /* 同一份歌单已经完成过首次字体准备：后续分页不再替换整个 list，
-     * 只让新进入的 item 自己显示 loading。 */
-    if (playlistFontPrimedFile === file && playlistFontPrimedEpoch === epoch) {
-      playlistWarmup?.dispose();
-      playlistWarmup = undefined;
-      playlistWarmupKey = "";
-      if (!playlistFontReady()) setPlaylistFontReady(true);
-      return;
-    }
-    /* 理论上可从非第一页开始，但那也属于分页语义，不能卡住整个列表。 */
-    if (page.offset !== 0) {
-      playlistWarmup?.dispose();
-      playlistWarmup = undefined;
-      playlistWarmupKey = "";
-      if (!playlistFontReady()) setPlaylistFontReady(true);
-      return;
-    }
-    const items = [
-      { text: open.name || page.name, slot: 7 },
-      ...page.songs.flatMap((song) => [
-        { text: song.title || "", slot: 0 },
-        { text: song.artists || "", slot: 0 },
-      ]),
-    ].filter((item) => item.text.length > 0);
-    const key = `${file}:${page.offset}:${items.map((item) => `${item.slot}:${item.text}`).join("|")}`;
-    if (key === playlistWarmupKey) return;
-    playlistWarmup?.dispose();
-    playlistWarmupKey = key;
-    playlistWarmup = beginCjkWarmup(items);
-    const ready = playlistWarmup.ready();
-    setPlaylistFontReady(ready);
-    if (logEnabled()) {
-      logMsg(`perf: cjk_warmup file=${file} offset=${page.offset} items=${items.length} pending=${playlistWarmup.pending()} ready=${ready ? 1 : 0}`);
-    }
-  });
 
   /*
    * ---------------- 云端条目的"按需物化" ----------------
@@ -1424,7 +1351,6 @@ export default function Music() {
       if (i === 0) setUiTheme(nextTheme());
       else if (i === 1) openSub("keys");
       else if (i === 2) openSub("about");
-      else if (i === 3) applyCjkMode(cjkMode() === "stream" ? "baked" : "stream");
       return;
     }
     if (s === "account") {
@@ -1452,7 +1378,6 @@ export default function Music() {
       setQueueIds(realTracks.map((song) => song.id));
     }
     /* 进来**不预选歌**：播放器停在空位，等用户从本地/在线清单里点第一首才开播。 */
-    if (cjkMode() === "stream") applyCjkMode("stream");
 
     /* Rust catalog worker 会在后台加载/解析已有清单；这里仅采样小摘要。 */
     pullCatalog();
@@ -1667,23 +1592,10 @@ export default function Music() {
      * effect 放在同一帧。只在帧循环里一次性泵一个已排队的二维码。
      */
     pumpQrTexture();
-    /* 流式字体的 prepare 是主线程上的同步 bookkeeping，但不能把一屏
-     * 文本一次性塞进同一帧。每帧最多推进一个 lease；页面仍停在 loading
-     * 占位态时，drawlist 不会和冷启动字形收集重叠。 */
-    /* prepareText 单次可能占 30~60ms（日志已证实），即使每次只推进
-     * 一个也不应连续霸占每个 vblank。错开到每 4 帧一次，空闲帧给
-     * drawlist / 输入 / present 让路；页面 warmup 仍会继续轮询完成。 */
-    cjkPrepareFrame += 1;
-    if (cjkPrepareFrame % 4 === 1) perfSpan("cjkPrepare", () => pumpCjkPrepare(1));
     perfFrame(); /* 掉帧 / 帧率汇总（只在慢的时候写日志） */
     /* 音频泵也要入账：它是**原生调用**（SDL / sceAudioOutOutput），输出缓冲满时
      * 会按音频时钟阻塞 —— 那部分是"等音频"，不是卡顿，必须和 JS 逻辑分开看。 */
     perfSpan("audioPump", () => audioEngine.pump());
-
-    if (cjkMode() === "stream") {
-      cjkDbgFrames += 1;
-      if (cjkDbgFrames % 60 === 0 && logEnabled()) logCjkStats();
-    }
 
     const nowMs = Date.now();
     const frameGapMs = nowMs - lastFrameMs;
@@ -1701,14 +1613,6 @@ export default function Music() {
       const task = deferredCatalogPage;
       deferredCatalogPage = undefined;
       loadCatalogPage(task.file, task.offset);
-    }
-    if (playlistWarmup && !playlistFontReady() && playlistWarmup.ready()) {
-      playlistFontPrimedFile = cloudOpen().file;
-      playlistFontPrimedEpoch = cjkEpoch();
-      setPlaylistFontReady(true);
-      if (logEnabled()) {
-        logMsg(`perf: cjk_warmup_ready pending=0`);
-      }
     }
     /* catalogIds 只为后续播放队列服务，低优先级地一次处理一个文件。 */
     if (frameCounter % 2 === 0) pumpCatalogIds();
@@ -2059,18 +1963,12 @@ export default function Music() {
                   <Show when={sub() === "playlist"}>
                     <Show
                       when={
-                        (cloudOpen().id === "" || cloudOpen().state === "ready" || listCount() > 0) &&
-                        (cjkMode() !== "stream" || playlistFontReady() || start() !== 0)
+                        cloudOpen().id === "" || cloudOpen().state === "ready" || listCount() > 0
                       }
                       fallback={
                         <PlaceholderPage
                           text={
-                            cjkMode() === "stream" &&
-                            (cloudOpen().state === "ready" || listCount() > 0) &&
-                            start() === 0 &&
-                            !playlistFontReady()
-                              ? `准备字体…${playlistWarmup?.pending() ? ` ${playlistWarmup.pending()}` : ""}`
-                              : cloudOpen().state === "failed"
+                            cloudOpen().state === "failed"
                               ? cloudOpen().message || "同步失败（检查登录状态）"
                               : syncElapsed() > 45
                                 ? "同步超时（网络或登录）· 按 △ 返回"
@@ -2095,6 +1993,7 @@ export default function Music() {
                   </Show>
                   <Show when={sub() === "albums"}>
                     <AlbumListPage
+                      debugName="albums"
                       albums={albums()}
                       cursor={cursor}
                       start={start}
@@ -2103,7 +2002,7 @@ export default function Music() {
                   </Show>
                   <Show when={sub() === "settings"}>
                     <SettingPage
-                      fontMode={cjkMode() === "stream" ? "流式" : "内置"}
+                      fontMode="Vita2D"
                       cursor={cursor}
                       active={rowActive}
                     />

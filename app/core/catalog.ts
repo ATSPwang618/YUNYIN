@@ -58,7 +58,7 @@ export const catalogMenu = (kind: "discover" | "charts" | "account"): CatalogMen
   return parse(raw, { state: "loading" });
 };
 
-/** Fetch at most eight visible songs from a native-parsed document. */
+/** Fetch one bounded visible-song window from a native-parsed document. */
 export const catalogPage = (
   file: string,
   offset: number,

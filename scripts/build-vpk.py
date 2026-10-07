@@ -2,10 +2,10 @@
 """YUNYIN 一键打包：app/ + native/ → PS Vita VPK。
 
 流水线（每一步的实现都在 scripts/yunyin_build/，模块分工见该包的 __init__）：
-  1. pack.stage()             app/ 与 native/ 暂存进 PocketJS（apps/yunyin、hosts/vita）
-  2. apply_host_patches()     把 PocketJS 官方宿主打成 YUNYIN 宿主
-                              （帧循环 / 正式包开关 / 诊断 / 图形与字库补丁）
-  3. fonts.bake_cjk_archive() 生僻字字库 cjk.pjfa（有缓存就直接用）
+  1. apply_pocketjs_patch()   应用仓库内固定的 PocketJS 源码补丁
+  2. pack.stage()             app/ 与 native/ 暂存进 PocketJS（apps/yunyin、hosts/vita）
+  3. apply_host_patches()     应用按构建开关决定的宿主补丁
+                              （帧循环 / 正式包开关 / 诊断 / Vita2D 原生字体）
   4. pack.build_vpk()         PocketJS 编译（bun tools/build.ts + tools/vita.ts）
   5. pack.repack()            换 TITLE_ID / 权限 eboot / 中文标题，重新打 VPK 到 dist/
 
@@ -17,14 +17,14 @@ Requires (inside the WSL2 distro):
   * bun      at /root/.bun/bin/bun
   * PocketJS framework checkout at $POCKETJS_ROOT
     （默认 /root/pocketjs；当前正式配置是 0.13：POCKETJS_ROOT=/root/pocketjs013，
-      并带 YUNYIN_BARE_GRAPHICS=1、YUNYIN_FORCE_CJK_BAKED=1，见 README「自行构建」）
+      并带 YUNYIN_BARE_GRAPHICS=1，见 README「自行构建」）
 
 常用环境变量：
   YUNYIN_FONT=chinese|japanese   字体版本（默认 chinese）
   YUNYIN_OUT=<name>              输出名 -> dist/<name>.vpk（默认 yunyin-main）
   YUNYIN_THEME=<skin>            烘焙时优先的皮肤：light / dark / pure / anime
   YUNYIN_APP_VER=<ver>           param.sfo 里的 APP_VER（默认 01.00）
-  诊断开关：YUNYIN_FORCE_CJK_BAKED / YUNYIN_NO_COVER / YUNYIN_BARE_GRAPHICS / YUNYIN_CATCH_HANG
+  诊断开关：YUNYIN_NO_COVER / YUNYIN_BARE_GRAPHICS / YUNYIN_CATCH_HANG
 两个字体版本一次打完用 scripts/build-variants.sh。
 """
 
@@ -34,28 +34,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from yunyin_build import config, fonts, pack, patches_graphics, patches_host
+from yunyin_build import config, fonts, pack, patches_host, patches_pocketjs
 
 
 def apply_host_patches(*, diagnostics: bool = True) -> None:
     """把 PocketJS 官方宿主打成 YUNYIN 宿主。
 
-    顺序有讲究：先让 media 模块能编译进来（patch_host 里含流式 CJK 补丁），
-    再落正式包开关与诊断，最后才是和 0.13 渲染模型冲突的图形补丁
+    顺序有讲究：先让 media 模块能编译进来，再落正式包开关与诊断，
+    最后安装 Vita2D 原生字体桥接并移除旧字体渲染路径
     （BARE_GRAPHICS=1 时整组跳过）。
     """
-    patches_host.patch_force_cjk_baked()
     patches_host.patch_no_cover()
     patches_host.patch_host()
     patches_host.patch_host_defer_dynamic_texture_gpu()
-    # 流式字库的本地 offload 通道每帧复位一次（Vita 宿主漏了这一步，见函数注释）。
-    patches_host.patch_host_offload_frames()
     patches_host.patch_vita_release_guards()
-    # media/ui/font_gpu.rs calls graphics::refresh_font_atlas() in every
-    # build mode. This compatibility hook is required even for
-    # BARE_GRAPHICS; only the heavier glyph-inset/font-upload changes stay
-    # disabled there.
-    patches_graphics.patch_font_gpu()
     if diagnostics:
         patches_host.patch_host_frame_diag()
         patches_host.patch_host_present_diag()
@@ -66,13 +58,10 @@ def apply_host_patches(*, diagnostics: bool = True) -> None:
         print("[build-vpk] diagnostic: keep PocketJS render/present every frame")
     else:
         patches_host.patch_host_frame_loop()
-    if not config.BARE_GRAPHICS:
-        patches_graphics.patch_graphics_glyph()
-    patches_graphics.patch_font_dirty()
-    patches_graphics.patch_font_cache()
-    patches_graphics.patch_stream_font_paging()
-    patches_graphics.patch_stream_font_batch_limit()
-    patches_graphics.patch_stream_layout_cache()
+    # Must run after the frame-loop/diagnostic patches: native-only removes the
+    # old PJFA refresh call and the legacy GLYPH_RUN renderer from their final
+    # staged form.
+    patches_host.patch_host_native_text()
 
 
 def build_and_pack() -> None:
@@ -84,9 +73,11 @@ def main() -> int:
     if not Path(fonts.theme_font()).exists():
         raise SystemExit(f"字体文件缺失：{fonts.theme_font()}")
 
+    # PocketJS itself must remain a clean external checkout.  All YUNYIN
+    # changes to its tracked sources live in the repository patch below.
+    patches_pocketjs.apply_pocketjs_patch()
     pack.stage()
     apply_host_patches()
-    fonts.bake_cjk_archive()
     try:
         build_and_pack()
     except subprocess.CalledProcessError:

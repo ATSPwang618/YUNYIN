@@ -16,6 +16,11 @@ from .proc import run
 
 # --- 1/2 stage source + native -------------------------------------------
 def stage():
+    vita2d_archive = PROJECT_ROOT / "native" / "libs" / "libvita2d.a"
+    if not vita2d_archive.is_file():
+        raise SystemExit(
+            f"[build-vpk] required Vita2D archive is missing: {vita2d_archive}"
+        )
     app_dst = PKJ / "apps" / APP_NAME
     if app_dst.exists():
         shutil.rmtree(app_dst)
@@ -63,7 +68,10 @@ def stage():
             "#[used]\n"
             f"static YUNYIN_ELF_PAD: [u8; {config.PAD_SIZE}] = [0u8; {config.PAD_SIZE}];\n"
         )
-    print("[build-vpk] staged app + native/rs -> hosts/vita/src/media/")
+    print(
+        "[build-vpk] staged app + native/rs -> hosts/vita/src/media/ "
+        f"(libvita2d.a={vita2d_archive.stat().st_size} bytes)"
+    )
 
 
 def app_const(name):
@@ -164,12 +172,18 @@ def repack():
         print("[build-vpk] eboot regenerated with authid 0x2800000000000001")
     else:
         print(f"[build-vpk] WARN: velf not found ({velf}), kept default eboot")
-    pjfa = PROJECT_ROOT / "fonts" / "chinese" / "cjk.pjfa"
-    if pjfa.exists():
+    # Vita2D native font path.  The runtime intentionally consumes only the
+    # PVF entry; do not package a TTF fallback that could reintroduce a second
+    # renderer and make logs misleading.
+    native_pvf_source = PROJECT_ROOT / "fonts" / "chinese" / "SourceHanSansSC-Bold.otf"
+    if native_pvf_source.exists():
         fonts_dir = staging / "fonts"
         fonts_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(pjfa, fonts_dir / "cjk.pjfa")
-        print(f"[build-vpk] packed {pjfa.name} ({pjfa.stat().st_size} bytes) -> app0:/fonts/cjk.pjfa")
+        shutil.copy2(native_pvf_source, fonts_dir / "yunyin.pvf")
+        print(
+            f"[build-vpk] packed native PVF font {native_pvf_source.name} "
+            f"({native_pvf_source.stat().st_size} bytes) -> app0:/fonts/yunyin.pvf"
+        )
     # 根证书：SceSsl 默认只认固件自带的那份库，随包带一张 DigiCert Global Root G2
     # （网易云整条链都用它），开机由 yhttp_load_ca() 注册进去 —— 老机器/模拟器上
     # 缺新根时也能验通。PEM 和 DER 都带上：SceHttpsData 没写明格式，运行时两个都试。

@@ -1,13 +1,11 @@
-"""字形收割 / cjk.pjfa 烘焙 / theme-seed 生成。"""
+"""字体选择 / 曲库字符收集 / theme-seed 生成。"""
 
 import json
 import re
 import shutil
-import subprocess
 from pathlib import Path
 
-from .config import BUN, FONT_NAMES, FONT_THEME, PROJECT_ROOT, THEME
-from .proc import run
+from .config import FONT_NAMES, FONT_THEME, PROJECT_ROOT, THEME
 
 
 def theme_font():
@@ -25,39 +23,8 @@ def theme_font():
     for pat in ("*.ttf", "*.ttc", "*.otf"):
         for cand in sorted(base.glob(pat)):
             return str(cand)
-    # 兜底：中文版字体（fonts/chinese/ 那份，项目里只有这一份 Noto）
-    return str(PROJECT_ROOT / "fonts" / "chinese" / "NotoSansSC-Medium.ttf")
-
-
-def bake_cjk_archive():
-    """PJFA for STREAM mode. Cached at fonts/chinese/cjk.pjfa.
-
-    字符集（fonts/chinese/cjk-stream.txt）由 scripts/gen-cjk-charset.py 从字体
-    自己的 cmap 生成：中日韩汉字主体 + 扩展 A + 兼容区 + 假名 + 标点符号。
-    手写字符集永远在赌"够不够用"——歌名/歌词里冒出繁体字、日文汉字时就成了方框。
-
-    缓存带失效判断：字符集比 cjk.pjfa 新，或者 pjfa 不存在，就重新烘。
-    （以前只看"文件在不在"，改了字符集也不会重烘，等于白改。）
-    """
-    out = PROJECT_ROOT / "fonts" / "chinese" / "cjk.pjfa"
-    chars = PROJECT_ROOT / "fonts" / "chinese" / "cjk-stream.txt"
-    script = PROJECT_ROOT / "scripts" / "bake-cjk-archive.ts"
-    fresh = out.stat().st_mtime if out.exists() else 0
-    if out.exists() and out.stat().st_size > 1024 and (
-        not chars.exists() or fresh >= chars.stat().st_mtime
-    ):
-        print(f"[build-vpk] using cached PJFA {out} ({out.stat().st_size} bytes)")
-        return out
-    if not script.exists() or not chars.exists():
-        print("[build-vpk] WARN: CJK archive script/charset missing, STREAM will fall back")
-        return None
-    run([BUN, str(script),
-         f"--font={theme_font()}",
-         f"--out={out}",
-         "--slots=0,7",
-         f"--chars={chars}",
-         "--density=2"], cwd=PROJECT_ROOT)
-    return out if out.exists() else None
+    # 兜底：中文版思源黑体 CFF OTF。
+    return str(PROJECT_ROOT / "fonts" / "chinese" / "SourceHanSansSC-Bold.otf")
 
 
 def _ffprobe():

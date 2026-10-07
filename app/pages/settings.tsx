@@ -8,8 +8,7 @@ import { themeLabel } from "../core/theme";
  * 这里**没有**"账号"行：登录入口在「我的 → 账号」，摆两份只会让人以为是两个地方。 */
 
 export function SettingPage(props: {
-  /* 字库模式：流式 = 按需从 cjk.pjfa 取字形（常用汉字全覆盖）；
-   * 内置 = 只用烘焙进包里的那几百个字。 */
+  /* 只展示当前固定的 Vita2D 原生字体后端，不再提供 PJFA 模式切换。 */
   fontMode: string;
   cursor: () => number;
   active: () => boolean;

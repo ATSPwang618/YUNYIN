@@ -55,10 +55,9 @@
 | 在线清单落盘（断网可看，事件驱动刷新） | ✅ |
 | 内置根证书（DigiCert Global Root G2 随包发布，防"机器缺根"） | ✅ |
 | 收藏（本地 / 在线分组）、专辑页、歌词页、设置页 | ✅ |
-| 字库：内置烘焙 + 流式（29,894 字，可切换） | ✅ |
+| 字库：Vita2D 原生 PVF，TEXT_RUN 直绘 | ✅ |
 | 五套扁平化主题（浅色 / 深色 / 浅蓝 / 浅绿 / 浅紫） | ✅ |
 | 在线歌封面 / 搜索 | ❌ 未来计划 |
-| stream字库的进一步优化 | ❌ 未来计划 |
 | 顶部状态栏电量/时间/网络标识显示 | ❌ 未来计划 |
 | 在线歌词的读取支持 | ❌ 未来计划 |
 
@@ -153,9 +152,11 @@ POCKETJS_ROOT=/root/pocketjs013 YUNYIN_BARE_GRAPHICS=1 python3 scripts/build-vpk
 * `YUNYIN_BARE_GRAPHICS=1`：跳过与 0.13 渲染模型冲突的两组图形补丁，**正式包必须带**。
 * 常用开关：`YUNYIN_FONT=chinese|japanese`、`YUNYIN_THEME=light|dark|pure|anime`、
   `YUNYIN_OUT=<名字>`、`YUNYIN_APP_VER=01.10`。
+* PocketJS 的宿主/core 改动由 `scripts/patches/pocketjs-yunyin.patch` 在构建开始时应用；
+  `native/libs/libvita2d.a` 是项目固定的 Vita2D 静态库，会随 native 目录进入 PocketJS 构建树。
 * **不要**加 `YUNYIN_CATCH_HANG`：0.13 的看门狗会在单帧超 2 秒时打死 guest。
-* 源码里没有三个构建派生物，构建时自动生成：`app/theme-seed.tsx`（由 `colors.json`）、
-  `app/images.json`（扫 `asset/**`）、`fonts/*/cjk.pjfa`（流式字库归档）。
+* 源码里没有两个构建派生物，构建时自动生成：`app/theme-seed.tsx`（由 `colors.json`）、
+  `app/images.json`（扫 `asset/**`）。字体包只打包为 Vita2D 原生 PVF 资源。
 
 ## 仓库结构
 
@@ -164,8 +165,8 @@ POCKETJS_ROOT=/root/pocketjs013 YUNYIN_BARE_GRAPHICS=1 python3 scripts/build-vpk
 ├── app/          界面层：app.tsx（唯一入口）+ core/ + pages/ + components/ + sce_sys/
 ├── native/       原生层：rs/（Rust）+ audio/ host/ net/（C）+ vendor/ + libs/
 ├── asset/        主题素材（构建时复制成应用内的 asset/）
-├── fonts/        字体与流式字库字符集（chinese/、japanese/）
-├── scripts/      构建与检查：build-vpk.py + yunyin_build/ + gen-cjk-charset.py
+├── fonts/        Vita2D 原生字体（chinese/、japanese/）
+├── scripts/      构建与检查：build-vpk.py + yunyin_build/
 │   └── tools/    素材/曲库维护工具（不参与构建）
 ├── tests/        宿主侧 cargo 测试
 └── docs/         技术文档（只有两份）+ img/ 真机截图
@@ -189,7 +190,7 @@ python3 scripts/tools/gen-theme-icons.py     # 从浅色图标派生一套换色
 
 ## 致谢
 
-* [PocketJS](https://pocketjs.dev)：PS Vita/PSP 上的 JS+原生应用运行时（宿主、GXM 渲染、字库归档）。
+* [PocketJS](https://pocketjs.dev)：PS Vita/PSP 上的 JS+原生应用运行时（宿主、GXM 渲染、Vita2D 字体桥接）。
 * [VitaSDK](https://vitasdk.org)：工具链与 `Sce*` 头/桩。
 * mpg123 / libvorbis / opusfile / dr_wav：解码。
 * [Noto Sans SC](https://fonts.google.com/noto) / MS Mincho：界面字体（各自的许可证随字体）。

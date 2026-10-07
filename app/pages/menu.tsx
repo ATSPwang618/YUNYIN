@@ -21,7 +21,7 @@ export type MenuRowData = {
   local?: boolean;
 };
 
-const rowH = (kind: MenuRowData["kind"]) => (kind === "card" ? 44 : 30);
+const rowH = (kind: MenuRowData["kind"]) => (kind === "card" ? 44 : 32);
 const MENU_POOL = LIST_WINDOW + 2;
 type MenuSlot = { index: () => number; setIndex: (value: number) => void };
 
@@ -38,7 +38,10 @@ function RecycledMenuSlot(props: {
 }) {
   const row = () => props.rows()[props.slot.index()];
   return (
-    <Show when={row()}>
+    /* Recycled slots must remount only the entering row. A non-keyed Show
+       keeps the old Text node identity while its native TEXT_RUN payload
+       changes; that path can leave a blank PVF run after a discover recycle. */
+    <Show when={row()} keyed>
       {(value) => (
         <View
           style={{
@@ -46,13 +49,13 @@ function RecycledMenuSlot(props: {
             insetT: menuTop(props.start(), props.slot.index(), props.rows()),
             insetL: 0,
             insetR: 0,
-            height: rowH(value().kind),
+            height: rowH(value.kind),
           }}
         >
-          {value().kind === "card" ? (
-            <CardRow title={value().name} sub={value().value} />
+          {value.kind === "card" ? (
+            <CardRow title={value.name} sub={value.value} />
           ) : (
-            <MenuRow title={value().name} value={value().value} />
+            <MenuRow title={value.name} value={value.value} />
           )}
         </View>
       )}
@@ -84,7 +87,9 @@ export function MenuList(props: {
       const leaving = step > 0 ? lastStart : lastStart + MENU_POOL - 1;
       const entering = step > 0 ? from + MENU_POOL - 1 : from;
       const slot = slots.find((candidate) => untrack(candidate.index) === leaving);
-      if (slot) slot.setIndex(entering < total ? entering : -1);
+      /* Retain an out-of-range logical index.  The row stays hidden through
+       * row(), but remains discoverable when the user scrolls back. */
+      if (slot) slot.setIndex(entering);
     } else if (from !== lastStart || total !== lastTotal) {
       for (let i = 0; i < slots.length; i += 1) {
         const index = from + i;

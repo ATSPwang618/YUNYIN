@@ -4,8 +4,8 @@
   proc.py              子进程封装（bun / vita-* 工具的统一环境）
   patching.py          通用文本补丁助手
   assets.py            皮肤 PNG 归一化 + images.json
-  patches_host.py      宿主补丁：帧循环 / 正式包开关 / 诊断
-  patches_graphics.py  宿主补丁：图形与字库
-  fonts.py             字形收割 / cjk.pjfa / theme-seed
+  patches_host.py      宿主补丁：帧循环 / 正式包开关 / 诊断 / 原生字体
+  patches_pocketjs.py  PocketJS 固定源码补丁
+  fonts.py             字体选择 / 曲库字符收集 / theme-seed
   pack.py              暂存 / 编译 / VPK 打包
 """
