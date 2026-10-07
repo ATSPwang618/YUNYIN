@@ -16,6 +16,8 @@
 use alloc::string::String;
 
 pub mod bgm;
+pub mod catalog;
+pub mod qr;
 mod bridge;
 mod decoder;
 pub mod net;
@@ -98,6 +100,7 @@ pub unsafe fn register(ctx: *mut libquickjs_sys::JSContext, global: libquickjs_s
         if avcdec >= 0 && net_ok { "" } else { "← 功能可能受限" }
     ));
     power::start();
+    catalog::start();
     log::append("yunyin: 启动 3/4 装桥接");
     bridge::install(ctx, global);
     cjk_host::install(ctx, global);

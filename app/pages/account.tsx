@@ -1,7 +1,7 @@
-import { createEffect, createMemo, createSignal } from "solid-js";
+import { createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import { Image, Text, View } from "@pocketjs/framework/components";
 import { bgCls, pTxt } from "../core/theme";
-import { uploadQrTexture } from "../core/qr";
+import { cancelQrTexture, scheduleQrTexture } from "../core/qr";
 import { logMsg } from "../core/media";
 import { MenuRow } from "../components/rows";
 
@@ -45,18 +45,30 @@ export function AccountPage(props: {
     const url = props.snapshot().url;
     if (!url || url === lastQrUrl) return;
     lastQrUrl = url;
-    try {
-      /* 固定 key：旧句柄由 qr.ts 回收，渲染器里只保留当前二维码。 */
-      const key = "qr-login";
-      uploadQrTexture(key, url);
-      setQrTexKey(key);
-      logMsg(`qr: 贴图已上传 ${key}`);
-    } catch {
-      /* 页面照常显示文字提示 */
-      logMsg("qr: 贴图上传失败");
-      setQrTexKey("");
-    }
+    /*
+     * 网络回调发生在 guest 帧里；二维码已经由 Rust 后台线程编码，
+     * 这里只排队等待 native texture handle，避免 bridge 与响应式级联撞在同一帧。
+     */
+    const key = "qr-login";
+    setQrTexKey("");
+    scheduleQrTexture(
+      key,
+      url,
+      () => {
+        if (props.snapshot().url !== url) return;
+        setQrTexKey(key);
+        logMsg(`qr: 贴图已上传 ${key}`);
+      },
+      () => {
+        if (props.snapshot().url !== url) return;
+        /* 页面照常显示文字提示 */
+        logMsg("qr: 贴图上传失败");
+        setQrTexKey("");
+      },
+    );
   });
+
+  onCleanup(() => cancelQrTexture("qr-login", lastQrUrl));
 
   const on = (i: number) => props.active() && props.cursor() === i;
 

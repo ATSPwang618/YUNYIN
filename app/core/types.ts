@@ -28,6 +28,8 @@ export type VitaMedia = {
   netLoginStart?: () => void;
   netLoginTick?: () => void;
   netLoginState?: () => string;
+  /** Native Rust QR worker result: texture handle, or -1 while not ready. */
+  netLoginQr?: () => number;
   /**
    * 同步进度：`{"kind":"lists","done":3,"total":7}`（步数）
    * 或 `{"kind":"download","done":123,"total":456}`（正文下载字节数，界面换算成百分比）。
@@ -49,6 +51,13 @@ export type VitaMedia = {
   /* 某张歌单的歌曲：{"state":"…","name":"…","songs":[{id,title,artists,album,durationMs}]}
    * 榜单/歌单的常规路径是读 list/ 里的文件；只有文件还没生成时才调它兜底。 */
   netPlaylistTracks?: (id: string) => string;
+  /** 只触发 native 后台拉取，结果由 catalog version + page 读取。 */
+  netPlaylistRequest?: (id: string) => void;
+  /** Native-owned catalog snapshots; results are bounded to menu/page views. */
+  netCatalogVersion?: () => string;
+  netCatalogMenu?: (kind: string) => string;
+  netCatalogPage?: (name: string, offset: string, limit: string) => string;
+  netCatalogIds?: (name: string) => string;
   /* 读 ux0:/data/yunyin/list/ 下的清单 JSON（不存在返回空串）。 */
   listRead?: (name: string) => string;
   /* 清单文件的版本戳 "大小,修改时间ms"（不存在返回空串）：

@@ -157,6 +157,7 @@ def patch_host_defer_dynamic_texture_gpu():
     """
     ffi = PKJ / "hosts/vita/src/ffi.rs"
     if not ffi.exists():
+        print("[build-vpk] dynamic texture GPU deferral skipped (PocketJS ffi.rs missing)")
         return
     t = ffi.read_text()
     if "YUNYIN_DEFER_DYNAMIC_TEXTURE_GPU" in t:
@@ -174,10 +175,26 @@ def patch_host_defer_dynamic_texture_gpu():
         "     * this handle during render, after begin_frame() has made GXM idle.\n"
         "     * Doing it here runs inside QuickJS and can stall input/guest frames. */\n"
     )
-    if old not in t:
-        print("[build-vpk] WARN: ffi.rs dynamic texture upload anchor not found")
+    if old in t:
+        ffi.write_text(t.replace(old, new, 1))
+        print("[build-vpk] dynamic texture GPU upload deferred to render")
         return
-    ffi.write_text(t.replace(old, new, 1))
+
+    # PocketJS 0.13.0 and the later 0.13 snapshots kept the same operation
+    # but changed the explanatory comments.  Match the call as a fallback so
+    # a harmless upstream comment change cannot silently re-enable a blocking
+    # GPU mirror upload in QuickJS.
+    call = "crate::graphics::register_texture(ui(), handle);"
+    if call not in t:
+        raise SystemExit(
+            "[build-vpk] ffi.rs dynamic texture upload anchor not found; "
+            "refusing to build without the guest-frame GPU deferral"
+        )
+    replacement = (
+        "        /* YUNYIN_DEFER_DYNAMIC_TEXTURE_GPU: resolve the core handle "
+        "during render, after begin_frame(). */"
+    )
+    ffi.write_text(t.replace(call, replacement, 1))
     print("[build-vpk] dynamic texture GPU upload deferred to render")
 
 
@@ -417,6 +434,39 @@ def patch_vita_release_guards():
             print("[build-vpk] patch: 0.13 guest interrupt disabled")
         elif "YUNYIN: 正式包不打断 guest" in t:
             print("[build-vpk] 0.13 guest interrupt already disabled")
+
+        # 0.13 also checks the same deadline while draining QuickJS jobs.
+        # Disabling only JS_SetInterruptHandler is insufficient: a QR frame
+        # can finish JS_Call, then drain_jobs() still returns the watchdog
+        # error and the host shuts the guest down (black screen).
+        drain_guard = (
+            '            if cfg!(feature = "usb-debug") && '
+            'std::time::Instant::now() > *self.deadline {\n'
+            '                return Err("guest JavaScript time budget exceeded".into());\n'
+            '            }\n'
+        )
+        if CATCH_HANG and "YUNYIN: 正式包关闭 drain_jobs 看门狗" in t:
+            # The staged PocketJS checkout is reused between builds. Restore
+            # the upstream drain guard when making the explicit diagnostic
+            # package; otherwise CATCH_HANG would only restore the interrupt
+            # callback while the second watchdog stayed disabled.
+            t = t.replace(
+                '            /* YUNYIN: 正式包关闭 drain_jobs 看门狗；长帧不能杀 guest。 */\n',
+                drain_guard,
+                1,
+            )
+            lib.write_text(t)
+            print("[build-vpk] catch-hang: drain_jobs watchdog restored")
+        elif not CATCH_HANG and drain_guard in t:
+            t = t.replace(
+                drain_guard,
+                '            /* YUNYIN: 正式包关闭 drain_jobs 看门狗；长帧不能杀 guest。 */\n',
+                1,
+            )
+            lib.write_text(t)
+            print("[build-vpk] patch: 0.13 drain_jobs watchdog disabled")
+        elif not CATCH_HANG and "YUNYIN: 正式包关闭 drain_jobs 看门狗" in t:
+            print("[build-vpk] 0.13 drain_jobs watchdog already disabled")
 
     menu = PKJ / "hosts/vita/src/devmenu.rs"
     if menu.exists():

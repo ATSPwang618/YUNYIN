@@ -1,66 +1,69 @@
-/* 二维码：把登录 URL 变成一张 GPU 贴图。
+/* QR display bridge.
  *
- * 用 vendor/ 里的 MIT 单文件编码器（qrcode-generator，不引 npm 依赖）编出矩阵，
- * 在 JS 里铺成 RGBA 位图，走 PocketJS 的 uploadTexture + registerTexture，
- * 页面里用 <Image src={key}> 显示 —— 和专辑封面同一条通道。
- *
- * 二维码是登录页里唯一的动态 GPU 贴图；它不能沿用“每次刷新都生成一个
- * 新 key”的写法，否则每次刷新都会把旧句柄留在渲染器里。 */
+ * Rust owns URL encoding, Reed-Solomon, matrix construction and RGBA painting
+ * on a native worker. JS only waits for the finished native texture handle
+ * and registers it with the renderer. No QR algorithm or byte-sized image
+ * construction belongs in the guest frame.
+ */
 
 import { getOps, registerTexture } from "@pocketjs/framework";
-import qrcode from "../vendor/qrcode.js";
+import { media } from "./media";
 
-/* 贴图边长：2 的幂、≤512。二维码实际显示 124 逻辑像素，128 足够且更适合
- * Vita 的小显存/动态纹理路径。显示端是点采样，放大后仍保持黑白模块边界。 */
-const TEX = 128;
-/* 静区：规格要求 4 个模块宽，少了手机对不上焦。 */
-const QUIET = 4;
+let frameNo = 0;
 let lastQrHandle = -1;
 
-/** 把 `text` 编成二维码、上传成贴图并注册到 `key`；返回实际绘制边长（像素）。 */
-export function uploadQrTexture(key: string, text: string): number {
-  const ops = getOps();
-  /* 先回收上一张二维码。native 侧会把 GPU 镜像放入安全的回收队列，
-   * 不是在当前场景里直接销毁。 */
-  if (lastQrHandle >= 0) {
-    ops.freeTexture?.(lastQrHandle);
-    lastQrHandle = -1;
-  }
+type QrUploadJob = {
+  key: string;
+  text: string;
+  afterFrame: number;
+  onReady: () => void;
+  onError: () => void;
+};
 
-  const qr = qrcode(0, "L"); /* 0 = 自动挑版本；L 纠错同尺寸容量最大 */
-  qr.addData(text);
-  qr.make();
+let pendingQr: QrUploadJob | undefined;
 
-  const count = qr.getModuleCount();
-  const modules = count + QUIET * 2;
-  const scale = Math.max(1, Math.floor(TEX / modules));
-  const drawn = modules * scale;
-  const offset = Math.floor((TEX - drawn) / 2);
+/** Queue a native QR result for the next safe frame window. */
+export function scheduleQrTexture(
+  key: string,
+  text: string,
+  onReady: () => void,
+  onError: () => void,
+): void {
+  pendingQr = {
+    key,
+    text,
+    afterFrame: frameNo + 2,
+    onReady,
+    onError,
+  };
+}
 
-  const rgba = new Uint8Array(TEX * TEX * 4);
-  rgba.fill(255); /* 白底（含静区） */
+/** Drop a queued job when the account page is unmounted or superseded. */
+export function cancelQrTexture(key: string, text?: string): void {
+  if (pendingQr?.key !== key) return;
+  if (text !== undefined && pendingQr.text !== text) return;
+  pendingQr = undefined;
+}
 
-  for (let row = 0; row < count; row += 1) {
-    for (let col = 0; col < count; col += 1) {
-      if (!qr.isDark(row, col)) continue;
-      const x0 = offset + (col + QUIET) * scale;
-      const y0 = offset + (row + QUIET) * scale;
-      for (let y = 0; y < scale; y += 1) {
-        let at = ((y0 + y) * TEX + x0) * 4;
-        for (let x = 0; x < scale; x += 1) {
-          rgba[at] = 0;
-          rgba[at + 1] = 0;
-          rgba[at + 2] = 0;
-          rgba[at + 3] = 255;
-          at += 4;
-        }
-      }
+/** Poll only the cheap Rust-ready bridge and register one new texture handle. */
+export function pumpQrTexture(): void {
+  frameNo += 1;
+  const job = pendingQr;
+  if (!job || frameNo < job.afterFrame) return;
+
+  const handle = media()?.netLoginQr?.() ?? -1;
+  if (handle < 0) return; /* Rust worker is still encoding. */
+
+  pendingQr = undefined;
+  try {
+    const ops = getOps();
+    if (lastQrHandle >= 0) {
+      ops.freeTexture?.(lastQrHandle);
     }
+    lastQrHandle = handle;
+    registerTexture(job.key, handle);
+    job.onReady();
+  } catch {
+    job.onError();
   }
-
-  const handle = ops.uploadTexture(rgba, TEX, TEX, 3);
-  if (handle < 0) throw new Error("二维码贴图上传失败");
-  lastQrHandle = handle;
-  registerTexture(key, handle);
-  return drawn;
 }

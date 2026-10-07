@@ -228,6 +228,55 @@ unsafe extern "C" fn js_list_read(
     )
 }
 
+/// Native-owned catalog version.  It is a cheap atomic read; parsing and
+/// filesystem access happen on `catalog`'s worker thread.
+unsafe extern "C" fn js_net_catalog_version(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    _argc: i32,
+    _argv: *mut JSValue,
+) -> JSValue {
+    js_str(ctx, &crate::media::catalog::version_string())
+}
+
+/// Small menu summaries (`discover`, `charts`, or `account`).
+unsafe extern "C" fn js_net_catalog_menu(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    argc: i32,
+    argv: *mut JSValue,
+) -> JSValue {
+    let kind = arg_string(ctx, argc, argv, 0);
+    js_str(ctx, &crate::media::catalog::menu_json(&kind))
+}
+
+/// Return one bounded visible window from a native-parsed list document.
+/// `offset` and `limit` are strings to keep this ABI compatible with the
+/// existing generic argument reader.
+unsafe extern "C" fn js_net_catalog_page(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    argc: i32,
+    argv: *mut JSValue,
+) -> JSValue {
+    let name = arg_string(ctx, argc, argv, 0);
+    let offset = arg_string(ctx, argc, argv, 1).parse::<usize>().unwrap_or(0);
+    let limit = arg_string(ctx, argc, argv, 2).parse::<usize>().unwrap_or(6);
+    js_str(ctx, &crate::media::catalog::page_json(&name, offset, limit))
+}
+
+/// Return only IDs for queue navigation.  Song metadata never crosses the
+/// bridge as a full document.
+unsafe extern "C" fn js_net_catalog_ids(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    argc: i32,
+    argv: *mut JSValue,
+) -> JSValue {
+    let name = arg_string(ctx, argc, argv, 0);
+    js_str(ctx, &crate::media::catalog::ids_json(&name))
+}
+
 /// 触发一次后台清单同步。`listSync(1)` 跳过 10 分钟 TTL（登录成功后 /
 /// 用户手动刷新时用）；启动时原生自己也会跑一次。
 unsafe extern "C" fn js_list_sync(
@@ -276,6 +325,22 @@ unsafe extern "C" fn js_net_playlist_tracks(
             || crate::media::provider::netease::playlist_tracks_json(&id),
         ),
     )
+}
+
+/// 只触发歌单后台请求；结果通过 catalog worker 落盘后再由版本号通知 guest。
+unsafe extern "C" fn js_net_playlist_request(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    argc: i32,
+    argv: *mut JSValue,
+) -> JSValue {
+    let id = arg_string(ctx, argc, argv, 0);
+    guarded(
+        "netPlaylistRequest",
+        (),
+        || crate::media::provider::netease::playlist_tracks_request(&id),
+    );
+    JS_UNDEFINED
 }
 
 /// 播放期间锁 PS 键：`setPsLock(true)` 锁、`false` 解锁（见 ps_lock.rs）。
@@ -415,6 +480,24 @@ unsafe extern "C" fn js_net_login_state(
     )
 }
 
+/// `vitaMedia.netLoginQr()` → a newly uploaded native QR texture handle, or
+/// `-1` while the Rust worker has not finished. QR encoding and RGBA painting
+/// never execute in QuickJS; this callback only transfers prepared pixels.
+unsafe extern "C" fn js_net_login_qr(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    _argc: i32,
+    _argv: *mut JSValue,
+) -> JSValue {
+    let handle = guarded("netLoginQr", -1, || {
+        let Some(rgba) = crate::media::qr::take_ready() else {
+            return -1;
+        };
+        unsafe { crate::ffi::ui().upload_texture(&rgba, 128, 128, 3) }
+    });
+    JS_NewInt32(ctx, handle)
+}
+
 unsafe extern "C" fn js_net_login_remember(
     ctx: *mut JSContext,
     _this: JSValue,
@@ -528,6 +611,7 @@ pub unsafe fn install(ctx: *mut JSContext, global: JSValue) {
     add_fn(ctx, obj, b"netLoginStart\0", js_net_login_start, 0);
     add_fn(ctx, obj, b"netLoginTick\0", js_net_login_tick, 0);
     add_fn(ctx, obj, b"netLoginState\0", js_net_login_state, 0);
+    add_fn(ctx, obj, b"netLoginQr\0", js_net_login_qr, 0);
     add_fn(ctx, obj, b"netLoginRemember\0", js_net_login_remember, 1);
     add_fn(ctx, obj, b"netSyncProgress\0", js_net_sync_progress, 0);
     add_fn(ctx, obj, b"netPrefetchNext\0", js_net_prefetch_next, 1);
@@ -537,9 +621,14 @@ pub unsafe fn install(ctx: *mut JSContext, global: JSValue) {
     add_fn(ctx, obj, b"netSongInfo\0", js_net_song_info, 1);
     add_fn(ctx, obj, b"netSongsInfo\0", js_net_songs_info, 1);
     add_fn(ctx, obj, b"netPlaylistTracks\0", js_net_playlist_tracks, 1);
+    add_fn(ctx, obj, b"netPlaylistRequest\0", js_net_playlist_request, 1);
     add_fn(ctx, obj, b"listRead\0", js_list_read, 1);
     add_fn(ctx, obj, b"listStat\0", js_list_stat, 1);
     add_fn(ctx, obj, b"listTouched\0", js_list_touched, 0);
+    add_fn(ctx, obj, b"netCatalogVersion\0", js_net_catalog_version, 0);
+    add_fn(ctx, obj, b"netCatalogMenu\0", js_net_catalog_menu, 1);
+    add_fn(ctx, obj, b"netCatalogPage\0", js_net_catalog_page, 3);
+    add_fn(ctx, obj, b"netCatalogIds\0", js_net_catalog_ids, 1);
     add_fn(ctx, obj, b"netPreload\0", js_net_preload, 2);
     add_fn(ctx, obj, b"listSync\0", js_list_sync, 0);
     add_fn(ctx, obj, b"netBuffer\0", js_net_buffer, 0);

@@ -22,6 +22,15 @@ import {
 } from "./core/library";
 import { audioEngine } from "./core/audio";
 import { logEnabled, logMsg, media } from "./core/media";
+import {
+  catalogIds,
+  catalogMenu,
+  catalogPage,
+  catalogVersion,
+  type CatalogPage,
+  type CatalogPlaylist,
+  type CatalogSong,
+} from "./core/catalog";
 import { bgCls, nextTheme, setUiTheme } from "./core/theme";
 import { applyCjkMode, cjkMode, logCjkStats } from "./core/cjk";
 import { setPsLockInfo } from "./core/ui-state";
@@ -43,6 +52,7 @@ import { KeyGuidePage } from "./pages/keys";
 import { AboutPage } from "./pages/about";
 import { AccountPage, type LoginSnapshot } from "./pages/account";
 import { LyricsPage } from "./pages/lyrics";
+import { pumpQrTexture } from "./core/qr";
 
 /* =========================================================
  * YUNYIN —— 流媒体播放器外壳
@@ -78,23 +88,8 @@ const TOPLISTS: { id: string; name: string }[] = [
   { id: "2884035", name: "原创榜" },
 ];
 
-/* list/ 文件里的歌曲节点（原生写的统一结构）。 */
-type ListSong = {
-  id?: string;
-  title?: string;
-  artists?: string;
-  album?: string;
-  durationMs?: number;
-  /** 1 = 网易云里已下架 / 无版权（标灰、不可播） */
-  off?: number;
-  /** 1 = 服务端 `privileges.pl == 0`（当前账号拿不到播放资源，多半是会员限定） */
-  vip?: number;
-  /** 服务端给的"这个账号能播的码率 / 音质档"（有就直接按它请求音质） */
-  pl?: number;
-  plLevel?: string;
-  /** 网易云的 fee：1 = VIP 歌曲（只做标签，不锁播放） */
-  fee?: number;
-};
+/* list/ 文件里的歌曲节点（现在由 Rust catalog bridge 提供）。 */
+type ListSong = CatalogSong;
 
 /* 空位占位：进应用还没选歌时播放器停在这里（只有从列表点歌才开始放）。 */
 const EMPTY_TRACK: Track = {
@@ -329,6 +324,7 @@ export default function Music() {
    * 否则"先玩三分钟再登录"会立刻被判成同步失败。 */
   let accountSyncSinceAt = Date.now();
   const [accountSyncLate, setAccountSyncLate] = createSignal(false);
+  let lastAccountTraceStage = -1;
   let lastNativeErr = "";
   const [onlineInfoFilled, setOnlineInfoFilled] = createSignal<Set<string>>(new Set());
   /*
@@ -352,103 +348,67 @@ export default function Music() {
     message: string;
   }>({ id: "", name: "", file: "", state: "idle", message: "" });
   /*
-   * list/ 目录下的清单文件（原生每次启动后台刷一遍）：
-   *   discover.json / daily.json / account_playlists.json / toplist_<id>.json
-   * 界面读文件来显示 —— 一进应用就有内容，没网也能看上次的。
+   * 在线目录由 Rust catalog worker 所有：Rust 后台解析整份 JSON，JS 只拿
+   * 菜单摘要或当前可见窗口。这里的 signal 只保存小结果，不保存原始文档。
    */
-  const [listFiles, setListFiles] = createSignal<
-    /* `stamp` = 原生 listStat 给的"修改时间+大小"，直接当清单身份用。
-     * 以前这里放的是**全文内容指纹**（hashOf 对整份原文逐字符算），
-     * 实测真机日志 `perf: 指纹 toplist_3778678.json 335ms` —— 33KB 的文件
-     * 要 300 多毫秒，四个榜单每 5 秒各来一次就是近 1 秒的纯浪费。
-     * stat 戳本来就够用（变了就重读重解析，没变就跳过），指纹纯属多余。 */
-    Record<string, { stamp: string; data: any }>
-  >({});
-  /* 清单文件的版本戳（见 loadList）：没变就不读文件。 */
-  const listStamps: Record<string, string> = {};
-  /* 内容指纹：只留一个 32 位整数，**不再把整份 raw 字符串留一份**
-   * （榜单几十 KB × 好几份，parsed 对象之外再存一份原文是白占内存）。 */
-  /*
-   * 清单更新排队：解析完**不要立刻** setListFiles。
-   *
-   * 为什么：一次 `setListFiles` 会让所有依赖它的 memo（行列表 / listIds /
-   * 可见行）在**同一帧**里全部重算。后台同步一口气写完 4 个榜单时，帧循环里
-   * 连着 6 次 loadList ⇒ 一帧里最多 6 次级联 —— 真机日志里
-   * `JS 帧 394ms ← 解析清单 toplist_3778678.json 29ms`（解析只 29ms，
-   * 其余 365ms 全是级联）就是这么来的。
-   *
-   * 现在：解析结果先进队列，帧循环每 15 帧（≈0.25s）只应用一条。
-   * 用户**手动打开**页面（openSub / 开歌单）时传 `immediate=true` 立即生效，
-   * 该等的地方一秒都不多等。
-   */
-  const pendingList: { name: string; stamp: string; data: unknown }[] = [];
-  const applyPendingList = () => {
-    for (let i = 0; i < pendingList.length; i++) {
-      const item = pendingList[i];
-      if (listFiles()[item.name]?.stamp === item.stamp) {
-        pendingList.splice(i, 1); /* 已经是这份内容了 */
-        i -= 1;
-        continue;
-      }
-      pendingList.splice(i, 1);
-      setListFiles((p) => ({ ...p, [item.name]: { stamp: item.stamp, data: item.data } }));
-      return; /* 一帧只应用一条：把级联摊到不同帧 */
+  const [catalogDiscover, setCatalogDiscover] = createSignal<CatalogPlaylist[]>([]);
+  const [catalogCharts, setCatalogCharts] = createSignal<CatalogPlaylist[]>([]);
+  const [catalogDailyCount, setCatalogDailyCount] = createSignal(0);
+  const [catalogAccount, setCatalogAccount] = createSignal<CatalogPlaylist[]>([]);
+  const [catalogPages, setCatalogPages] = createSignal<Record<string, CatalogPage>>({});
+  const [catalogQueues, setCatalogQueues] = createSignal<Record<string, string[]>>({});
+  let lastCatalogVersion = "";
+  const catalogPageRequests: Record<string, string> = {};
+
+  const pullCatalog = () => {
+    const version = catalogVersion();
+    if (version === lastCatalogVersion) return;
+    lastCatalogVersion = version;
+    const discover = catalogMenu("discover");
+    const charts = catalogMenu("charts");
+    const account = catalogMenu("account");
+    const accountRows = account.playlists ?? account.list ?? [];
+    logMsg(
+      `ui: catalog_pull version=${version} discover=${discover.state}/${discover.playlists?.length ?? 0} ` +
+        `charts=${charts.state}/${charts.charts?.length ?? 0} ` +
+        `account=${account.state}/${accountRows.length} list=${account.list?.length ?? 0} playlists=${account.playlists?.length ?? 0}`,
+    );
+    if (discover.state === "ready") setCatalogDiscover(discover.playlists ?? []);
+    if (charts.state === "ready") {
+      setCatalogCharts(charts.charts ?? []);
+      setCatalogDailyCount(charts.dailyCount ?? 0);
     }
+    if (account.state === "ready") {
+      /* Native account menus historically used `list`; normalize both names. */
+      setCatalogAccount(accountRows);
+    }
+    const open = cloudOpen();
+    if (open.file) loadCatalogPage(open.file, start(), true);
   };
 
-  const loadList = (name: string, immediate = false, touched = false) => {
-    if (!name) return;
-    /*
-     * `touched = true`：原生已经报过"这个文件刚被我们写过"，**跳过 stat 直接读**。
-     * 真机上省下的不是几微秒 —— 一次 stat 是 35~86ms。
-     */
-    if (touched) {
-      const raw = perfSpan("读清单 " + name, () => media()?.listRead?.(name) || "");
-      if (!raw) return;
-      const id = "t" + raw.length.toString();
-      const prev = listFiles()[name];
-      if (prev && prev.stamp === id) return;
-      try {
-        const data = perfSpan("解析清单 " + name, () => JSON.parse(raw));
-        const dup = pendingList.findIndex((e) => e.name === name);
-        if (dup >= 0) pendingList.splice(dup, 1);
-        pendingList.push({ name, stamp: id, data });
-      } catch {
-        /* 坏文件当没有 */
+  const loadCatalogPage = (
+    file: string,
+    offset: number,
+    immediate = false,
+  ): CatalogPage | undefined => {
+    if (!file) return undefined;
+    const key = `${file}:${offset}`;
+    const current = catalogPages()[file];
+    if (!immediate && current?.state === "ready" && current.offset === offset) return current;
+    if (!immediate && catalogPageRequests[file] === key) return current;
+    catalogPageRequests[file] = key;
+    const page = catalogPage(file, offset, LIST_WINDOW);
+    if (page.state === "ready") {
+      setCatalogPages((prev) => ({ ...prev, [file]: page }));
+      if (!catalogQueues()[file]) {
+        const ids = catalogIds(file);
+        if (ids.length > 0) setCatalogQueues((prev) => ({ ...prev, [file]: ids }));
       }
-      return;
     }
-    /* 先问版本戳（一次 stat，几微秒）：没变就直接返回，**不读整份文件**。
-     * 以前每秒把发现页/歌单页的 JSON 从 SD 卡整份读出来再比字符串，
-     * 榜单文件动辄几十 KB —— 这才是列表系统最大的一笔浪费。 */
-    /* stat 也要计时：它每秒要对 6 个清单文件各来一次，而这段以前不在任何 span 里 ——
-     * 真机日志里"慢帧几百毫秒却查不出谁花的"很可能就在这儿（尤其模拟器的文件层慢）。 */
-    const stamp = perfSpan("listStat " + name, () => media()?.listStat?.(name) || "");
-    if (stamp && stamp === listStamps[name]) return;
-    const raw = perfSpan("读清单 " + name, () => media()?.listRead?.(name) || "");
-    if (!raw) return;
-    listStamps[name] = stamp || raw.length.toString();
-    const prev = listFiles()[name];
-    /* 身份就是 stat 戳（上面已经拿到了）。**不再算内容指纹** ——
-     * 见 listFiles 的说明：那个逐字符哈希在真机上要几百毫秒，纯浪费。 */
-    const id = stamp || raw.length.toString();
-    if (prev && prev.stamp === id) return; /* 同一个版本，已经读过了 */
-    try {
-      const data = perfSpan("解析清单 " + name, () => JSON.parse(raw));
-      if (immediate) {
-        setListFiles((p) => ({ ...p, [name]: { stamp: id, data } }));
-        return;
-      }
-      /* 同一个文件重复入队只留最新的一份 */
-      const dup = pendingList.findIndex((e) => e.name === name);
-      if (dup >= 0) pendingList.splice(dup, 1);
-      pendingList.push({ name, stamp: id, data });
-    } catch {
-      /* 坏文件当没有 */
-    }
+    return page;
   };
-  const listData = <T,>(name: string): T | undefined =>
-    listFiles()[name]?.data as T | undefined;
+
+  const pageData = (file: string): CatalogPage | undefined => catalogPages()[file];
 
   /*
    * ---------------- 云端条目的"按需物化" ----------------
@@ -483,24 +443,10 @@ export default function Music() {
    *      直接顶爆 PocketJS 的 2 秒预算 → 黑屏（health.json: time budget exceeded）。
    * 正解是两头都要：**每个文件只建一次索引**，查的时候 O(1)；换歌单才重建。
    */
-  let cloudMetaIndex: Record<string, ListSong> = {};
-  let cloudMetaIndexFile = "";
-  let cloudMetaIndexStamp = "";
   const cloudMetaFor = (id: string): ListSong | undefined => {
     const file = cloudOpen().file ?? "";
-    const stamp = file ? listFiles()[file]?.stamp ?? "" : "";
-    if (file !== cloudMetaIndexFile || stamp !== cloudMetaIndexStamp) {
-      /* 换歌单、或这份清单被重新解析过：重建一次索引（O(n)，每次数据更新只一次）。 */
-      const songs = file ? listData<{ songs?: ListSong[] }>(file)?.songs : undefined;
-      const idx: Record<string, ListSong> = {};
-      for (const s of songs ?? []) {
-        if (s?.id) idx[cloudId(s.id)] = s;
-      }
-      cloudMetaIndex = idx;
-      cloudMetaIndexFile = file;
-      cloudMetaIndexStamp = stamp;
-    }
-    return cloudMetaIndex[id];
+    const songs = file ? pageData(file)?.songs : undefined;
+    return songs?.find((song) => cloudId(song.id) === id);
   };
 
   const buildCloudTrack = (id: string, meta: ListSong): Track => {
@@ -643,11 +589,8 @@ export default function Music() {
 
     /* 发现：热门推荐（推荐歌单），点进去就是那张歌单 */
     if (t === 0) {
-      const d = listData<{ playlists?: { id?: string; name?: string; count?: number }[] }>(
-        "discover.json",
-      );
       const rows: MenuRowData[] = [];
-      const list = d?.playlists ?? [];
+      const list = catalogDiscover();
       if (list.length === 0) {
         rows.push({ kind: "card", name: "热门推荐", value: `同步中…${syncProgText()}` });
       }
@@ -667,19 +610,21 @@ export default function Music() {
     /* 榜单：每日推荐 + 热歌榜/飙升榜/新歌榜/原创榜 */
     if (t === 1) {
       const rows: MenuRowData[] = [];
-      const daily = listData<{ songs?: ListSong[] }>("daily.json");
       rows.push({
         kind: "card",
         name: "每日推荐",
-        value: daily?.songs?.length ? `${daily.songs.length} 首` : "登录后同步",
+        value:
+          loginSnapshot().loggedIn && catalogDailyCount()
+            ? `${catalogDailyCount()} 首`
+            : "登录后同步",
         file: "daily.json",
       });
       for (const top of TOPLISTS) {
-        const f = listData<{ name?: string; songs?: ListSong[] }>(`toplist_${top.id}.json`);
+        const f = catalogCharts().find((chart) => chart.id === top.id);
         rows.push({
           kind: "item",
           name: f?.name || top.name,
-          value: f?.songs?.length ? `${f.songs.length} 首` : `同步中…${syncProgText()}`,
+          value: f?.count ? `${f.count} 首` : `同步中…${syncProgText()}`,
           id: top.id,
           file: `playlist_${top.id}.json`,
         });
@@ -689,11 +634,11 @@ export default function Music() {
 
     /* 歌单：在线歌曲（playlist.json 的全部）→ 我的歌单（账号）→ 我喜欢的 */
     if (t === 2) {
-      const acc = listData<{ list?: { id?: string; name?: string; count?: number }[] }>(
-        "account_playlists.json",
-      );
-      const clouds = acc?.list ?? [];
-      const cloudNames = new Set(clouds.map((p) => p?.name ?? ""));
+      /* account_playlists.json can be left on the card from a previous
+       * session. Never expose that snapshot as the current account while
+       * logged out; the native worker will refresh it after login. */
+      const clouds = loginSnapshot().loggedIn ? catalogAccount() : [];
+      const cloudNames = new Set(clouds.map((p) => p.name));
 
       /* 「在线歌曲」那张卡片去掉了：它只是把卡里 playlist.json 的歌摊平一遍，
        * 和下面的歌单分组重复，用户反馈没用。 */
@@ -767,10 +712,8 @@ export default function Music() {
     if (s === "album") return album()?.trackIds.length ?? 0;
     if (s === "playlist") {
       const file = cloudOpen().file;
-      if (file) {
-        const songs = listData<{ songs?: ListSong[] }>(file)?.songs;
-        if (songs?.length) return songs.length;
-      }
+      const page = file ? pageData(file) : undefined;
+      if (page?.state === "ready") return page.total;
       const name = playlistName();
       return onlineIds().filter((id) => trackById()[id]?.playlist === name).length;
     }
@@ -790,8 +733,9 @@ export default function Music() {
     if (s === "album") return album()?.trackIds[i] ?? "";
     if (s === "playlist") {
       const file = cloudOpen().file;
-      if (file) {
-        const sid = listData<{ songs?: ListSong[] }>(file)?.songs?.[i]?.id;
+      const page = file ? pageData(file) : undefined;
+      if (page?.state === "ready" && i >= page.offset && i < page.offset + page.songs.length) {
+        const sid = page.songs[i - page.offset]?.id;
         if (sid) return cloudId(sid);
       }
       const name = playlistName();
@@ -828,14 +772,10 @@ export default function Music() {
        * 甚至整个清单只剩一首能对上。 */
       const file = cloudOpen().file;
       if (file) {
-        const songs = listData<{ songs?: ListSong[] }>(file)?.songs;
-        if (songs?.length) {
-          const out: string[] = [];
-          for (const song of songs) {
-            if (song?.id) out.push(cloudId(song.id));
-          }
-          if (out.length > 0) return out;
-        }
+        const ids = catalogQueues()[file];
+        if (ids?.length) return ids.map(cloudId);
+        const songs = pageData(file)?.songs;
+        if (songs?.length) return songs.map((song) => cloudId(song.id));
       }
       /* 卡里 playlist.json 描述的歌单：按曲库里的 playlist 分组。 */
       const name = playlistName();
@@ -1003,9 +943,15 @@ export default function Music() {
   let lastForceMs = 0;
   const forceListSync = () => {
     const now = Date.now();
-    if (now - lastForceMs < 60_000) return;
+    const age = now - lastForceMs;
+    if (age < 60_000) {
+      return;
+    }
     lastForceMs = now;
-    logMsg("ui: 强制刷在线清单");
+    logMsg(
+      `ui: list_sync_request force=1 logged_in=${loginSnapshot().loggedIn} ` +
+        `catalog_account=${catalogAccount().length}`,
+    );
     media()?.listSync?.(1);
   };
 
@@ -1014,22 +960,19 @@ export default function Music() {
    *
    * 榜单 / 歌单文件是**打开时**才落盘的：登录之前写下的那些会带一大堆下架
    * 标记（真机上出现过 200 首里 159 首标灰 —— 那是匿名会话拿到的权限结果）。
-   * 文件超过 10 分钟就让原生重拉一次（原生自己有 60 秒 TTL，不会打爆接口），
-   * 拉到的会落盘，下一拍 loadList 就读到新的了。
+   * 文件超过 10 分钟就让原生重拉一次（原生自己有 60 秒 TTL，不会打爆接口）。
+   * 文件时间戳由 Rust catalog worker 管理，guest 不再读取原始清单。
    */
-  const FILE_MAX_AGE_MS = 10 * 60 * 1000;
   let lastStaleAskMs = 0;
   const refreshListIfStale = () => {
     const open = cloudOpen();
-    if (!open.id || !open.file) return;
-    const at = Number((listData<{ at?: number }>(open.file) || {}).at) || 0;
-    if (at > 0 && Date.now() - at < FILE_MAX_AGE_MS) return;
+    if (!open.id) return;
     /* 拉取失败时 at 不会更新，别每 5 秒问一次原生（真正的节流点）。 */
     const now = Date.now();
     if (now - lastStaleAskMs < 60_000) return;
     lastStaleAskMs = now;
     logMsg("ui: 清单文件偏旧，让原生重拉 id=" + open.id);
-    media()?.netPlaylistTracks?.(open.id);
+    media()?.netPlaylistRequest?.(open.id);
   };
 
   const playTrack = (id: string) => {
@@ -1201,11 +1144,13 @@ export default function Music() {
     let name = row.name;
     let state = row.id ? "loading" : "ready";
     let got = false;
+    logMsg(
+      `ui: open_list_row kind=${row.kind} name=${row.name} id=${row.id ?? ""} file=${row.file ?? ""}`,
+    );
     if (row.file) {
-      loadList(row.file, true); /* 用户刚点的：立即生效，别排队等 0.25s */
-      const d = listData<{ name?: string; songs?: ListSong[] }>(row.file);
-      if (d?.name) name = d.name;
-      if (d?.songs?.length) {
+      const page = loadCatalogPage(row.file, 0, true);
+      if (page?.name) name = page.name;
+      if (page?.state === "ready" && page.total > 0) {
         state = "ready";
         got = true;
       }
@@ -1225,7 +1170,7 @@ export default function Music() {
     listOpenAt = Date.now();
     setSyncElapsed(0);
     if (!got && row.id) {
-      media()?.netPlaylistTracks?.(row.id);
+      media()?.netPlaylistRequest?.(row.id);
       forceListSync();
     }
     openSub("playlist");
@@ -1316,12 +1261,8 @@ export default function Music() {
     /* 进来**不预选歌**：播放器停在空位，等用户从本地/在线清单里点第一首才开播。 */
     if (cjkMode() === "stream") applyCjkMode("stream");
 
-    /* list/ 清单：先把上次落下的文件读进界面，再让原生后台刷一遍
-     * （热推荐 / 每日推荐 / 我的歌单 / 四个榜单，原生侧 10 分钟 TTL）。 */
-    loadList("discover.json");
-    loadList("daily.json");
-    loadList("account_playlists.json");
-    for (const top of TOPLISTS) loadList(`toplist_${top.id}.json`);
+    /* Rust catalog worker 会在后台加载/解析已有清单；这里仅采样小摘要。 */
+    pullCatalog();
     media()?.listSync?.();
   });
 
@@ -1336,7 +1277,10 @@ export default function Music() {
       /* 计时从"这次登录"开始算，而不是应用启动那一刻。 */
       accountSyncSinceAt = Date.now();
       setAccountSyncLate(false);
-      logMsg("ui: 会话就绪，强制刷清单");
+      logMsg(
+        `ui: session_transition logged_in=true catalog_version=${catalogVersion()} ` +
+          `catalog_account=${catalogAccount().length}`,
+      );
       forceListSync();
     } else if (!on) {
       wasLoggedIn = false;
@@ -1542,6 +1486,11 @@ export default function Music() {
     /* 用 try/finally 保证"帧结束"一定被结算 —— 帧循环里有提前 return（息屏那条），
      * 漏结算就会退化成量"两帧之间的墙钟时间"，把宿主渲染也算成 JS 慢帧（踩过）。 */
     try {
+    /*
+     * QR 贴图上传可能进入宿主 GPU 路径，不能和收到网络结果的响应式
+     * effect 放在同一帧。只在帧循环里一次性泵一个已排队的二维码。
+     */
+    pumpQrTexture();
     perfFrame(); /* 掉帧 / 帧率汇总（只在慢的时候写日志） */
     /* 音频泵也要入账：它是**原生调用**（SDL / sceAudioOutOutput），输出缓冲满时
      * 会按音频时钟阻塞 —— 那部分是"等音频"，不是卡顿，必须和 JS 逻辑分开看。 */
@@ -1656,38 +1605,9 @@ export default function Music() {
       }
     }
 
-    /* list/ 清单文件：发现页、我的歌单每秒看一次；每日推荐 + 四个榜单每 5 秒看一次。
-     * 原生只在启动时真刷一遍（10 分钟 TTL），这里只是把文件内容读进界面。 */
-    /* 每 15 帧（≈0.25s）把队列里的一条清单更新应用到界面：把"一帧 6 次级联"
-     * 摊成"6 帧各一次"，切页面/滚动就不再被后台同步的落盘打断。 */
-    if (frameCounter % 15 === 0) applyPendingList();
-    /*
-     * **事件驱动**刷新清单（任务书 ⑦）：不再"每秒问 6 个文件变没变"。
-     *
-     * 真机实测：一次 `listStat` 要 **35~86ms**（SD 卡 metadata IO），每秒 6 次就是
-     * 200ms+ 的固定开销，也是剩下那些 `JS 帧 130~390ms ← listStat/读清单/解析清单`
-     * 的全部来源。文件本来就是我们原生侧自己写的 —— 写的时候顺手记一笔名字，
-     * 界面每 0.5 秒取一次"被写过谁"，只有名单里的文件才去读（跳过 stat）。
-     *
-     * 另外保留一条**慢速扫查**（每 15 秒）兜底：用户从电脑往卡里丢文件时，
-     * 那不是我们写的，只有扫查才能发现。代价从"每秒 6 次 stat"降到"每 15 秒 6 次"。
-     */
-    if (frameCounter % 30 === 0) {
-      const touched = perfSpan("listTouched", () => media()?.listTouched?.() || "");
-      if (touched) {
-        for (const name of touched.split(",")) {
-          const n = name.trim();
-          if (n) loadList(n, false, true); /* 已知变过：跳过 stat，直接读 */
-        }
-      }
-    }
-    if (frameCounter % 900 === 0) {
-      /* 慢速兜底扫查：只有这条路径还会 stat（每 15 秒一轮）。 */
-      loadList("discover.json");
-      loadList("account_playlists.json");
-      loadList("daily.json");
-      for (const top of TOPLISTS) loadList(`toplist_${top.id}.json`);
-    }
+    /* 清单文件由 Rust catalog worker 读取、解析并缓存；guest 每 0.5 秒只采样
+     * 一个原子版本号，需要时再取菜单摘要/当前窗口，不再触碰文件 IO 或全量 JSON。 */
+    if (frameCounter % 30 === 0) pullCatalog();
     if (frameCounter % 60 === 0) {
       /* 同步进度（"3/7"）：原生只报当前那件事，只有多步任务才显示数字。 */
       try {
@@ -1703,7 +1623,10 @@ export default function Music() {
         } else if (p?.kind && total > 1) {
           txt = `${p.done ?? 0}/${total}`;
         }
-        if (txt !== syncProg()) setSyncProg(txt);
+        if (txt !== syncProg()) {
+          setSyncProg(txt);
+          logMsg(`ui: list_progress kind=${p?.kind ?? ""} done=${p?.done ?? 0} total=${p?.total ?? 0} text=${txt}`);
+        }
       } catch {
         /* 拿不到就当没有进度 */
       }
@@ -1712,13 +1635,23 @@ export default function Music() {
      * 自带 60 秒节流），超过 60 秒还没来就在界面上写"同步失败"。
      * 以前这里只会一直显示"同步中…"，用户根本分不出是慢还是坏了。 */
     if (frameCounter % 300 === 0) {
-      const hasAccount = !!listData<{ list?: unknown[] }>("account_playlists.json");
+      const hasAccount = catalogAccount().length > 0;
       if (hasAccount) {
         if (accountSyncLate()) setAccountSyncLate(false);
       } else if (loginSnapshot().loggedIn) {
         const waited = Date.now() - accountSyncSinceAt;
+        const stage = waited > 60_000 ? 2 : waited > 15_000 ? 1 : 0;
+        if (stage !== lastAccountTraceStage) {
+          lastAccountTraceStage = stage;
+          logMsg(
+            `ui: account_check stage=${stage} logged_in=true catalog_account=0 waited_ms=${waited}`,
+          );
+        }
         if (waited > 60_000 && !accountSyncLate()) setAccountSyncLate(true);
         if (waited > 15_000) forceListSync();
+      } else if (lastAccountTraceStage !== -1) {
+        lastAccountTraceStage = -1;
+        logMsg("ui: account_check logged_in=false");
       }
     }
     /* 正开着的清单子页：先读文件（断网/没刷新过也有上次的内容）；
@@ -1736,17 +1669,11 @@ export default function Music() {
       let name = open.name;
       let songs: ListSong[] | undefined;
       if (open.file) {
-        /*
-         * 打开中的歌单：以前**每秒**都 `loadList(open.file, true)` —— 真机一次 stat 35~86ms，
-         * 这是"歌单选首后就一直卡"的一笔固定开销。文件若被原生写过，`listTouched`
-         * 那条事件路径会把它读进来；这里只做**很慢的兜底扫查**（每 15 秒）。
-         */
-        if (frameCounter % 900 === 0) loadList(open.file, true);
-        const d = listData<{ name?: string; songs?: ListSong[] }>(open.file);
-        if (d?.name) name = d.name;
-        if (d?.songs?.length) songs = d.songs;
+        const page = loadCatalogPage(open.file, start());
+        if (page?.name) name = page.name;
+        if (page?.state === "ready") songs = page.songs;
       }
-      if (songs) {
+      if (songs && pageData(open.file)?.state === "ready") {
         /* 文件没变就什么都不做（adoptListFile 自己判重）——
          * 以前每秒把整张榜单重并一遍，是卡顿的主因。 */
         const renamed = name !== open.name;
@@ -1755,27 +1682,8 @@ export default function Music() {
           setCloudOpen((p) => ({ ...p, name, state: "ready" }));
         }
       } else if (open.id && frameCounter % 60 === 0) {
-        /* 每秒问一次原生"拉到没有"（它自己 60 秒 TTL + 后台线程，问了不亏）。 */
-        const raw = perfSpan("netPlaylistTracks", () => media()?.netPlaylistTracks?.(open.id) || "");
-        try {
-          const parsed = JSON.parse(raw) as {
-            state?: string;
-            name?: string;
-            message?: string;
-            songs?: ListSong[];
-          };
-          if (parsed?.state === "auth") {
-            setCloudOpen((p) => ({ ...p, state: "failed", message: "登录后同步" }));
-          } else if (parsed?.state === "failed") {
-            setCloudOpen((p) => ({
-              ...p,
-              state: "failed",
-              message: parsed.message || "",
-            }));
-          }
-        } catch {
-          /* 下次再问 */
-        }
+        /* 只触发 native 请求；结果落盘后由 catalog worker 发布，整份响应不回 guest。 */
+        media()?.netPlaylistRequest?.(open.id);
       }
     }
 

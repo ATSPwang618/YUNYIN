@@ -377,6 +377,7 @@ pub fn sync_progress_json() -> String {
 }
 
 pub fn login_start() {
+    crate::media::qr::reset();
     {
         let Ok(mut g) = LOGIN.lock() else { return };
         if matches!(*g, LoginState::Starting) {
@@ -408,6 +409,7 @@ pub fn login_start() {
                     crate::media::platform::log::append(&format!(
                         "login: 二维码就绪 key=…{tail}"
                     ));
+                    crate::media::qr::prepare(&login::qr_content(&start.unikey));
                     set_login(LoginState::Waiting {
                         key: start.unikey,
                         /* 电脑对照实验证明：轮询不带 NMTID、只带 os=pc; appver=2.9.7 就能
@@ -581,6 +583,7 @@ pub fn login_remember(on: bool) {
 }
 
 pub fn logout() {
+    crate::media::qr::reset();
     if let Ok(mut slot) = SESSION.lock() {
         *slot = None;
     }
@@ -773,6 +776,19 @@ pub fn songs_info_json(ids_csv: &str) -> String {
 
 /// 某张歌单的歌曲：`{"state":"…","name":"…","songs":[…]}`。
 pub fn playlist_tracks_json(playlist_id: &str) -> String {
+    playlist_tracks_json_inner(playlist_id, true)
+}
+
+/// 只触发后台拉取，不把缓存里的整张歌曲 JSON 构造成 bridge 返回值。
+///
+/// 清单页面已经由 `catalog` worker 消费落盘文件；guest 只需要发起请求，
+/// 后续通过 catalog version 看到结果。这个入口专门避免旧的
+/// `playlist_tracks_json` 在缓存命中时又拼一份大字符串。
+pub fn playlist_tracks_request(playlist_id: &str) {
+    let _ = playlist_tracks_json_inner(playlist_id, false);
+}
+
+fn playlist_tracks_json_inner(playlist_id: &str, include_songs: bool) -> String {
     static STATE: AtomicU8 = AtomicU8::new(0);
     /* (id, name, songs_json, 拿到的时间 ms) */
     static CACHE: Mutex<Vec<(String, String, String, u64)>> = Mutex::new(Vec::new());
@@ -896,6 +912,9 @@ pub fn playlist_tracks_json(playlist_id: &str) -> String {
     }
 
     if let Some((name, songs, _)) = &cached {
+        if !include_songs {
+            return String::new();
+        }
         return format!(
             "{{\"state\":\"ready\",\"name\":\"{}\",\"songs\":{}}}",
             json::escape(name),

@@ -97,6 +97,15 @@ pub fn write_raw(name: &str, body: &str) {
                 g.push(String::from(name));
             }
         }
+        /* Parse the new snapshot on the native catalog worker.  The guest
+         * only receives bounded menu/page views through bridge.rs. */
+        crate::media::catalog::publish(name, body);
+        log::append(&format!(
+            "list: snapshot_written name={} bytes={} stat={}",
+            name,
+            body.len(),
+            stat(name)
+        ));
     }
 }
 
@@ -144,6 +153,11 @@ pub fn sync_once() {
     /* 7 件事：热门推荐 / 每日推荐 / 我的歌单 / 四个榜单。界面据此显示 "3/7"。 */
     super::prog_begin(1, 3 + TOPLISTS.len());
     let session = super::current_session();
+    log::append(&format!(
+        "list: sync_begin session_logged_in={} provider_logged_in={}",
+        session.is_logged_in(),
+        super::is_logged_in()
+    ));
     let mut post = crate::media::net::http::VitaPost;
     let mk_secret =
         || super::crypto::secret_key_from_entropy(crate::media::platform::time::entropy64());
@@ -168,42 +182,60 @@ pub fn sync_once() {
         super::prog_step();
     }
 
-    /* 每日推荐（需登录；没登录会返回 Auth，保留旧文件） */
+    /* 每日推荐（需登录）：未登录时不发请求，等登录成功后的强制同步。 */
     {
-        let secret = mk_secret();
-        match mine::daily_songs(&secret, &mut post, &session) {
-            Ok(songs) => {
-                write_raw(
-                    "daily.json",
-                    &format!(
-                        "{{\"at\":{},\"songs\":{}}}",
-                        now_ms(),
-                        mine::cloud_songs_json(&songs)
-                    ),
-                );
-                log::append(&format!("list: daily.json 已更新（{} 首）", songs.len()));
+        if session.is_logged_in() && super::is_logged_in() {
+            let secret = mk_secret();
+            match mine::daily_songs(&secret, &mut post, &session) {
+                Ok(songs) => {
+                    write_raw(
+                        "daily.json",
+                        &format!(
+                            "{{\"at\":{},\"songs\":{}}}",
+                            now_ms(),
+                            mine::cloud_songs_json(&songs)
+                        ),
+                    );
+                    log::append(&format!("list: daily.json 已更新（{} 首）", songs.len()));
+                }
+                Err(e) => log::append(&format!("list: 每日推荐失败 {e:?}")),
             }
-            Err(e) => log::append(&format!("list: 每日推荐失败 {e:?}")),
+        } else {
+            log::append("list: daily.json 跳过（未登录，登录后懒刷新）");
         }
         super::prog_step();
     }
 
-    /* 我的歌单（需登录） */
+    /* 我的歌单（需登录）：未登录时不问 uid，也不产生 Auth 失败。 */
     {
-        let secret = mk_secret();
-        match mine::my_playlists(&secret, &mut post, &session) {
-            Ok(list) => {
-                write_raw(
-                    "account_playlists.json",
-                    &format!(
-                        "{{\"at\":{},\"list\":{}}}",
-                        now_ms(),
-                        mine::playlists_json(&list)
-                    ),
-                );
-                log::append(&format!("list: account_playlists.json 已更新（{} 张）", list.len()));
+        let session_logged_in = session.is_logged_in();
+        let provider_logged_in = super::is_logged_in();
+        log::append(&format!(
+            "list: account_begin session_logged_in={} provider_logged_in={}",
+            session_logged_in, provider_logged_in
+        ));
+        if session_logged_in && provider_logged_in {
+            let secret = mk_secret();
+            match mine::my_playlists(&secret, &mut post, &session) {
+                Ok(list) => {
+                    log::append(&format!("list: account_api_ok count={}", list.len()));
+                    write_raw(
+                        "account_playlists.json",
+                        &format!(
+                            "{{\"at\":{},\"list\":{}}}",
+                            now_ms(),
+                            mine::playlists_json(&list)
+                        ),
+                    );
+                    log::append(&format!("list: account_playlists.json 已更新（{} 张）", list.len()));
+                }
+                Err(e) => log::append(&format!(
+                    "list: account_api_error error={e:?} provider_logged_in_after={}",
+                    super::is_logged_in()
+                )),
             }
-            Err(e) => log::append(&format!("list: 我的歌单失败 {e:?}")),
+        } else {
+            log::append("list: account_playlists.json 跳过（未登录，登录后懒刷新）");
         }
         super::prog_step();
     }
@@ -253,13 +285,21 @@ static PENDING: AtomicBool = AtomicBool::new(false);
 /// 单项失败不影响其它项，界面照样能读上一次的文件。
 pub fn sync_background(force: bool) {
     let now = now_ms();
-    if RUNNING.load(Ordering::Acquire) {
+    let running = RUNNING.load(Ordering::Acquire);
+    let age_ms = now.saturating_sub(STARTED_MS.load(Ordering::Acquire));
+    log::append(&format!(
+        "list: sync_request force={} running={} age_ms={}",
+        force, running, age_ms
+    ));
+    if running {
         if force {
             PENDING.store(true, Ordering::Release);
+            log::append("list: sync_request queued_pending=true");
         }
         return;
     }
-    if !force && now.saturating_sub(STARTED_MS.load(Ordering::Acquire)) < 10 * 60 * 1000 {
+    if !force && age_ms < 10 * 60 * 1000 {
+        log::append("list: sync_request skipped_ttl=true");
         return;
     }
     STARTED_MS.store(now, Ordering::Release);
@@ -276,5 +316,8 @@ pub fn sync_background(force: bool) {
         });
     if spawned.is_err() {
         RUNNING.store(false, Ordering::Release);
+        log::append("list: sync_request spawn_failed=true");
+    } else {
+        log::append("list: sync_request spawned=true");
     }
 }
