@@ -21,6 +21,20 @@ def stage():
         raise SystemExit(
             f"[build-vpk] required Vita2D archive is missing: {vita2d_archive}"
         )
+    # 这份 .a 是预编译的：scripts/patches/libvita2d-pvf-*.patch 记录的是当初改它源码的
+    # 内容，构建过程不会重新应用。少了 PVF 入口符号，宿主的 extern "C" 声明就会链接
+    # 失败（或更糟：链到别的实现），所以在这里先挡一道。
+    archive_bytes = vita2d_archive.read_bytes()
+    missing = [
+        name for name in (b"vita2d_pvf_set_char_size", b"vita2d_pvf_get_glyph_stats")
+        if name not in archive_bytes
+    ]
+    if missing:
+        raise SystemExit(
+            "[build-vpk] libvita2d.a 缺少 PVF 入口符号 "
+            + ", ".join(name.decode() for name in missing)
+            + "：请按 scripts/patches/libvita2d-pvf-*.patch 重新编译这份静态库"
+        )
     app_dst = PKJ / "apps" / APP_NAME
     if app_dst.exists():
         shutil.rmtree(app_dst)
@@ -109,15 +123,14 @@ def _elf_gap():
 
 # --- 4/5 bake + vite build ------------------------------------------------
 def build_vpk():
-    # Density 2 (raster 2 samples/logical px) renders sharp glyphs; a density-1
-    # raster is upscaled 2x on the Vita surface and looks blurry.  Because the
-    # atlas limit is 2048px we keep the charset small (ASCII + live music tags
-    # + symbols) so a 17x24 cell at density 2 (34x48 coverage) fits.
-    harvest = fonts.harvest_chars()
-    extra = ["--extra-chars=" + harvest] if harvest else []
+    # 这里烘焙出来的是 PocketJS 侧的字体归档；运行期宿主不会再把它上传成 GPU 纹理
+    # （见 patches_host.patch_host_native_text），界面文字走 Vita2D 的 ScePvf。
+    # 因此不再用 --extra-chars 去收割曲库字符集：图集内容只由源码字面量决定，
+    # 缺字与否跟界面无关（旧实现还会去扫 /mnt/d/PSV 下的音乐目录）。
+    # 注意 build.ts 只认 --font-regular / --font-bold，没有 --font-mono。
     font = fonts.theme_font()
     run([BUN, "tools/build.ts", APP_ID, f"--density={DENSITY}",
-         f"--font-regular={font}", f"--font-bold={font}", f"--font-mono={font}"] + extra)
+         f"--font-regular={font}", f"--font-bold={font}"])
     # Optional frame-capture build for debugging (env YUNYIN_CAPTURE_FRAMES is
     # a comma list of frame numbers; output goes to ux0:data/pocketjs-captures).
     cap = os.environ.get("YUNYIN_CAPTURE_FRAMES", "")
@@ -172,21 +185,24 @@ def repack():
         print("[build-vpk] eboot regenerated with authid 0x2800000000000001")
     else:
         print(f"[build-vpk] WARN: velf not found ({velf}), kept default eboot")
-    # Vita2D native font path.  The runtime intentionally consumes only the
-    # PVF entry; do not package a TTF fallback that could reintroduce a second
-    # renderer and make logs misleading.
-    native_pvf_source = PROJECT_ROOT / "fonts" / "chinese" / "SourceHanSansSC-Bold.otf"
-    if native_pvf_source.exists():
+    # 运行期只认这一个字体文件（vita2d_load_custom_pvf），不打包 TTF 兜底，免得又冒出
+    # 第二套渲染实现。文件只需"改名"：ScePvf 直接吃 OpenType/TTF，yunyin.pvf 只是
+    # libvita2d 的加载入口名。取自 fonts/<FONT_THEME>/，所以 YUNYIN_FONT=japanese
+    # 打出来的包真的用 MS Mincho。
+    native_font = Path(fonts.theme_font())
+    if native_font.exists():
         fonts_dir = staging / "fonts"
         fonts_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(native_pvf_source, fonts_dir / "yunyin.pvf")
+        shutil.copy2(native_font, fonts_dir / "yunyin.pvf")
         print(
-            f"[build-vpk] packed native PVF font {native_pvf_source.name} "
-            f"({native_pvf_source.stat().st_size} bytes) -> app0:/fonts/yunyin.pvf"
+            f"[build-vpk] packed native font {native_font.name} "
+            f"({native_font.stat().st_size} bytes) -> app0:/fonts/yunyin.pvf"
         )
-    # 根证书：SceSsl 默认只认固件自带的那份库，随包带一张 DigiCert Global Root G2
-    # （网易云整条链都用它），开机由 yhttp_load_ca() 注册进去 —— 老机器/模拟器上
-    # 缺新根时也能验通。PEM 和 DER 都带上：SceHttpsData 没写明格式，运行时两个都试。
+    else:
+        print(f"[build-vpk] WARN: 随包字体缺失 {native_font}，界面文字会 mode=disabled")
+    # 根证书：传输层是随包的 libcurl/OpenSSL，信任库就是这一份 —— 不看固件根库。
+    # 网易云整条链都挂在 DigiCert Global Root G2 上，另附完整 ca-bundle 兜底；
+    # 开机由 yhttp_load_ca() 把 PEM 读进内存交给 curl（PEM 与 DER 都带上，运行时按顺序试）。
     ca_dir = PROJECT_ROOT / "certs"
     certs = sorted(ca_dir.glob("*")) if ca_dir.is_dir() else []
     if certs:

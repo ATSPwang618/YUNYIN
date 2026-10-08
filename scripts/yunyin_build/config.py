@@ -34,17 +34,17 @@ OUT = os.environ.get("YUNYIN_OUT", APP_ID)
 APP_TITLE = "云音"                             # param.sfo TITLE（LiveArea 气泡下方显示名）
 
 
-# param.sfo 里的 APP_VER（VitaShell 里看到的版本号），发布新版本时改这里
+# 版本号只有这一处来源（发布新版本改这里）。
+# app/pocket.json、app/core/theme.ts、native 启动日志由 build-vpk.py 在构建前
+# 校验一致，漏改任何一处都会直接报错。
 APP_VER = os.environ.get("YUNYIN_APP_VER", "01.10")
+APP_VERSION = APP_VER.lstrip("0") or APP_VER    # 展示用（01.10 -> 1.10）
+# app/pocket.json 的 version 必须是严格的 X.Y.Z（PocketJS 校验），所以再补一位。
+APP_VERSION_SEMVER = APP_VERSION + ".0"        # -> 1.10.0
 
 
 # 诊断开关：YUNYIN_NO_COVER=1 时跳过内嵌封面贴图上传（排查 0.13 灰屏用）。
 NO_COVER = os.environ.get("YUNYIN_NO_COVER") == "1"
-
-
-# 诊断开关：YUNYIN_BARE_GRAPHICS=1 时跳过额外的宿主图形补丁；原生文字
-# 后端仍然保留，因为它是 Vita2D TEXT_RUN 的实际渲染入口。
-BARE_GRAPHICS = os.environ.get("YUNYIN_BARE_GRAPHICS") == "1"
 
 
 # 诊断开关：YUNYIN_CATCH_HANG=1 时保留 0.13 的 guest 中断，但把帧预算从
@@ -61,21 +61,16 @@ NO_FRAME_SKIP = os.environ.get("YUNYIN_NO_FRAME_SKIP") == "1"
 TITLE_ID = os.environ.get("YUNYIN_TITLE_ID", "")  # 留空 = 用 app/catalog.ts 的 TITLE_ID / PF2A47F97
 
 
-THEME = os.environ.get("YUNYIN_THEME", "dark")  # 皮肤主题：light / dark / pure / anime
-
-
-# 默认思源黑体 SC Bold。日文曲库才切 MSMINCHO：YUNYIN_FONT=japanese
-# dark/anime 以前绑日文字体会让简体 UI（首页/专辑/设置）变成 □□□。
-FONT_BY_THEME = {"light": "chinese", "dark": "chinese", "pure": "chinese", "anime": "chinese"}
-
-
-FONT_THEME = os.environ.get("YUNYIN_FONT", FONT_BY_THEME.get(THEME, "chinese"))
-
-
-DENSITY = 2                                    # see note in build_vpk()
+# 只影响构建期烘焙出来的 PocketJS 字体归档（运行期不画它，见 pack.build_vpk()）。
+DENSITY = 2
 
 
 PAD_SIZE = 0x1000                              # VitaSDK SCE-header layout pad (auto-adjusted)
+
+
+# 随包字体的选择：VPK 里的 app0:/fonts/yunyin.pvf 取 fonts/<FONT_THEME>/ 下的文件。
+# chinese = 思源黑体 SC Bold（默认），japanese = MSMINCHO.TTF。
+FONT_THEME = os.environ.get("YUNYIN_FONT", "chinese")
 
 
 FONT_NAMES = ("SourceHanSansSC-Bold.otf", "MSMINCHO.TTF", "font.ttf")

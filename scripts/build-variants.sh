@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 打包两个字体版本（在 WSL2 的 pocket-ubuntu 里跑）：
-#   dist/yunyin-cn.vpk  中文优先：Noto Sans SC + 中文标点/全角字符集
-#   dist/yunyin-jp.vpk  日文优先：MS Mincho + 假名/半角假名/日文标点
+#   dist/yunyin-cn.vpk  中文：fonts/chinese/SourceHanSansSC-Bold.otf（思源黑体 SC Bold）
+#   dist/yunyin-jp.vpk  日文：fonts/japanese/MSMINCHO.TTF（MS Mincho）
 #
 # 用法：wsl -d pocket-ubuntu -u root bash /mnt/d/AI-PSVITA/yunyin/scripts/build-variants.sh
 # 皮肤默认色、TITLE_ID 与单版本打包完全一致，两个包只是字体不同。

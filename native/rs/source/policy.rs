@@ -5,19 +5,32 @@
 //! "buffer 秒数"表达，字节数只是用来换算的输入。
 //!
 //! 三个阈值 + 一条迟滞：
-//!   * `START_BUFFER_MS` 首次启动要凑够 10 秒（真机首包 1.8–2.7 秒，太少会一开就卡）；
-//!   * `MIN_BUFFER_MS`   播放中掉到 5 秒以下才进入 rebuffer（不要抖一下就停）；
-//!   * `RESUME_BUFFER_MS` rebuffer 之后要回到 8 秒才继续（迟滞，避免抖动）；
+//!   * `START_BUFFER_MS` 首次启动要凑够 15 秒（真机首包 1.8–2.7 秒，太少会一开就卡）；
+//!   * `MIN_BUFFER_MS`   播放中掉到 7 秒以下才进入 rebuffer（不要抖一下就停）；
+//!   * `RESUME_BUFFER_MS` rebuffer 之后要回到 12 秒才继续（迟滞，避免抖动）；
 //!   * `TARGET_BUFFER_MS` 网络好时希望维持 20 秒 —— 预取是否让路的判据。
+//!
+//! 秒数是**字节 ÷ 码率**算出来的，码率由调用方给（接口的 br、整首大小÷时长，
+//! 或播放中的实测值），所以这里的"秒"要尽量当真秒看。
 
 #![allow(dead_code)]
 
 /// 首次启动播放需要的 buffer。
-pub const START_BUFFER_MS: u64 = 10_000;
+///
+/// 15 秒（原来 10 秒）：真机反馈"缓冲了一点、3 秒就播完"。这 10 秒是"字节÷码率"
+/// 的名义值，而文件头（ID3 / 内嵌封面）也占字节，实际可播常常只有一半多 ——
+/// 启动线要留出这段误差。
+pub const START_BUFFER_MS: u64 = 15_000;
+/// 网络健康（Fast）时更早开播的启动线。
+///
+/// 15 秒是"码率可能估错"时的保守值；现在码率来自接口 br / 播放实测，启动前还有
+/// start_ready 的"饿死"判据兜底，所以网速确实宽裕时没必要让用户干等 ——
+/// 真机反馈"切在线歌等太久"。
+pub const START_FAST_MS: u64 = 10_000;
 /// 播放中低于这个值进入 rebuffer。
-pub const MIN_BUFFER_MS: u64 = 5_000;
+pub const MIN_BUFFER_MS: u64 = 7_000;
 /// rebuffer 之后回到这个值才继续播（迟滞）。
-pub const RESUME_BUFFER_MS: u64 = 8_000;
+pub const RESUME_BUFFER_MS: u64 = 12_000;
 /// 网络正常时希望维持的 buffer（预取让路判据）。
 pub const TARGET_BUFFER_MS: u64 = 20_000;
 
@@ -41,10 +54,23 @@ pub const READAHEAD_MAX_BYTES: u64 = 6 * 1024 * 1024;
 pub const READAHEAD_FALLBACK_BYTES: u64 = 4 * 1024 * 1024;
 
 /// 预读预算：整首的 1/3，夹在 `[READAHEAD_MIN_BYTES, READAHEAD_MAX_BYTES]`。
-pub fn readahead_budget(total: Option<u64>) -> u64 {
+///
+/// 另外保证至少够 `TARGET_BUFFER_MS` 秒：整首的 1/3 在高码率（无损）下可能
+/// 连 20 秒都不到，那样 `available()` 永远够不着 TARGET，启动判据就只能靠
+/// "队列抓满"这一条兜底。
+pub fn readahead_budget(total: Option<u64>, bitrate_bps: u32) -> u64 {
+    let target_bytes = if bitrate_bps > 0 {
+        (bitrate_bps as u64 / 8).saturating_mul(TARGET_BUFFER_MS) / 1000
+    } else {
+        0
+    };
+    /* 别让下限超过上限（极端高码率时 clamp 会 panic）。 */
+    let floor = READAHEAD_MIN_BYTES
+        .max(target_bytes)
+        .min(READAHEAD_MAX_BYTES);
     match total {
-        Some(total) if total > 0 => (total / 3).clamp(READAHEAD_MIN_BYTES, READAHEAD_MAX_BYTES),
-        _ => READAHEAD_FALLBACK_BYTES,
+        Some(total) if total > 0 => (total / 3).clamp(floor, READAHEAD_MAX_BYTES),
+        _ => READAHEAD_FALLBACK_BYTES.clamp(floor, READAHEAD_MAX_BYTES),
     }
 }
 /// 预取**真正开跑**要求的 buffer：宁可晚一点备下一首，也不挤当前曲（2×TARGET）。
@@ -152,6 +178,36 @@ pub fn prefetch_should_run_q(
         return false;
     }
     buffer_ms >= PREFETCH_MIN_BUFFER_MS && net == NetState::Fast
+}
+
+/// Gate 的"可以开始出声"判据（在 `GateState::decide` 之前多一道）。
+///
+/// 光"现在够 START 秒"不代表这些秒能持续：网速明显跑不过码率时，刚够启动线就开播，
+/// 缓冲只会单调下降，几秒后必然跌破 MIN —— 真机"反复 rebuffer"的另一半原因。
+/// 所以启动前再问一句"网络是不是在饿死"。
+///
+/// 两个例外必须留，否则会永远"缓冲中"：
+///   * `at_end`：流已经到底，没有更多数据可等；
+///   * `at_budget`：取数线程已经把预读队列抓满（它没活干），速度采样自然会掉到 0，
+///     那是"假 Starving"，不是慢网。
+/// `buffer_ms >= TARGET_BUFFER_MS` 也直接放行：已经远超启动线，没有理由再等。
+pub fn start_ready(
+    buffer_ms: u64,
+    at_end: bool,
+    at_budget: bool,
+    speed_bps: u64,
+    bitrate_bps: u32,
+) -> bool {
+    if at_end {
+        return true;
+    }
+    let net = classify(speed_bps, bitrate_bps);
+    /* 够 15 秒这条保守线：只要不是正在饿死就放行（队列抓满 / 超 TARGET 更是直接放行）。 */
+    if buffer_ms >= START_BUFFER_MS {
+        return at_budget || buffer_ms >= TARGET_BUFFER_MS || net != NetState::Starving;
+    }
+    /* 网速明显宽裕（Fast）时用 10 秒那条更短的线 —— 切歌少等 5 秒。 */
+    buffer_ms >= START_FAST_MS && (at_budget || net == NetState::Fast)
 }
 
 /// **统一世代判据**：异步任务（预取 / 缓存写入 / 解码器等待）该不该作废。

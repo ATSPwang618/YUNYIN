@@ -26,6 +26,23 @@ const LOG_PATH: &str = "ux0:/data/yunyin/yunyin.log";
  */
 static LOG_LOCK: Mutex<()> = Mutex::new(());
 
+/*
+ * 行缓冲 + **后台落卡线程**：append() 只在内存里搬，任何调用者都不在自己线程上碰卡。
+ *
+ * 为什么（真机 2026-10-08 的日志）：
+ *   1) 最早每写一行都 open + write + close 一次 ux0:/data/yunyin/yunyin.log，
+ *      一晚上万行 = 上万次 SD 操作；音频线程读 MP3 用的是同一张卡（BGM 口缓冲
+ *      只有 ~21ms）→"本地 mp3 偶尔卡一下"；
+ *   2) 改成"帧循环每 60 帧 flush 一次"后仍然卡：空闲时 60 帧只有 ~0.17s，等于
+ *      每秒往卡上写 5~6 次、每次几十 ms —— 真机就是"每 1~2 秒轻卡一下"
+ *      （600 帧汇总里"最慢帧"稳定在 40~66ms）。
+ * 现在 append 只是 memcpy，落卡交给 start_flusher() 起的后台线程按**时间**做。
+ */
+const LOG_FLUSH_INTERVAL_US: u32 = 3_000_000;
+const LOG_BUF_CAP: usize = 256 * 1024;
+static LOG_BUF: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+static LOG_DROPPED: AtomicBool = AtomicBool::new(false);
+
 /// 拿日志锁（同进程里其它写日志的地方共用，例如探针报告文件）。
 pub fn lock() -> MutexGuard<'static, ()> {
     LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -37,6 +54,7 @@ pub fn init() {
     let _ = std::fs::create_dir_all(LOG_DIR);
     if std::fs::File::open(LOG_FLAG).is_ok() {
         LOG_ON.store(true, Ordering::Relaxed);
+        start_flusher();
     }
 }
 
@@ -44,18 +62,63 @@ pub fn enabled() -> bool {
     LOG_ON.load(Ordering::Relaxed)
 }
 
-/// Append a line to `ux0:/data/yunyin/yunyin.log`. No-op when logging is off.
+/// Append a line to the in-memory log buffer. No-op when logging is off.
+///
+/// 这里**不碰文件**：调用者可能是音频线程，写卡会把播放拖卡（见 LOG_BUF 的说明）。
 pub fn append(s: &str) {
     if !enabled() {
         return;
     }
-    let _guard = lock(); /* 串行化：多线程同时 open/write/close 会把 stdio 与堆搞坏 */
+    let Ok(mut buf) = LOG_BUF.lock() else { return };
+    if buf.len() >= LOG_BUF_CAP {
+        /* 没人来 flush（例如卡在某一帧）：丢新的，别把内存吃光。 */
+        LOG_DROPPED.store(true, Ordering::Relaxed);
+        return;
+    }
+    let _ = writeln!(&mut *buf, "{}", s);
+}
+
+/// 后台落卡线程（启动时起一次）。
+///
+/// 写卡本身避不开，但频率从"每秒 5~6 次"降到"每 3 秒 1 次"，而且不占主线程、
+/// 不占音频线程 —— 真机"每 1~2 秒轻卡一下"就是帧循环里那次 flush 造成的。
+pub fn start_flusher() {
+    let _ = std::thread::Builder::new()
+        .name("yunyin-log".into())
+        .stack_size(32 * 1024)
+        .spawn(|| loop {
+            unsafe { vitasdk_sys::sceKernelDelayThread(LOG_FLUSH_INTERVAL_US) };
+            flush();
+        });
+}
+
+/// 把内存里的日志写进卡：先把缓冲整个换出来，写的时候不占 LOG_BUF 锁。
+pub fn flush() {
+    if !enabled() {
+        return;
+    }
+    let pending = {
+        let Ok(mut buf) = LOG_BUF.lock() else { return };
+        if buf.is_empty() {
+            return;
+        }
+        if LOG_DROPPED.swap(false, Ordering::Relaxed) {
+            let _ = writeln!(&mut *buf, "log: 缓冲区满，中间有日志被丢弃");
+        }
+        core::mem::take(&mut *buf)
+    };
+    let t0 = crate::media::platform::time::now_ms();
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(LOG_PATH)
     {
-        let _ = writeln!(f, "{}", s);
+        let _ = f.write_all(&pending);
+    }
+    let ms = crate::media::platform::time::now_ms().saturating_sub(t0);
+    /* 自己花多久也记一笔（下次一起落卡）：确认 3 秒一次到底值不值。 */
+    if ms >= 5 {
+        append(&format!("log: 落卡 {} 字节耗时 {}ms", pending.len(), ms));
     }
 }
 

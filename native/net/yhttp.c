@@ -38,7 +38,14 @@
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-#define YHTTP_CONNECT_TIMEOUT_MS 10000L
+/*
+ * 连接超时 4 秒（原来 10 秒）。
+ *
+ * 为什么改：真机上 m704/m804 这类 CDN 域从 Vita 连不上，每次都要等满 10 秒才失败 ——
+ * 界面"点一次在线歌"要等 12 秒 × 3 次重试，用户得反复点几次才碰上一个能连的域名。
+ * PC 上同一个地址 0.4 秒就连上，4 秒对正常网络足够宽裕；失败更快 = 更早换解析结果。
+ */
+#define YHTTP_CONNECT_TIMEOUT_MS 4000L
 #define YHTTP_TOTAL_TIMEOUT_MS 30000L
 #define YHTTP_CA_MAX (256 * 1024)
 
@@ -538,9 +545,24 @@ static int yh_get(const char *url, const char *range, const char *referer,
                 res->ssl_detail = (unsigned int)code;
             }
         }
-        yh_logf("yhttp: GET failed curl=%d (%s) mapped=0x%08X stage=send url=%s",
-                (int)code, curl_easy_strerror(code), (unsigned)ret,
-                url ? url : "(null)");
+        {
+            /*
+             * 把"连的是哪个 IP、等了多久、系统错误码是多少"记下来。
+             *
+             * 真机上 m704/m804 会 10s 连接超时（三次重试间隔 ~12s），而 PC 上同一个
+             * URL 0.4s 连上并返回 206 —— 说明 Vita 解析到的那个边缘地址可能根本不可达。
+             * 没有这一行就只能猜是网络、CDN 还是解析。
+             */
+            char *peer_ip = NULL;
+            long os_errno = 0;
+            curl_easy_getinfo(easy, CURLINFO_PRIMARY_IP, &peer_ip);
+            curl_easy_getinfo(easy, CURLINFO_OS_ERRNO, &os_errno);
+            yh_logf("yhttp: GET failed curl=%d (%s) mapped=0x%08X stage=send ip=%s os_errno=%ld took=%ums url=%s",
+                    (int)code, curl_easy_strerror(code), (unsigned)ret,
+                    peer_ip ? peer_ip : "-", os_errno,
+                    res ? res->took_ms : 0u,
+                    url ? url : "(null)");
+        }
     } else {
         ret = 0;
     }
@@ -657,9 +679,23 @@ static int yhttp_post_impl(const char *url, const char *body_text,
         yh_logf("yhttp: POST response exceeds buffer url=%s", url ? url : "(null)");
     } else {
         ret = yh_map_curl_error(code);
-        yh_logf("yhttp: POST failed curl=%d (%s) mapped=0x%08X stage=send url=%s",
-                (int)code, curl_easy_strerror(code), (unsigned)ret,
-                url ? url : "(null)");
+        {
+            /*
+             * 把"连的是哪个 IP、等了多久、系统错误码是多少"记下来。
+             *
+             * 真机上 m704/m804 会 10s 连接超时（三次重试间隔 ~12s），而 PC 上同一个
+             * URL 0.4s 连上并返回 206 —— 说明 Vita 解析到的那个边缘地址可能根本不可达。
+             * 没有这一行就只能猜是网络、CDN 还是解析。
+             */
+            char *peer_ip = NULL;
+            long os_errno = 0;
+            curl_easy_getinfo(easy, CURLINFO_PRIMARY_IP, &peer_ip);
+            curl_easy_getinfo(easy, CURLINFO_OS_ERRNO, &os_errno);
+            yh_logf("yhttp: POST failed curl=%d (%s) mapped=0x%08X stage=send ip=%s os_errno=%ld url=%s",
+                    (int)code, curl_easy_strerror(code), (unsigned)ret,
+                    peer_ip ? peer_ip : "-", os_errno,
+                    url ? url : "(null)");
+        }
     }
     curl_slist_free_all(list);
     curl_easy_cleanup(easy);

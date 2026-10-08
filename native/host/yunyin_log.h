@@ -33,13 +33,21 @@
  */
 void yunyin_log_line(const unsigned char *text, unsigned int len);
 
+/*
+ * 缓存一次：以前每次写日志都要 sceIoOpen + sceIoClose 一遍开关文件，
+ * 真机日志里这就是每行两次多余的 SD 操作。运行期开关文件不会变（建了就是建了）。
+ */
 static YUNYIN_UNUSED int yunyin_log_enabled(void) {
-  SceUID flag = sceIoOpen(YUNYIN_LOG_FLAG, SCE_O_RDONLY, 0);
-  if (flag >= 0) {
-    sceIoClose(flag);
-    return 1;
+  static int cached = -1;
+  if (cached < 0) {
+    SceUID flag = sceIoOpen(YUNYIN_LOG_FLAG, SCE_O_RDONLY, 0);
+    cached = 0;
+    if (flag >= 0) {
+      sceIoClose(flag);
+      cached = 1;
+    }
   }
-  return 0;
+  return cached;
 }
 
 static YUNYIN_UNUSED void yunyin_log(const char *msg) {

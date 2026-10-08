@@ -26,39 +26,43 @@
 
 ![待机状态](docs/img/player-idle.jpg)
 
+> 这几张是 1.10 时期（字体重构前）的真机截图；`local-library.jpg` 里那处方框就是当时的缺字问题，
+> 现在文本改由 ScePvf 直接栅格化整份思源黑体，不再受预烘字符集限制。
+
 ## vita上安装方法（4 步）
 
 1. 用 VitaShell 装 `yunyin-main.vpk`。
-2. 把音乐放进 `ux0:/data/yunyin/music/`（可分子文件夹，支持 **mp3 / m4a / ogg / wav / flac / opus**，
+2. 把音乐放进 `ux0:/data/yunyin/music/`（可分子文件夹，支持 **mp3 / m4a / ogg / oga / wav / flac / opus**，
    内嵌封面与歌词会被读出来）。
 3. 想听在线歌：**我的 → 账号**，用网易云 App 扫码登录。
 4. 〔可选但强烈建议〕在 `ux0:/data/yunyin/` 建一个**空文件** `debug` —— 打开日志，
    出问题时 `yunyin.log` 就是唯一证据（不建不写，不影响性能）。
 
-> 扫码一直刷新不出来？先看机器的**系统日期时间**对不对（证书有效期检查会拒掉所有
-> HTTPS），再确认固件有没有给 SceSsl 补 TLS 1.2（老固件装 iTLS-Enso）。
-> 细节与日志关键字见 [docs/排障.md](docs/排障.md)。
+> 扫码一直刷新不出来？先看机器的**系统日期时间**对不对 —— 证书有效期检查会拒掉所有
+> HTTPS。传输层用的是随包编译进去的 libcurl + OpenSSL（不再走固件的 SceSsl），
+> 所以老固件也不需要额外装 iTLS。细节与日志关键字见 [docs/排障.md](docs/排障.md)。
 
 在线歌单**不用手动准备**：每次启动应用会在后台把热门推荐 / 每日推荐 / 我的歌单 /
-四个榜单写成 JSON 落到 `ux0:/data/yunyin/list/`，界面直接读文件 —— 断网也能看上次的内容。
+四个榜单写成 JSON 落到 `ux0:/data/yunyin/list/`，原生再把它们解析成有界视图交给界面 ——
+断网也能看上次的内容。
 
 ## 目前功能
 
 | 能力 | 状态 |
 | --- | --- |
-| 支持本地六格式播放（mp3 / m4a / ogg / wav / flac / opus） | ✅ |
-| 内嵌封面、内嵌歌词（含逐字高亮） | ✅ |
+| 支持本地六格式播放（mp3 / m4a / ogg / oga / wav / flac / opus） | ✅ |
+| 内嵌封面、内嵌歌词（逐行高亮） | ✅ |
 | 在线播放（Range 流 + 滚动预读 + 秒级缓冲 Gate） | ✅ |
 | 磁盘缓存（固定 32 MB `cache.dat` 环形覆盖，正常播放不删文件） | ✅ |
 | 下一首预取（网络空闲时才跑，按键期间让路） | ✅ |
 | 扫码登录 / 我的歌单 / 每日推荐 / 四个榜单 | ✅ |
-| 在线清单落盘（断网可看，事件驱动刷新） | ✅ |
-| 内置根证书（DigiCert Global Root G2 随包发布，防"机器缺根"） | ✅ |
+| 在线清单落盘 + 原生解析视图（断网可看，不再逐帧 stat） | ✅ |
+| 内置根证书（信任库就是随包的 DigiCert Global Root G2 + ca-bundle，不看固件根库） | ✅ |
 | 收藏（本地 / 在线分组）、专辑页、歌词页、设置页 | ✅ |
-| 字库：Vita2D 原生 PVF，TEXT_RUN 直绘 | ✅ |
+| 字库：Vita2D ScePvf（随包思源黑体 OTF，改名 yunyin.pvf）+ TEXT_RUN 直绘 | ✅ |
 | 五套扁平化主题（浅色 / 深色 / 浅蓝 / 浅绿 / 浅紫） | ✅ |
 | 在线歌封面 / 搜索 | ❌ 未来计划 |
-| 顶部状态栏电量/时间/网络标识显示 | ❌ 未来计划 |
+| 顶部状态栏电量/时间/网络标识显示 | ✅ 已实现（左栏顶部：电量 / 时间 / 在线-离线） |
 | 在线歌词的读取支持 | ❌ 未来计划 |
 
 
@@ -68,8 +72,8 @@
 | --- | --- |
 | ↑ ↓ | 列表上下；列表顶部再按 ↑ 聚焦返回/页签行 |
 | ← → | 页签之间切换 / 从列表回到播放器 / 播放器里移动焦点 |
-| ○ | 确认（播放、进子页、切主题、切字库…） |
-| △ | 返回上一层 / 回到当前歌单第一首 |
+| ○ | 确认（播放、进子页、切主题…） |
+| △ | 返回上一层（关子页 / 从播放器回内容区） |
 | L / R | 上一首 / 下一首（息屏也有效） |
 | START | 息屏继续播放（再按或任意键回来） |
 | PS | 播放期间锁定（先暂停才能退出） |
@@ -98,9 +102,11 @@ ux0:/data/yunyin/
 ├── playlist.json       〔可选〕自己写的在线歌单
 ├── cache.dat           在线歌磁盘缓存（固定 32 MB 环形覆盖，可随手删）
 ├── cache.idx           缓存索引（自动维护）
-├── store/              收藏 / 字库模式 / 登录会话
+├── store/              收藏 / 登录会话
 ├── covers/             封面解码缓存（可随手删）
 ├── yunyin.log          运行日志（建了 debug 才写）
+├── yunyin-netprobe.log 网络探针报告（启动让开 20 秒后跑一次）
+├── netprobe.url        〔可选〕写一行 URL，探针就改测它
 ├── debug               〔开关〕建了才写日志
 ├── netdbg              〔开关〕建了才记 HTTP 逐条轨迹
 └── cookie.txt          〔可选〕手填会话（模拟器/扫码走不通时的后门）
@@ -136,7 +142,8 @@ powershell -ExecutionPolicy Bypass -File scripts/tools/build-tagcheck-exe.ps1
 
 ## 想自己构建？
 
-在 WSL2（Ubuntu）里准备 **VitaSDK**、**bun**、**PocketJS 0.13 源码检出**：
+在 WSL2（Ubuntu）里准备 **VitaSDK**（要带 OpenSSL 1.1.1，`native/libs/libcurl_yunyin.a`
+是按它编的）、**bun**、**PocketJS 0.13 源码检出**：
 
 ```bash
 # 1) 类型检查（打包器只转译不查类型，这道闸专抓真机才炸的错）
@@ -146,29 +153,38 @@ bash scripts/typecheck-app.sh
 cd tests && cargo test; cd ..
 
 # 3) 打包 → dist/yunyin-main.vpk
-POCKETJS_ROOT=/root/pocketjs013 YUNYIN_BARE_GRAPHICS=1 python3 scripts/build-vpk.py
+POCKETJS_ROOT=/root/pocketjs013 python3 scripts/build-vpk.py
 ```
 
-* `YUNYIN_BARE_GRAPHICS=1`：跳过与 0.13 渲染模型冲突的两组图形补丁，**正式包必须带**。
-* 常用开关：`YUNYIN_FONT=chinese|japanese`、`YUNYIN_THEME=light|dark|pure|anime`、
-  `YUNYIN_OUT=<名字>`、`YUNYIN_APP_VER=01.10`。
+* 常用开关（都在 `scripts/yunyin_build/config.py` 里读取）：`YUNYIN_FONT=chinese|japanese`、
+  `YUNYIN_OUT=<名字>`、`YUNYIN_APP_VER=01.10`（版本号的唯一来源；构建前会校验 `pocket.json`
+  （严格 semver，写 `1.10.0`）/ `theme.ts` / 原生启动日志三处与它一致）、`YUNYIN_TITLE_ID=<9 位 ID>`；
+  诊断开关 `YUNYIN_NO_COVER=1`、`YUNYIN_NO_FRAME_SKIP=1`；
+  另有 `YUNYIN_CAPTURE_FRAMES`（在 `pack.py` 里读，抓帧调试用）。
 * PocketJS 的宿主/core 改动由 `scripts/patches/pocketjs-yunyin.patch` 在构建开始时应用；
   `native/libs/libvita2d.a` 是项目固定的 Vita2D 静态库，会随 native 目录进入 PocketJS 构建树。
 * **不要**加 `YUNYIN_CATCH_HANG`：0.13 的看门狗会在单帧超 2 秒时打死 guest。
-* 源码里没有两个构建派生物，构建时自动生成：`app/theme-seed.tsx`（由 `colors.json`）、
-  `app/images.json`（扫 `asset/**`）。字体包只打包为 Vita2D 原生 PVF 资源。
+* `YUNYIN_BARE_GRAPHICS` **已经不起作用**：旧的两组图形补丁在本分支已整组删除，
+  config 里那个常量没有任何消费者。
+* 源码里有两个构建期派生物（不入库）：`app/theme-seed.tsx`（由 `colors.json` 生成）、
+  `app/images.json`（扫 `asset/**` 生成）。
+* **字体**：随包字体取 `fonts/<YUNYIN_FONT>/` 下那个文件，打包时**改名**成
+  `app0:/fonts/yunyin.pvf` —— "PVF" 只是 libvita2d/ScePvf 的加载入口名，文件本身仍是
+  OpenType/TTF，运行期由 Vita2D 栅格化。所以 `YUNYIN_FONT=japanese` 打出来的是真的日文包
+  （`scripts/build-variants.sh` 一次打中/日两个）。构建期框架仍会烘焙一份 PocketJS 字体归档，
+  但宿主已经不再上传/绘制它。
 
 ## 仓库结构
 
 ```text
 .
-├── app/          界面层：app.tsx（唯一入口）+ core/ + pages/ + components/ + sce_sys/
-├── native/       原生层：rs/（Rust）+ audio/ host/ net/（C）+ vendor/ + libs/
+├── app/          界面层：main.tsx（框架入口）→ app.tsx（状态机）+ core/ + pages/ + components/ + sce_sys/
+├── native/       原生层：rs/（Rust，构建时暂存成宿主的 media 模块）+ audio/ host/ net/（C）+ vendor/ + libs/
 ├── asset/        主题素材（构建时复制成应用内的 asset/）
-├── fonts/        Vita2D 原生字体（chinese/、japanese/）
-├── scripts/      构建与检查：build-vpk.py + yunyin_build/
+├── fonts/        随包字体源文件：chinese/SourceHanSansSC-Bold.otf、japanese/MSMINCHO.TTF
+├── scripts/      构建与检查：build-vpk.py + yunyin_build/ + patches/（PocketJS 补丁）
 │   └── tools/    素材/曲库维护工具（不参与构建）
-├── tests/        宿主侧 cargo 测试
+├── tests/        宿主侧 cargo 测试（目录名对应暂存后的 crate 模块名）
 └── docs/         技术文档（只有两份）+ img/ 真机截图
 ```
 
@@ -193,4 +209,4 @@ python3 scripts/tools/gen-theme-icons.py     # 从浅色图标派生一套换色
 * [PocketJS](https://pocketjs.dev)：PS Vita/PSP 上的 JS+原生应用运行时（宿主、GXM 渲染、Vita2D 字体桥接）。
 * [VitaSDK](https://vitasdk.org)：工具链与 `Sce*` 头/桩。
 * mpg123 / libvorbis / opusfile / dr_wav：解码。
-* [Noto Sans SC](https://fonts.google.com/noto) / MS Mincho：界面字体（各自的许可证随字体）。
+* [Source Han Sans SC / 思源黑体](https://github.com/adobe-fonts/source-han-sans)：随包界面字体；MS Mincho：日文包备用字体。

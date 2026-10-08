@@ -35,6 +35,8 @@ type RemoteSource = HttpRangeSource<CacheTransport<Stream>>;
  * 以及 Gate 自己的迟滞状态机。所有阈值都在 policy.rs 里，宿主上测过。
  */
 static BITRATE_BPS: AtomicU32 = AtomicU32::new(0);
+/* 实测码率：已经喂给解码器的字节 ÷ 已经解码出来的毫秒（见 sample_measured_bitrate）。 */
+static MEASURED_BPS: AtomicU32 = AtomicU32::new(0);
 static SPEED_BPS: AtomicU64 = AtomicU64::new(0);
 static SAMPLE_AT_MS: AtomicU64 = AtomicU64::new(0);
 static SAMPLE_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -261,6 +263,8 @@ pub fn open_remote(
     referer: &str,
     cookie: &str,
     duration_ms: i64,
+    bitrate_hint: u32,
+    size_hint: Option<u64>,
     token: u32,
 ) -> Result<(), SourceError> {
     /* 每一步都单独记日志：真机上"在线打开失败"必须能分辨是取数没打开、
@@ -302,7 +306,7 @@ pub fn open_remote(
                 key,
                 cookie.len()
             ));
-            CacheTransport::from_net(stream, &key, size.unwrap_or(0))
+            CacheTransport::from_net(stream, &key, size.or(size_hint).unwrap_or(0))
         }
     };
     if !token_current(token) {
@@ -317,10 +321,33 @@ pub fn open_remote(
      * 速度采样、迟滞状态机。不重置的话上一首的"已经播过"状态会漏到新歌上 ——
      * 新歌刚从 0 开始缓冲，Gate 却以为早就开播了，于是立刻放行、一开就卡。
      */
-    let total_bytes = transport.size().unwrap_or(0);
-    let bps = policy::bitrate_from_size_duration(total_bytes, duration_ms.max(0) as u64)
-        .unwrap_or(0);
+    let total_bytes = transport.size().or(size_hint).unwrap_or(0);
+    /*
+     * 码率优先用接口给的 `br`（网易云 resolve 返回的真实码率），其次才用
+     * “整首大小 ÷ 时长”推，两者都没有才是 0（按 policy 的兜底码率算）。
+     *
+     * 为什么必须优先用 `br`：Gate 的判据是“还能播几秒”= 剩余字节 ÷ 码率，
+     * 码率估低了，秒数就虚高 —— 真机反馈“缓冲了一点、3 秒就播完”就是这么来的
+     * （尺寸或时长缺一个时，兜底的 192 kbps 会把 320 kbps / 无损的流高估 2~5 倍）。
+     */
+    let bps = if bitrate_hint > 0 {
+        bitrate_hint
+    } else {
+        policy::bitrate_from_size_duration(total_bytes, duration_ms.max(0) as u64).unwrap_or(0)
+    };
     BITRATE_BPS.store(bps, Ordering::Release);
+    MEASURED_BPS.store(0, Ordering::Release);
+    log::append(&format!(
+        "remote: 码率 {} kbps（{}）",
+        bps / 1000,
+        if bitrate_hint > 0 {
+            "接口 br"
+        } else if bps > 0 {
+            "整首大小÷时长"
+        } else {
+            "未知，按兜底码率算"
+        }
+    ));
     SPEED_BPS.store(0, Ordering::Release);
     SAMPLE_AT_MS.store(0, Ordering::Release);
     SAMPLE_BYTES.store(0, Ordering::Release);
@@ -335,13 +362,15 @@ pub fn open_remote(
      * 取数线程只要提前量没到预算就一直往后抓，播到后面自己接着补剩下的。
      * 这里把算出来的数写进日志，真机上对照"缓冲不足/恢复"就能判断预算够不够。
      */
-    let budget = policy::readahead_budget(if total_bytes > 0 { Some(total_bytes) } else { None });
+    let budget =
+        policy::readahead_budget(if total_bytes > 0 { Some(total_bytes) } else { None }, bps);
     log::append(&format!(
-        "remote: 预读预算 {} KB（整首 {} KB 的 1/3，夹在 {}-{} KB；播到后面继续补）",
+        "remote: 预读预算 {} KB（整首 {} KB 的 1/3，夹在 {}-{} KB；约 {}s；播到后面继续补）",
         budget / 1024,
         total_bytes / 1024,
         policy::READAHEAD_MIN_BYTES / 1024,
-        policy::READAHEAD_MAX_BYTES / 1024
+        policy::READAHEAD_MAX_BYTES / 1024,
+        policy::buffer_ms(budget as u64, effective_bitrate(), policy::FALLBACK_BITRATE_BPS) / 1000
     ));
     let source = HttpRangeSource::new(url, transport, budget);
     let mut slot = match REMOTE.lock() {
@@ -463,16 +492,40 @@ pub fn active() -> bool {
     REMOTE.lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
-/// 现在可播多少毫秒（字节数 ÷ 码率；码率未知时用 192 kbps 兜底）。
+/// 把字节换算成“秒”时用的码率：接口/元数据给的，和实测的，取其中更大的那个。
 ///
-/// 这是整套缓冲策略的核心输入：启动要 10 秒、维持下限 5 秒、恢复 8 秒。
+/// 取 max 是**故意保守**：码率估高 → 同样的剩余字节算出来的可播秒数更少 →
+/// Gate 宁可多等一会儿，也不会再出现“显示够 10 秒、其实 3 秒就没声了”。
+pub fn effective_bitrate() -> u32 {
+    BITRATE_BPS
+        .load(Ordering::Acquire)
+        .max(MEASURED_BPS.load(Ordering::Acquire))
+}
+
+/// 用“已经喂给解码器的字节 ÷ 已经解码出来的时长”实测这条流自己的码率。
+///
+/// 这是对“整首大小 ÷ 时长”的兜底纠正：URL 没给 Content-Length、清单里没有时长、
+/// 或者 HTTP 报的长度和真实流对不上时，只有播放本身能告诉我们真实码率。
+/// 只信 2 秒以后的样本（开头有 ID3 与探测噪声），1/4 权重滑动平均跟住 VBR。
+fn sample_measured_bitrate(pos: u64, position_ms: u32) {
+    if pos == 0 || position_ms < 2000 {
+        return;
+    }
+    let bps = (pos.saturating_mul(8).saturating_mul(1000) / position_ms as u64)
+        .min(u32::MAX as u64) as u32;
+    let prev = MEASURED_BPS.load(Ordering::Acquire);
+    let next = if prev == 0 { bps } else { (prev.saturating_mul(3) + bps) / 4 };
+    MEASURED_BPS.store(next, Ordering::Release);
+}
+
+/// 现在可播多少毫秒（字节数 ÷ 码率；码率未知时用 policy 的兜底码率）。
 pub fn buffer_ms() -> u64 {
     if !active() {
         return u64::MAX; /* 本地播放：不受 Gate 限制 */
     }
     policy::buffer_ms(
         available() as u64,
-        BITRATE_BPS.load(Ordering::Acquire),
+        effective_bitrate(),
         policy::FALLBACK_BITRATE_BPS,
     )
 }
@@ -538,17 +591,38 @@ pub fn gate_ok() -> bool {
      * 以前拿 `available()` 的增量估速：解码器同时在消费，稳态下增量≈0，
      * 于是真机日志里网络永远显示 `Starving`（假的），预取也因此一直被拦。
      */
-    let fetched = match REMOTE.lock() {
-        Ok(g) => g.as_ref().map(|s| s.fetched_total()).unwrap_or(0),
-        Err(_) => 0,
+    let (fetched, pos) = match REMOTE.lock() {
+        Ok(g) => g
+            .as_ref()
+            .map(|s| (s.fetched_total(), s.tell()))
+            .unwrap_or((0, 0)),
+        Err(_) => (0, 0),
     };
     sample_speed(fetched, crate::media::platform::time::now_ms());
+    /* 顺手喂一次实测码率（已喂给解码器的字节 ÷ 已解码毫秒）。 */
+    sample_measured_bitrate(pos, crate::media::decoder::position_ms());
     let ms = buffer_ms();
     let at_end = is_eof() || at_cached_end();
     let mut gate = match GATE.lock() {
         Ok(g) => g,
         Err(_) => return true, /* 锁坏了也不能把播放卡死 */
     };
+    /*
+     * 启动前多问一道"能不能持续"：够 START 秒但网络在饿死时先别出声，
+     * 否则就是"开播 → 几秒后跌破 MIN → 静音 → 再回到 RESUME"的循环。
+     * 队列抓满（at_budget）或缓冲已超 TARGET 时直接放行，见 policy::start_ready。
+     */
+    if !gate.started()
+        && !policy::start_ready(
+            ms,
+            at_end,
+            prefetch_full(),
+            SPEED_BPS.load(Ordering::Acquire),
+            effective_bitrate(),
+        )
+    {
+        return false;
+    }
     matches!(gate.decide(ms, at_end), GateDecision::Play)
 }
 
@@ -580,6 +654,17 @@ pub fn prime() {
         if let Some(src) = g.as_ref() {
             src.prime();
         }
+    }
+}
+
+/// 预读队列是不是已经填到预算了。
+///
+/// Gate 用它区分"取数线程没活干"和"网速慢"：队列满时下载速度采样会掉到 0，
+/// 那是**假** Starving，不能因此把启动无限期推迟。
+fn prefetch_full() -> bool {
+    match REMOTE.lock() {
+        Ok(g) => g.as_ref().map(|s| s.prefetch_full()).unwrap_or(true),
+        Err(_) => true,
     }
 }
 

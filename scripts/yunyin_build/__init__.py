@@ -6,6 +6,6 @@
   assets.py            皮肤 PNG 归一化 + images.json
   patches_host.py      宿主补丁：帧循环 / 正式包开关 / 诊断 / 原生字体
   patches_pocketjs.py  PocketJS 固定源码补丁
-  fonts.py             字体选择 / 曲库字符收集 / theme-seed
+  fonts.py             随包字体选择 / theme-seed 生成
   pack.py              暂存 / 编译 / VPK 打包
 """

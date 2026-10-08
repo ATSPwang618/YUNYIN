@@ -13,8 +13,6 @@
 //! ui/                                  Vita2D 原生字体、跳帧
 //! ```
 
-use alloc::string::String;
-
 pub mod bgm;
 pub mod catalog;
 pub mod qr;
@@ -38,21 +36,8 @@ pub(crate) const COVER_PX: u32 = 256;
 pub(crate) const MAX_ART: usize = 1024 * 1024;
 pub(crate) const PREFIX_CAP: usize = MAX_ART + 65536;
 
-pub(crate) fn json_escape(s: &str) -> String {
-    let mut o = String::new();
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\r' => o.push_str("\\r"),
-            '\t' => o.push_str("\\t"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            _ => o.push(c),
-        }
-    }
-    o
-}
+/* 全体原生模块都按短路径用这个转义（实现见 platform/json.rs）。 */
+pub(crate) use platform::json::json_escape;
 
 /// Install `globalThis.vitaMedia`.
 ///

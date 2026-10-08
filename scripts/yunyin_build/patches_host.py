@@ -504,8 +504,8 @@ def patch_host_defer_dynamic_texture_gpu():
 def patch_host_frame_loop():
     """帧循环补丁：画面没变就跳过 render/present。
 
-    这一步和图形管线无关，所以 **BARE_GRAPHICS=1 也要打**：
-    以前它被塞在 patch_font_gpu() 里，正式包一开 bare 就跟着丢 ——
+    这一步和图形管线无关，所以当初那组"bare graphics"开关根本管不到它：
+    以前它被塞在字体/图形补丁里，跳过那组补丁时它跟着丢 ——
     结果每帧无条件重建顶点 + 提交 GXM + 换缓冲（暂停时纯发热耗电）。
     判定见 native/rs/ui/frame_skip.rs：DrawList 内容 + raster_revision 的哈希，
     和上一帧一样就跳过绘制；第一帧一定画。

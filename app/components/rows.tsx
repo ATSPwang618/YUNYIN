@@ -1,6 +1,5 @@
 import { Text, View } from "@pocketjs/framework/components";
 import { bgCls, pTxt } from "../core/theme";
-import { StreamText } from "../core/cjk";
 import { clipW } from "../core/util";
 
 /* 通用行组件：菜单行 / 卡片 / 曲目行 / 专辑行 / 居中提示。
@@ -14,16 +13,14 @@ export function MenuRow(props: {
   return (
     <View class={props.focused ? bgCls("rowFocus") : bgCls("row")}>
       <View class="flex-1 min-w-0">
-        <StreamText
-          class={props.focused ? pTxt("accent") : pTxt("rowTitle")}
-          text={(props.focused ? "› " : "") + clipW(props.title, 26)}
-        />
+        <Text class={props.focused ? pTxt("accent") : pTxt("rowTitle")}>
+          {(props.focused ? "› " : "") + clipW(props.title, 26)}
+        </Text>
       </View>
       <View class="shrink-0">
-        <StreamText
-          class={props.focused ? pTxt("accent") : pTxt("rowValue")}
-          text={clipW(props.value, 12)}
-        />
+        <Text class={props.focused ? pTxt("accent") : pTxt("rowValue")}>
+          {clipW(props.value, 12)}
+        </Text>
       </View>
     </View>
   );
@@ -36,8 +33,8 @@ export function CardRow(props: {
 }) {
   return (
     <View class={props.focused ? bgCls("cardFocus") : bgCls("card")}>
-      <StreamText class={pTxt("cardTitle")} text={clipW(props.title, 36)} />
-      <StreamText class={pTxt("cardSub")} text={clipW(props.sub, 38)} />
+      <Text class={pTxt("cardTitle")}>{clipW(props.title, 36)}</Text>
+      <Text class={pTxt("cardSub")}>{clipW(props.sub, 38)}</Text>
     </View>
   );
 }
@@ -82,11 +79,10 @@ export function TrackRow(props: {
           <Text class={pTxt("index")}>{String(props.index)}</Text>
         </View>
         <View class="flex-1 min-w-0 flex-col overflow-hidden">
-          <StreamText
-            class={blocked() ? pTxt("hint") : pTxt("listTitle")}
-            text={clipW(props.title, 26)}
-          />
-          <StreamText class={pTxt("listSub")} text={clipW(props.artist, 30)} />
+          <Text class={blocked() ? pTxt("hint") : pTxt("listTitle")}>
+            {clipW(props.title, 26)}
+          </Text>
+          <Text class={pTxt("listSub")}>{clipW(props.artist, 30)}</Text>
         </View>
       </View>
       <View class="shrink-0">
@@ -108,11 +104,10 @@ export function AlbumRow(props: {
   return (
     <View class={props.focused ? bgCls("rowFocus") : bgCls("row")}>
       <View class="flex-1 min-w-0 flex-col overflow-hidden">
-        <StreamText
-          class={props.focused ? pTxt("accent") : pTxt("listTitle")}
-          text={props.title}
-        />
-        <StreamText class={pTxt("listSub")} text={props.artist} />
+        <Text class={props.focused ? pTxt("accent") : pTxt("listTitle")}>
+          {props.title}
+        </Text>
+        <Text class={pTxt("listSub")}>{props.artist}</Text>
       </View>
       <View class="shrink-0">
         <Text class={props.focused ? pTxt("accent") : pTxt("rowValue")}>

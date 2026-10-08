@@ -6,7 +6,6 @@ import { type Track, type PlaybackMode } from "../core/types";
 import { clipW, formatMs } from "../core/util";
 import { getTrackDuration } from "../core/library";
 import { bgCls, pTxt, useSkin } from "../core/theme";
-import { StreamText } from "../core/cjk";
 import { MotionHandle, trackChange } from "../core/motion";
 
 /* 左侧常驻播放器面板：封面（无封面时画一张唱片）+ 问候 + 曲目 + 进度 + 控制。
@@ -41,18 +40,19 @@ export function PlayerPanel(props: {
   /* 空位（还没选歌）两边就是纯文字 00:00，不显示横线也不显示假时长。 */
   const hasSong = () => !!props.track().id;
   /*
-   * 切歌动画（任务书 §13）：封面容器先"轻微退出"（scale 0.96 / opacity 0.55）
-   * 再补回 1 —— 用的是官方 animate()，由 native core 推进，不进帧循环。
-   * 只在**曲目 id 变化**时触发一次；暂停/播放/进度变化都不动它。
+   * 切歌时**不再做封面弹入动画**。
+   *
+   * 原来这里调 `trackChange(cover, coverAnim)`：封面容器先 scale 0.96 / opacity 0.55
+   * 再补回 1。真机反馈"切歌时左边专辑图轻微弹窗、掉帧，可能是烘焙的动画" —— 这一下
+   * 正好和封面解码（内嵌 JPEG，主线程 stb_image）叠在同一帧，那帧能掉到 1 FPS。
+   * 现在封面直接换，最省；`cover` 节点引用保留（以后要做就做不占帧的轻量版）。
    */
   let cover: NodeMirror | undefined;
-  const coverAnim = new MotionHandle();
   let lastTrackId = "";
   createEffect(() => {
     const id = props.track().id;
     if (id === lastTrackId) return;
     lastTrackId = id;
-    if (id) trackChange(cover, coverAnim);
   });
   const posLabel = createMemo(() =>
     hasSong() ? formatMs(props.position()) : "00:00",
@@ -125,14 +125,12 @@ export function PlayerPanel(props: {
         </View>
       </View>
 
-      <StreamText
-        class={pTxt("playerTitle")}
-        text={clipW(props.track().title, 28)}
-      />
-      <StreamText
-        class={pTxt("playerArtist")}
-        text={clipW(props.track().artist, 28)}
-      />
+      <Text class={pTxt("playerTitle")}>
+        {clipW(props.track().title, 28)}
+      </Text>
+      <Text class={pTxt("playerArtist")}>
+        {clipW(props.track().artist, 28)}
+      </Text>
 
       {/* 信息行：「清单进度 + 状态 + 词」并成一排 —— 左中右各一格，
           左右两格等宽，中间那格才是真居中。

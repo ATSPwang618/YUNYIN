@@ -156,9 +156,11 @@ fn audio_decode(buf: &mut [i16], frames: i32) {
         if !GATE_SILENT.swap(true, Ordering::AcqRel) {
             /* 只记状态跳变那一次，不刷屏（音频线程上写日志现在是安全的：日志有锁）。 */
             log::append(&format!(
-                "remote: 缓冲不足，先静音（剩 {}.{}s / 启动需 10s，网络 {:?}）",
+                "remote: 缓冲不足，先静音（剩 {}.{}s / 启动需 {}s，码率 {} kbps，网络 {:?}）",
                 crate::media::source::remote::buffer_ms() / 1000,
                 (crate::media::source::remote::buffer_ms() % 1000) / 100,
+                crate::media::source::policy::START_BUFFER_MS / 1000,
+                crate::media::source::remote::effective_bitrate() / 1000,
                 crate::media::source::remote::net_state()
             ));
         }
@@ -167,9 +169,10 @@ fn audio_decode(buf: &mut [i16], frames: i32) {
     }
     if GATE_SILENT.swap(false, Ordering::AcqRel) {
         log::append(&format!(
-            "remote: 缓冲恢复（{}.{}s，网络 {:?}）",
+            "remote: 缓冲恢复（{}.{}s，码率 {} kbps，网络 {:?}）",
             crate::media::source::remote::buffer_ms() / 1000,
             (crate::media::source::remote::buffer_ms() % 1000) / 100,
+            crate::media::source::remote::effective_bitrate() / 1000,
             crate::media::source::remote::net_state()
         ));
     }
@@ -209,6 +212,22 @@ fn audio_out_blocking(port: i32, buf: &[i16]) {
 
 /// vitaAudioChannelThread: callback then blocking BGM output, double buffer.
 fn audio_channel_thread() {
+    {
+        /*
+         * 记一次音频线程的调度优先级。
+         *
+         * 真机反馈"本地播放 1 帧轻微卡一下"（600 帧汇总里最慢帧稳定 40~66ms）：
+         * 如果落卡线程/主线程能把它挤掉，就得给音频线程单独提优先级。先把当前值
+         * 记下来（默认优先级到底是几），下次就能按它加减而不是猜。
+         */
+        extern "C" {
+            fn sceKernelGetThreadCurrentPriority() -> i32;
+        }
+        let prio = unsafe { sceKernelGetThreadCurrentPriority() };
+        log::append(&format!("bgm: 音频线程优先级 {}", prio));
+        /* 音频线程优先争取第 4 个核（装了解锁插件才有用，见 platform/cpu.rs）。 */
+        crate::media::platform::cpu::widen("音频");
+    }
     let mut buf_a = vec![0i16; (VITA_NUM_AUDIO_SAMPLES as usize) * 2];
     let mut buf_b = vec![0i16; (VITA_NUM_AUDIO_SAMPLES as usize) * 2];
     let mut use_a = true;
@@ -328,12 +347,28 @@ pub fn play(path: &str) {
         play_url(path, &referer, -1);
         return;
     }
-    let _guard = lock_session();
-    /* 有正在后台打开的在线流的话，这次请求就是新的，让它作废。 */
-    let _ = crate::media::source::remote::new_token();
-    if path.is_empty() {
-        return;
+    /*
+     * 本地开流放后台线程。
+     *
+     * `session_end()`（要 join 音频线程）+ `decoder::open()`（fopen/探测/解头）
+     * 真机实测会让所在帧卡 0.3–1.4s（日志里 `HOST: guest 帧耗时 1201ms` 正好跟着
+     * `perf: 起播（含原生调用）`）。在线路径一直是后台线程做的，本地这条照抄同一模式。
+     */
+    PLAYING.store(false, Ordering::Release);
+    PAUSED.store(false, Ordering::Release);
+    let path_owned = String::from(path);
+    let spawned = std::thread::Builder::new()
+        .name("yunyin-local-open".into())
+        .stack_size(96 * 1024)
+        .spawn(move || local_open(&path_owned));
+    if spawned.is_err() {
+        log::append("bgm: 本地打开线程创建失败");
     }
+}
+
+/// 后台线程里的本地开流：收掉上一首 → 打开解码器 → 起 BGM 口。
+fn local_open(path: &str) {
+    let _guard = lock_session();
     session_end();
     if !decoder::open(path) {
         log::append(&format!("bgm: yp_open failed {path}"));
@@ -450,6 +485,9 @@ fn play_song_id(song_id: &str) {
                             &info.url,
                             crate::media::provider::netease::REFERER,
                             info.duration_ms as i64,
+                            /* 接口返回的真实码率（br）与整首大小，别浪费。 */
+                            info.bitrate,
+                            info.size,
                             token,
                         ) {
                             Ok(()) => return,
@@ -545,7 +583,7 @@ pub fn pause() {
  */
 pub fn play_url(url: &str, referer: &str, duration_ms: i64) {
     let token = crate::media::source::remote::new_token();
-    play_url_with_token(url, referer, duration_ms, token);
+    play_url_with_token(url, referer, duration_ms, 0, None, token);
 }
 
 /// 用调用方已经拿到的序号开流（Phase 3 的 `netease:` 解析线程用）。
@@ -553,7 +591,14 @@ pub fn play_url(url: &str, referer: &str, duration_ms: i64) {
 /// 为什么要有这个变体：解析线程先校验"我还是当前播放请求"，如果此刻再另起一个
 /// 序号，就会出现"用户已经点了别的歌、旧解析却把新序号抢走"的窗口。沿用同一个
 /// 序号，`open_online` 里的每一步检查都会自然作废过期请求。
-fn play_url_with_token(url: &str, referer: &str, duration_ms: i64, token: u32) {
+fn play_url_with_token(
+    url: &str,
+    referer: &str,
+    duration_ms: i64,
+    bitrate: u32,
+    size_hint: Option<u64>,
+    token: u32,
+) {
     if url.is_empty() {
         return;
     }
@@ -568,7 +613,7 @@ fn play_url_with_token(url: &str, referer: &str, duration_ms: i64, token: u32) {
         .name("yunyin-net-open".into())
         .stack_size(96 * 1024) /* 打开阶段会走 yp_open_io → 解码器 → 取数层，同样要留余量 */
         .spawn(move || {
-            if let Err(e) = open_online(&url_owned, &referer_owned, duration_ms, token) {
+            if let Err(e) = open_online(&url_owned, &referer_owned, duration_ms, bitrate, size_hint, token) {
                 log::append(&format!("bgm: 在线打开失败 {:?} {}", e, url_owned));
                 set_play_error(short_reason(&e));
             }
@@ -586,6 +631,9 @@ fn open_online(
     url: &str,
     referer: &str,
     duration_ms: i64,
+    /* 接口给的码率与整首大小：Gate 用它们把“剩余字节”换算成“还能播几秒”。 */
+    bitrate: u32,
+    size_hint: Option<u64>,
     token: u32,
 ) -> Result<(), crate::media::source::SourceError> {
     use crate::media::source::SourceError;
@@ -600,7 +648,15 @@ fn open_online(
     /* 开流要带登录会话 Cookie：登录用户拿到的地址带 authSecret，
      * CDN 会校这个（不带就是 403）。 */
     let cookie = crate::media::provider::netease::current_cookie();
-    crate::media::source::remote::open_remote(url, referer, &cookie, duration_ms, token)?;
+    crate::media::source::remote::open_remote(
+        url,
+        referer,
+        &cookie,
+        duration_ms,
+        bitrate,
+        size_hint,
+        token,
+    )?;
     /*
      * 打开可能花好几秒；这期间用户按了停止/换了歌（token 变了）就**别起播**：
      * 否则旧的那首会在用户已经走开之后突然出声。stop() 现在不再等这把锁，

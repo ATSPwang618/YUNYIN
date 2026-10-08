@@ -1,4 +1,4 @@
-//! Vita2D native text backend for the experimental `pvf-font` branch.
+//! Vita2D native text backend (the only runtime text renderer).
 //!
 //! PocketJS core already has a native-text DrawList path (`TEXT_RUN`).  This
 //! module supplies the Vita-side measure/draw callbacks so plain, untracked
@@ -14,8 +14,10 @@ use alloc::format;
 use alloc::string::String;
 use alloc::collections::BTreeMap;
 use core::ffi::c_char;
+use core::hash::{Hash, Hasher};
 use core::ptr;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::collections::hash_map::DefaultHasher;
 use std::sync::Mutex;
 
 use pocketjs_core::text::MeasureFn;
@@ -80,9 +82,22 @@ static LEGACY_GLYPH_OPS: AtomicU64 = AtomicU64::new(0);
 /* Native draw-list construction asks for the same width twice: once while
  * emitting TEXT_RUN and once again for alignment in draw_text().  Keep this
  * small process-lifetime cache bounded; it never owns glyph pixels. */
-const WIDTH_CACHE_LIMIT: usize = 512;
-static WIDTH_CACHE: Mutex<BTreeMap<(usize, String), i32>> = Mutex::new(BTreeMap::new());
-static HEIGHT_CACHE: Mutex<[i32; PVF_FACE_SIZES.len()]> = Mutex::new([-1; PVF_FACE_SIZES.len()]);
+const WIDTH_CACHE_LIMIT: usize = 2048;
+/* 键用 (face, 文本 hash) 而不是 String：命中时不再每次分配一个 String
+ * （以前每帧每个文本要分配两次，翻页/滚动时就是一堆 malloc/free）。
+ * 文本相同才认命中，hash 撞了也只是多量一次。 */
+static WIDTH_CACHE: Mutex<BTreeMap<(usize, u64), (String, i32)>> =
+    Mutex::new(BTreeMap::new());
+/* 高度按 (face, 该 face 的栅格槽位尺寸) 存：两个不同字号的 slot 可能落在同一个
+ * face 上，只按 face 存会把高度用错（基线偏）。 */
+static HEIGHT_CACHE: Mutex<[(u32, i32); PVF_FACE_SIZES.len()]> =
+    Mutex::new([(0, -1); PVF_FACE_SIZES.len()]);
+
+fn text_hash(text: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
 
 #[inline]
 fn slot_px(slot: u8) -> u32 {
@@ -273,31 +288,38 @@ unsafe fn native_height(backend: Backend, slot: u8, text: *const c_char) -> i32 
 }
 
 fn cached_width(backend: Backend, slot: u8, text: &str) -> i32 {
-    let key = (face_index(slot), String::from(text));
+    let key = (face_index(slot), text_hash(text));
     if let Ok(cache) = WIDTH_CACHE.lock() {
-        if let Some(width) = cache.get(&key) {
-            return *width;
+        if let Some((stored, width)) = cache.get(&key) {
+            if stored == text {
+                return *width;
+            }
         }
     }
     let c = text_cstring(text);
     let width = unsafe { native_width(backend, slot, c.as_ptr() as *const c_char) };
     if let Ok(mut cache) = WIDTH_CACHE.lock() {
         if cache.len() >= WIDTH_CACHE_LIMIT {
+            /* 满了整表清掉（BTreeMap 没有 LRU 顺序）；2048 条之后很少走到这里。 */
             cache.clear();
         }
-        cache.insert(key, width);
+        cache.insert(key, (String::from(text), width));
     }
     width
 }
 
 fn glyph_line_height(backend: Backend, slot: u8) -> f32 {
     let face = face_index(slot);
+    let px = slot_px(slot);
     let height = if let Ok(mut cache) = HEIGHT_CACHE.lock() {
-        if cache[face] < 0 {
+        if cache[face].1 < 0 || cache[face].0 != px {
             let probe = text_cstring("Ag");
-            cache[face] = unsafe { native_height(backend, slot, probe.as_ptr() as *const c_char) };
+            cache[face] = (
+                px,
+                unsafe { native_height(backend, slot, probe.as_ptr() as *const c_char) },
+            );
         }
-        cache[face]
+        cache[face].1
     } else {
         let probe = text_cstring("Ag");
         unsafe { native_height(backend, slot, probe.as_ptr() as *const c_char) }

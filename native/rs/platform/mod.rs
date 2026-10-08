@@ -5,7 +5,10 @@
 //! 在目录里一眼就能看见。
 #![allow(dead_code)]
 
+pub mod cpu;
 pub mod fs;
+pub mod hostinfo;
+pub mod json;
 pub mod log;
 pub mod power;
 pub mod ps_lock;

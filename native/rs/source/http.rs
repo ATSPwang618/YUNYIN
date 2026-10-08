@@ -670,6 +670,18 @@ impl<T: ByteTransport + 'static> HttpRangeSource<T> {
         w.fetch_cursor() >= end
     }
 
+    /// 预读队列已经填到预算了吗？
+    ///
+    /// Gate 用它区分"取数线程没活干"和"网速慢"：队列抓满时下载速度采样会掉到 0，
+    /// 那是**假** Starving，不能因此把启动无限期推迟。
+    pub fn prefetch_full(&self) -> bool {
+        let (lock, _cv) = &*self.shared;
+        match lock.lock() {
+            Ok(w) => w.budget > 0 && w.queued >= w.budget,
+            Err(_) => true,
+        }
+    }
+
     /// 让正在进行的 `read()` 立刻返回（取消等待），但不动窗口里的数据。
     ///
     /// 切歌 / 停止时必须在 join 音频线程**之前**叫这一下：否则音频线程可能正卡在

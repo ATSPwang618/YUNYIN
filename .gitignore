@@ -5,10 +5,8 @@ dist/
 # ── 构建派生物（构建时自动重新生成，源码里不留）────────────────────
 # app/theme-seed.tsx：由 app/colors.json 生成
 # app/images.json  ：由 asset/** 扫描生成
-# fonts/*/cjk.pjfa ：流式字库归档（scripts/bake-cjk-archive.ts 烘）
 app/theme-seed.tsx
 app/images.json
-fonts/*/cjk.pjfa
 
 # 真机崩溃 dump
 *.psp2dmp
@@ -32,7 +30,6 @@ scripts/tools/*.exe
 tag-report.csv
 music-to-fix.m3u8
 *.log
-!docs/perf/*.log
 
 # ── OS / 编辑器 ──────────────────────────────────────────────────
 .DS_Store

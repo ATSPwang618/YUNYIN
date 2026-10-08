@@ -17,17 +17,17 @@ Requires (inside the WSL2 distro):
   * bun      at /root/.bun/bin/bun
   * PocketJS framework checkout at $POCKETJS_ROOT
     （默认 /root/pocketjs；当前正式配置是 0.13：POCKETJS_ROOT=/root/pocketjs013，
-      并带 YUNYIN_BARE_GRAPHICS=1，见 README「自行构建」）
+      见 README「自行构建」）
 
 常用环境变量：
-  YUNYIN_FONT=chinese|japanese   字体版本（默认 chinese）
+  YUNYIN_FONT=chinese|japanese   随包字体（默认 chinese；japanese 用 fonts/japanese/MSMINCHO.TTF）
   YUNYIN_OUT=<name>              输出名 -> dist/<name>.vpk（默认 yunyin-main）
-  YUNYIN_THEME=<skin>            烘焙时优先的皮肤：light / dark / pure / anime
-  YUNYIN_APP_VER=<ver>           param.sfo 里的 APP_VER（默认 01.00）
-  诊断开关：YUNYIN_NO_COVER / YUNYIN_BARE_GRAPHICS / YUNYIN_CATCH_HANG
+  YUNYIN_APP_VER=<ver>           param.sfo 里的 APP_VER（默认 01.10，版本号的唯一来源）
+  诊断开关：YUNYIN_NO_COVER / YUNYIN_CATCH_HANG / YUNYIN_NO_FRAME_SKIP / YUNYIN_TITLE_ID
 两个字体版本一次打完用 scripts/build-variants.sh。
 """
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -41,8 +41,7 @@ def apply_host_patches(*, diagnostics: bool = True) -> None:
     """把 PocketJS 官方宿主打成 YUNYIN 宿主。
 
     顺序有讲究：先让 media 模块能编译进来，再落正式包开关与诊断，
-    最后安装 Vita2D 原生字体桥接并移除旧字体渲染路径
-    （BARE_GRAPHICS=1 时整组跳过）。
+    最后安装 Vita2D 原生字体桥接并移除旧字体渲染路径。
     """
     patches_host.patch_no_cover()
     patches_host.patch_host()
@@ -69,7 +68,34 @@ def build_and_pack() -> None:
     pack.repack()
 
 
+def check_versions() -> None:
+    """三处版本号必须与 config.APP_VER 一致（版本号只有这一个来源）。
+
+    以前它们各写各的：app/pocket.json 停在 0.6.1、About 页写 1.10、启动日志写
+    01.10，发布时全靠人记得同步。任何一处漂移现在会在构建第一步就报错。
+    """
+    root = config.PROJECT_ROOT
+    pj = json.loads((root / "app" / "pocket.json").read_text(encoding="utf-8"))
+    got = str(pj.get("version", ""))
+    if got != config.APP_VERSION_SEMVER:
+        raise SystemExit(
+            "[build-vpk] app/pocket.json version="
+            f"{got!r} != APP_VER {config.APP_VER!r} 的 semver 形式 {config.APP_VERSION_SEMVER!r}"
+        )
+    theme = (root / "app" / "core" / "theme.ts").read_text(encoding="utf-8")
+    for needle in (
+        f'APP_VER_SFO = "{config.APP_VER}"',
+        f'APP_VERSION = "{config.APP_VERSION}"',
+    ):
+        if needle not in theme:
+            raise SystemExit(f"[build-vpk] app/core/theme.ts 缺少 {needle!r}")
+    native = (root / "native" / "rs" / "mod.rs").read_text(encoding="utf-8")
+    if f"版本 {config.APP_VER}" not in native:
+        raise SystemExit(f"[build-vpk] native/rs/mod.rs 启动日志没有写 版本 {config.APP_VER}")
+
+
 def main() -> int:
+    check_versions()
     if not Path(fonts.theme_font()).exists():
         raise SystemExit(f"字体文件缺失：{fonts.theme_font()}")
 
@@ -122,6 +148,13 @@ def main() -> int:
                 # 段本身没问题就把原始错误抛出去。
                 elf = (config.PKJ / "hosts/vita/target/armv7-sony-vita-newlibeabihf"
                        / "release/pocketjs-vita.elf")
+                # 没有 ELF 就说明错在更早的步骤（例如 tools/vita.ts 的校验），
+                # 这跟 SCE 段对齐无关 —— 以前会在这里空转 24 轮才报错。
+                if not elf.exists():
+                    raise SystemExit(
+                        "[build-vpk] 上一步没有产出 pocketjs-vita.elf，"\
+                        "不是 SCE 段对齐问题，先修上面那条错误"
+                    )
                 probe = subprocess.run(
                     [f"{config.VITASDK}/bin/vita-elf-create", str(elf),
                      "/tmp/elf-probe.velf"],

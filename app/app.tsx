@@ -39,6 +39,7 @@ import { animate, jump } from "@pocketjs/framework/animation";
 import { MOTION, MotionHandle } from "./core/motion";
 
 import { TabBar, TAB_LABELS } from "./components/tabbar";
+import { StatusBar, pollHostInfo } from "./components/statusbar";
 import { CTRL_ORDER, PlayerPanel } from "./components/player";
 import { SubPage } from "./components/subpage";
 
@@ -359,8 +360,27 @@ export default function Music() {
   const [catalogMeta, setCatalogMeta] = createSignal<Record<string, CatalogSong>>({});
   const CATALOG_FETCH_LIMIT = 16; /* 对齐窗口：滚动时复用同一批元数据，避免一行一请求 */
   let lastCatalogVersion = "";
-  const catalogIdsQueued: Record<string, boolean> = {};
-  let deferredCatalogPage: { file: string; offset: number; dueFrame: number } | undefined;
+  /* 文件 -> "到哪一帧才去取全量 id"（不是布尔，见 queueCatalogIds 的说明）。 */
+  const catalogIdsQueued: Record<string, number> = {};
+  /*
+   * 待取的页排成**小队列**，不是单个槽位。
+   *
+   * 单槽会被后一个请求覆盖：一屏 6 行跨页时（start=13 显示第 13~18 行），
+   * "start 所在的那页"和"窗口最后一行所在的那页"只会活下来一个，另一个永远
+   * 取不到 —— 那几行只有 id、没有元数据，就显示占位"加载中…"（真机反馈，
+   * 日志里 page_offset 一直停在 0、list_page_begin 也只有 offset=0）。
+   */
+  let deferredCatalogPages: { file: string; offset: number; dueFrame: number }[] = [];
+  /*
+   * 文件 -> 连续 loading 的尝试次数。
+   *
+   * 有的清单**根本同步不下来**（原生取数失败 / 文件没落盘），page_json 对这种情况永远回
+   * loading。界面以前每 3 帧重试一次：真机一份日志里同一个文件被请求了 1.2 万次，主线程
+   * 从不空闲（播放时就是"卡卡的"）。现在指数退避 + 次数上限，放弃后等清单版本变化再试，
+   * 用户重新点开这个歌单也会重置。
+   */
+  const CATALOG_PAGE_MAX_TRIES = 8;
+  let catalogPageTries: Record<string, number> = {};
   let catalogTrace = 0;
 
   const mergeCatalogMeta = (file: string, songs: CatalogSong[]): void => {
@@ -390,6 +410,8 @@ export default function Music() {
     const version = catalogVersion();
     if (version === lastCatalogVersion) return;
     lastCatalogVersion = version;
+    /* 清单版本变了 = 原生那边有新文件落下，之前放弃的页可以再试一轮。 */
+    catalogPageTries = {};
     const discover = catalogMenu("discover");
     const charts = catalogMenu("charts");
     const account = catalogMenu("account");
@@ -409,22 +431,40 @@ export default function Music() {
       setCatalogAccount(accountRows);
     }
     const open = cloudOpen();
-    if (open.file) queueCatalogPage(open.file, start(), 1);
+    queueCatalogWindow(open.file);
   };
 
   const queueCatalogPage = (file: string, offset: number, delayFrames = 1): void => {
     if (!file) return;
-    deferredCatalogPage = { file, offset, dueFrame: frameCounter + Math.max(1, delayFrames) };
+    /* 试满就放弃（除非页已经拿到了）：不然"永远 loading 的清单"会把每帧都占住。 */
+    if ((catalogPageTries[file] ?? 0) >= CATALOG_PAGE_MAX_TRIES && !catalogPages()[file]) return;
+    const pageOffset = Math.floor(Math.max(0, offset) / CATALOG_FETCH_LIMIT) * CATALOG_FETCH_LIMIT;
+    if (deferredCatalogPages.some((t) => t.file === file && t.offset === pageOffset)) return;
+    if (deferredCatalogPages.length >= 4) deferredCatalogPages.shift();
+    deferredCatalogPages.push({
+      file,
+      offset: pageOffset,
+      dueFrame: frameCounter + Math.max(1, delayFrames),
+    });
   };
 
-  const queueCatalogIds = (file: string): void => {
-    if (!file || catalogQueues()[file] || catalogIdsQueued[file]) return;
-    catalogIdsQueued[file] = true;
-  };
-
-  const pumpCatalogIds = (): void => {
-    const file = Object.keys(catalogIdsQueued).find((name) => catalogIdsQueued[name]);
+  /* 一屏 6 行会跨页：除 start() 那一页，还要排上"窗口最后一行"所在的页，
+   * 否则翻到跨页位置时后面几行永远停在"加载中…"。第二页晚一帧取，别挤同一帧。 */
+  const queueCatalogWindow = (file: string): void => {
     if (!file) return;
+    queueCatalogPage(file, start(), 1);
+    queueCatalogPage(file, start() + CATALOG_FETCH_LIMIT - 1, 2);
+  };
+
+  /* 全量 id 队列（527 首这种）在 guest 线程上要 100~200ms，别和"打开歌单"的进场
+   * 动画挤在同一帧：推迟到动画结束之后再取。 */
+  const CATALOG_IDS_DELAY_FRAMES = 30;
+  const queueCatalogIds = (file: string, delayFrames = CATALOG_IDS_DELAY_FRAMES): void => {
+    if (!file || catalogQueues()[file] || catalogIdsQueued[file]) return;
+    catalogIdsQueued[file] = frameCounter + Math.max(0, delayFrames);
+  };
+
+  const takeCatalogIds = (file: string): void => {
     delete catalogIdsQueued[file];
     const idsT0 = Date.now();
     const ids = perfSpan(`catalogIds ${file}`, () => catalogIds(file));
@@ -432,6 +472,19 @@ export default function Music() {
       logMsg(`perf: list_ids file=${file} count=${ids.length} bridge_ms=${Date.now() - idsT0} deferred=1`);
     }
     if (ids.length > 0) setCatalogQueues((prev) => ({ ...prev, [file]: ids }));
+  };
+
+  const pumpCatalogIds = (): void => {
+    const now = frameCounter;
+    const file = Object.keys(catalogIdsQueued).find((name) => catalogIdsQueued[name] <= now);
+    if (!file) return;
+    takeCatalogIds(file);
+  };
+
+  /* 点歌前把还没到点的 id 队列立刻补上 —— 否则队列会退化成"只有当前页 16 首"。 */
+  const flushCatalogIds = (file: string): void => {
+    if (!file || catalogQueues()[file] || !catalogIdsQueued[file]) return;
+    takeCatalogIds(file);
   };
 
   const loadCatalogPage = (
@@ -468,10 +521,15 @@ export default function Music() {
      * native worker and returns loading. Poll the same window a few frames
      * later instead of keeping a synchronous bridge call in this frame. */
     if (page.state === "loading") {
-      queueCatalogPage(file, pageOffset, 3);
+      /* 指数退避：3、6、12、24、48… 帧，76 帧封顶；配合上面的次数上限，
+       * "同步失败的清单"不会再把主线程按在每 3 帧一次的重试上。 */
+      const tries = (catalogPageTries[file] ?? 0) + 1;
+      catalogPageTries[file] = tries;
+      queueCatalogPage(file, pageOffset, Math.min(3 * (1 << Math.min(tries - 1, 6)), 192));
       return page;
     }
     if (page.state === "ready") {
+      delete catalogPageTries[file];
       mergeCatalogMeta(file, page.songs);
       setCatalogPages((prev) => ({ ...prev, [file]: page }));
       /* 全量 IDs 只用于后续队列/播放导航，不应和首屏 page 共用一次同步桥接。 */
@@ -662,13 +720,17 @@ export default function Music() {
     const t = tabIndex();
     const rowsStartedAt = Date.now();
     const finishRows = (rows: MenuRowData[]): MenuRowData[] => {
-      const trace = `${t}:${rows.length}:${rows.map((row) => `${row.kind}/${row.name}`).join("|")}`;
-      if (trace !== lastRowsPerfTrace && logEnabled()) {
-        lastRowsPerfTrace = trace;
-        logMsg(
-          `perf: menu_rows tab=${t} rows=${rows.length} build_ms=${Date.now() - rowsStartedAt} ` +
-            `names=${rows.map((row) => row.name.slice(0, 20)).join("|")}`,
-        );
+      /* trace 只在日志开着时才算：它要把整表 map+join 成字符串，
+       * 切页签/翻页时白花这份钱（清单越长大越明显）。 */
+      if (logEnabled()) {
+        const trace = `${t}:${rows.length}:${rows.map((row) => `${row.kind}/${row.name}`).join("|")}`;
+        if (trace !== lastRowsPerfTrace) {
+          lastRowsPerfTrace = trace;
+          logMsg(
+            `perf: menu_rows tab=${t} rows=${rows.length} build_ms=${Date.now() - rowsStartedAt} ` +
+              `names=${rows.map((row) => row.name.slice(0, 20)).join("|")}`,
+          );
+        }
       }
       return rows;
     };
@@ -1093,6 +1155,8 @@ export default function Music() {
 
   const playTrack = (id: string) => {
     logMsg("ui: 点歌 " + id);
+    /* 全量 id 还没到点就先补上：L/R 队列导航要按整张歌单走。 */
+    if (sub() === "playlist") flushCatalogIds(cloudOpen().file);
     const target = getTrack(id);
     const pool = listIds().length > 0 ? listIds() : tracks().map((s) => s.id);
     const scoped = pool.filter(
@@ -1293,7 +1357,11 @@ export default function Music() {
       forceListSync();
     }
     openSub("playlist");
-    if (row.file) queueCatalogPage(row.file, 0, 1);
+    if (row.file) {
+      /* 用户主动点开：把这个歌单的重试预算清掉再排队。 */
+      delete catalogPageTries[row.file];
+      queueCatalogPage(row.file, 0, 1);
+    }
     refreshListIfStale();
   };
 
@@ -1609,13 +1677,16 @@ export default function Music() {
 
     /* 页面已经显示 loading 后才读 native catalog；即使桥接本身偶尔较慢，
      * 也不会和按键回调、列表第一次 mount、字体收集叠在同一个同步栈。 */
-    if (deferredCatalogPage && deferredCatalogPage.dueFrame <= frameCounter) {
-      const task = deferredCatalogPage;
-      deferredCatalogPage = undefined;
+    const duePage = deferredCatalogPages.findIndex((t) => t.dueFrame <= frameCounter);
+    if (duePage >= 0) {
+      const task = deferredCatalogPages.splice(duePage, 1)[0];
       loadCatalogPage(task.file, task.offset);
     }
     /* catalogIds 只为后续播放队列服务，低优先级地一次处理一个文件。 */
     if (frameCounter % 2 === 0) pumpCatalogIds();
+    /* 状态栏：电量 / 时间 / 联网每 300 帧（≈5 秒）刷一次。
+     * 运行期没有 setInterval/setTimeout，只能靠帧循环驱动（见 statusbar.tsx 的说明）。 */
+    if (frameCounter % 300 === 0) pollHostInfo();
 
     /* 登录状态：登录页开着时半秒一推（扫码要跟手），其它页面 2 秒一推。
      * 以前只有登录页才会刷新，于是"上次登录过、这次直接开应用"时，
@@ -1775,7 +1846,7 @@ export default function Music() {
       let name = open.name;
       let songs: ListSong[] | undefined;
       if (open.file) {
-        queueCatalogPage(open.file, start(), 1);
+        queueCatalogWindow(open.file);
         const page = pageData(open.file);
         if (page?.name) name = page.name;
         if (page?.state === "ready") songs = page.songs;
@@ -1902,7 +1973,11 @@ export default function Music() {
       {/* 整屏壁纸：画在最前面，所有面板/行都是毛玻璃材质，会透出它 */}
       <ThemeSeed />
 
-      <PlayerPanel
+      {/* 左栏 = 状态栏 + 播放器卡片：状态栏在卡片**外面**，只占左栏宽度，
+          这样右栏的页签/列表不会被压下去。 */}
+      <View class="flex-col w-[196] h-full gap-1">
+        <StatusBar />
+        <PlayerPanel
         nodeRef={(n) => {
           playerRef = n;
         }}
@@ -1917,7 +1992,8 @@ export default function Music() {
         netStatus={statusText}
         netAlert={statusAlert}
         buffered={buffered}
-      />
+        />
+      </View>
 
       <View
         ref={(n) => {

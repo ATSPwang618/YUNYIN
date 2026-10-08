@@ -1,0 +1,6 @@
+# 这个仓库在 Windows 上编辑、在 WSL 里构建：行尾必须是 LF。
+# 没有这条规则时，Windows 侧 git（core.autocrlf=true）会在检出时写回 CRLF，
+# 于是 `git apply` 的上下文对不上、`bash scripts/*.sh` 也会带 \r 报错。
+* text=auto eol=lf
+# 补丁文件尤其不能带 CR。
+*.patch text eol=lf

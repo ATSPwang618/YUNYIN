@@ -112,6 +112,16 @@ unsafe extern "C" fn js_stop(
     JS_UNDEFINED
 }
 
+/// 状态栏：电量 / 时间 / 联网（一次拿全，见 platform/hostinfo.rs）。
+unsafe extern "C" fn js_host_info(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    _argc: i32,
+    _argv: *mut JSValue,
+) -> JSValue {
+    js_str(ctx, &crate::media::platform::hostinfo::json())
+}
+
 unsafe extern "C" fn js_state(
     ctx: *mut JSContext,
     _this: JSValue,
@@ -636,6 +646,7 @@ pub unsafe fn install(ctx: *mut JSContext, global: JSValue) {
     add_fn(ctx, obj, b"resume\0", js_resume, 1);
     add_fn(ctx, obj, b"stop\0", js_stop, 0);
     add_fn(ctx, obj, b"state\0", js_state, 0);
+    add_fn(ctx, obj, b"hostInfo\0", js_host_info, 0);
     add_fn(ctx, obj, b"cover\0", js_cover, 1);
     add_fn(ctx, obj, b"tags\0", js_tags, 1);
     add_fn(ctx, obj, b"logMsg\0", js_log, 1);

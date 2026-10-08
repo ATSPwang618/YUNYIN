@@ -11,7 +11,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Mutex, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::Duration;
 
@@ -49,7 +49,10 @@ enum Command {
 static START: Once = Once::new();
 static COMMANDS: Mutex<Option<Sender<Command>>> = Mutex::new(None);
 static WATCHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
-static DOCUMENTS: Mutex<Vec<Document>> = Mutex::new(Vec::new());
+/* 存 Arc<Document>：解析好的歌单可能上千首，guest 线程每次取一页都深拷贝整份
+ * 文档是纯浪费（真机日志里 catalogPage 一次 30~200ms 就是这么来的）。现在只
+ * 复制一个 Arc 计数。 */
+static DOCUMENTS: Mutex<Vec<Arc<Document>>> = Mutex::new(Vec::new());
 static PAGE_CACHE: Mutex<Vec<PageCache>> = Mutex::new(Vec::new());
 static PAGE_PENDING: Mutex<Vec<(String, usize, usize)>> = Mutex::new(Vec::new());
 static VERSION: AtomicU64 = AtomicU64::new(0);
@@ -95,9 +98,9 @@ fn replace_document(document: Document) {
         if old.stamp == document.stamp {
             return;
         }
-        *old = document;
+        *old = Arc::new(document);
     } else {
-        docs.push(document);
+        docs.push(Arc::new(document));
     }
     drop(docs);
     if let Ok(mut pages) = PAGE_CACHE.lock() {
@@ -174,12 +177,12 @@ fn worker(rx: Receiver<Command>) {
                         if let Some(old) = pages.iter_mut().find(|page| {
                             page.name == doc.name && page.offset == offset && page.limit == limit
                         }) {
-                            old.stamp = doc.stamp;
+                            old.stamp = doc.stamp.clone();
                             old.raw = raw;
                         } else {
                             pages.push(PageCache {
-                                name: doc.name,
-                                stamp: doc.stamp,
+                                name: doc.name.clone(),
+                                stamp: doc.stamp.clone(),
                                 offset,
                                 limit,
                                 raw,
@@ -298,7 +301,7 @@ pub fn version() -> u64 {
     VERSION.load(Ordering::Acquire)
 }
 
-fn document(name: &str) -> Option<Document> {
+fn document(name: &str) -> Option<Arc<Document>> {
     DOCUMENTS
         .lock()
         .ok()
@@ -306,7 +309,7 @@ fn document(name: &str) -> Option<Document> {
 }
 
 fn page_cache(name: &str, offset: usize, limit: usize) -> Option<String> {
-    let doc_stamp = document(name)?.stamp;
+    let doc_stamp = document(name)?.stamp.clone();
     PAGE_CACHE
         .lock()
         .ok()

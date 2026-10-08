@@ -1,10 +1,9 @@
 import { createEffect, createMemo } from "solid-js";
-import { View, type NodeMirror } from "@pocketjs/framework/components";
+import { Text, View, type NodeMirror } from "@pocketjs/framework/components";
 import { animate, jump } from "@pocketjs/framework/animation";
 import { type Track, type LyricLine } from "../core/types";
 import { clipW } from "../core/util";
 import { pTxt } from "../core/theme";
-import { StreamText } from "../core/cjk";
 
 /* 歌词页（子页）：三行居中，当前行红色。骨架/预取逻辑沿用旧版（性能相关）。 */
 
@@ -79,9 +78,9 @@ export function LyricsPage(props: {
         style={{ translateY: 0 }}
         class="flex-col items-center gap-2 overflow-hidden"
       >
-        <StreamText class={pTxt("lyricOther")} text={clipW(prevLine(), 38)} />
-        <StreamText class={pTxt("lyricCur")} text={clipW(curLine(), 40)} />
-        <StreamText class={pTxt("lyricOther")} text={clipW(nextLine(), 38)} />
+        <Text class={pTxt("lyricOther")}>{clipW(prevLine(), 38)}</Text>
+        <Text class={pTxt("lyricCur")}>{clipW(curLine(), 40)}</Text>
+        <Text class={pTxt("lyricOther")}>{clipW(nextLine(), 38)}</Text>
       </View>
     </View>
   );

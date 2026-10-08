@@ -1,7 +1,7 @@
 {
   "_说明": "YUNYIN 主题配置（流媒体播放器版）。改配色只改这里，重新打包生效。",
   "_用法": "bg 段给容器用（bgCls('角色')，值必须是**完整** Tailwind 类字面量——框架按整串烘焙，不能在运行时拼）；ui 段给文字用（pTxt('角色')）。",
-  "_主题": "只有 light / dark 两套；红色只给『当前/主要动作』。",
+  "_主题": "五套：light / dark / blue / green / purple（见 app/core/theme.ts 的 UI_THEMES）；红色只给『当前/主要动作』。",
   "_字号": "text-base=16 粗 / text-sm=14 粗 / text-xs=12（可加 font-bold）。再大的字号要新烘字模，不批。",
   "bg": {
     "light": {

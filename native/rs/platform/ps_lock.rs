@@ -10,6 +10,7 @@
 
 use alloc::format;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::Mutex;
 
 use crate::media::platform::log;
 
@@ -34,20 +35,41 @@ pub fn init() {
     log::append(&format!("shell util events init -> 0x{:08X}", ret as u32));
 }
 
+/* 系统调用串行化：两个状态变化挨得很近时（播放→暂停）保证不会乱序。 */
+static SHELL_CALL: Mutex<()> = Mutex::new(());
+
 /// 播放状态变化时调用：true = 锁 PS 键，false = 解锁。同一个状态重复调用是空操作。
 /// 返回最近一次系统调用的结果（0 = 成功）。
+///
+/// **系统调用放后台线程**：真机日志里 `sceShellUtilLock/Unlock` 偶尔让所在帧卡
+/// 0.5–1.2s（`HOST: guest 帧耗时 1203ms` 紧跟着 `ps lock: request=true`）。
+/// 界面只关心"锁没锁上"这个状态，不需要等它返回。
 pub fn set_locked(on: bool) -> i32 {
     if LOCKED.swap(on, Ordering::AcqRel) == on {
         return LAST_RET.load(Ordering::Acquire);
     }
-    let ret = unsafe {
-        if on {
-            sceShellUtilLock(LOCK_PS_BTN)
-        } else {
-            sceShellUtilUnlock(LOCK_PS_BTN)
-        }
-    };
-    LAST_RET.store(ret, Ordering::Release);
-    log::append(&format!("ps btn lock: {} -> 0x{:08X}", on as i32, ret as u32));
-    ret
+    let spawned = std::thread::Builder::new()
+        .name("yunyin-shellutil".into())
+        .stack_size(16 * 1024)
+        .spawn(move || {
+            let _guard = SHELL_CALL.lock();
+            /* 等锁的期间可能又变了一次（比如刚按播放就暂停）：那时这次调用已经过期，
+             * 交给后一个线程去做，最终状态以最新请求为准。 */
+            if LOCKED.load(Ordering::Acquire) != on {
+                return;
+            }
+            let ret = unsafe {
+                if on {
+                    sceShellUtilLock(LOCK_PS_BTN)
+                } else {
+                    sceShellUtilUnlock(LOCK_PS_BTN)
+                }
+            };
+            LAST_RET.store(ret, Ordering::Release);
+            log::append(&format!("ps btn lock: {} -> 0x{:08X}", on as i32, ret as u32));
+        });
+    if spawned.is_err() {
+        log::append("ps btn lock: 后台线程创建失败（PS 锁状态可能不准）");
+    }
+    LAST_RET.load(Ordering::Acquire)
 }

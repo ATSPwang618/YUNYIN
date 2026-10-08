@@ -44,5 +44,20 @@ pub mod platform {
     }
 }
 
+/* json_escape 是纯函数，直接挂真文件；再导出的名字与 native/rs/mod.rs 一致，
+ * 因为 catalog / provider / tags 都按 crate::media::json_escape 这个短路径引用它。
+ * （注意：内联模块里的 #[path] 会多带一层模块名目录，所以这里放在文件作用域。） */
+#[path = "../../../native/rs/platform/json.rs"]
+mod platform_json;
+pub use platform_json::json_escape;
+
 #[path = "../../../native/rs/provider/mod.rs"]
 pub mod provider;
+
+/* 清单解析线程与二维码编码都是纯逻辑（只用到 provider / platform::log），
+ * 所以挂真文件；provider 里对它们的引用也必须在这里能解析。 */
+#[path = "../../../native/rs/catalog.rs"]
+pub mod catalog;
+
+#[path = "../../../native/rs/qr.rs"]
+pub mod qr;
